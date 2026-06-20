@@ -68,18 +68,24 @@ type Controller struct {
 	sink     event.Sink
 	policy   permission.Policy
 
-	label             string
-	modelRef          string
-	systemPrompt      string
-	sessionDir        string
-	host              *plugin.Host
-	commands          []command.Command
-	skills            []skill.Skill
-	allSkills         []skill.Skill
-	skillStore        *skill.Store
-	allSkillStore     *skill.Store
-	hooks             *hook.Runner // session hook runner; nil-safe (no hooks configured)
-	mem               *memory.Set
+	label         string
+	modelRef      string
+	systemPrompt  string
+	sessionDir    string
+	host          *plugin.Host
+	commands      []command.Command
+	skills        []skill.Skill
+	allSkills     []skill.Skill
+	skillStore    *skill.Store
+	allSkillStore *skill.Store
+	hooks         *hook.Runner // session hook runner; nil-safe (no hooks configured)
+	mem           *memory.Set
+	// memMu serializes memory mutations (QuickAdd/SaveDoc/SaveMemory/ForgetMemory/
+	// QueueMemory) so each write+reload+swap is atomic with respect to the others,
+	// WITHOUT holding c.mu across the disk I/O. c.mu is taken only briefly — to read
+	// the snapshot pointer and to swap the reloaded snapshot in — never around a
+	// filesystem walk, so a memory-panel save can't stall an approval or status poll.
+	memMu             sync.Mutex
 	cleanup           func()
 	autoPlan          string
 	reasoningLanguage string
@@ -113,6 +119,11 @@ type Controller struct {
 	// goalStatePath is where the current goal state is persisted for session
 	// continuity. Empty means no persistence.
 	goalStatePath string
+	// goalWriteMu serializes goal-state disk writes so they happen OFF c.mu: a
+	// caller builds the JSON under c.mu (cheap) then writes it here after
+	// unlocking, keeping the per-turn goal persistence out of the critical
+	// section that approvals and status polls also take.
+	goalWriteMu sync.Mutex
 
 	// Checkpoints (snapshot-based rewind). cp is the per-session store rebound when
 	// the session path changes; cpRoot is the workspace root used to guard restore
@@ -750,7 +761,7 @@ func (c *Controller) advanceGoalAfterTurn() bool {
 		c.goalIntercepts = 0
 		c.goalSelfCheckDone = false
 		c.goalIdleTurns = 0
-		c.saveGoalState()
+		// (final state is persisted once below, after the lock is released)
 		c.goal = ""
 		c.goalStatus = GoalStatusComplete
 		c.goalBlocks = 0
@@ -802,11 +813,14 @@ func (c *Controller) advanceGoalAfterTurn() bool {
 		c.goalIdleTurns = 0
 		notice = c.goalBlock
 	}
+	var savePath string
+	var saveData []byte
 	if notice != "" {
-		c.saveGoalState()
+		savePath, saveData, _ = c.buildGoalStateLocked()
 	}
 	cont := notice == ""
 	c.mu.Unlock()
+	c.writeGoalState(savePath, saveData)
 	if notice != "" {
 		c.notice(notice)
 	}
@@ -931,16 +945,20 @@ func (c *Controller) stopGoal(status string) {
 	c.goalIntercepts = 0
 	c.goalSelfCheckDone = false
 	c.goalIdleTurns = 0
-	c.saveGoalState()
+	path, data, _ := c.buildGoalStateLocked()
 	c.mu.Unlock()
+	c.writeGoalState(path, data)
 }
 
-// saveGoalState persists the current goal state to disk for session continuity.
-func (c *Controller) saveGoalState() {
+// buildGoalStateLocked marshals the current goal state for persistence. The
+// caller holds c.mu; this only reads in-memory state and the executor's todo
+// snapshot, never touching disk. Returns the target path and JSON, or ok=false
+// when persistence is disabled. The matching writeGoalState does the disk write
+// OFF c.mu so the per-turn save can't stall an approval or status poll.
+func (c *Controller) buildGoalStateLocked() (path string, data []byte, ok bool) {
 	if c.goalStatePath == "" || c.executor == nil {
-		return
+		return "", nil, false
 	}
-	todos := c.executor.CanonicalTodoState()
 	state := goalState{
 		Goal:         c.goal,
 		Status:       c.goalStatus,
@@ -949,14 +967,32 @@ func (c *Controller) saveGoalState() {
 		Blocks:       c.goalBlocks,
 		Block:        c.goalBlock,
 		Strict:       c.goalStrict,
-		Todos:        todos,
+		Todos:        c.executor.CanonicalTodoState(),
 	}
-	data, err := json.Marshal(state)
+	b, err := json.Marshal(state)
 	if err != nil {
+		slog.Warn("controller: marshal goal state", "err", err)
+		return "", nil, false
+	}
+	return c.goalStatePath, b, true
+}
+
+// writeGoalState persists pre-marshaled goal-state bytes to disk, OFF c.mu and
+// serialized by goalWriteMu so concurrent saves don't interleave or land out of
+// order. Best-effort: failures are logged, not surfaced.
+func (c *Controller) writeGoalState(path string, data []byte) {
+	if path == "" || data == nil {
 		return
 	}
-	_ = os.MkdirAll(filepath.Dir(c.goalStatePath), 0o755)
-	_ = os.WriteFile(c.goalStatePath, data, 0o644)
+	c.goalWriteMu.Lock()
+	defer c.goalWriteMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		slog.Warn("controller: goal state dir", "err", err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		slog.Warn("controller: write goal state", "err", err)
+	}
 }
 
 // goalState is the serializable form of a running goal.
@@ -1839,8 +1875,9 @@ func (c *Controller) PlanMode() bool {
 func (c *Controller) GoalStrict(strict bool) {
 	c.mu.Lock()
 	c.goalStrict = strict
-	c.saveGoalState()
+	path, data, _ := c.buildGoalStateLocked()
 	c.mu.Unlock()
+	c.writeGoalState(path, data)
 }
 
 // SetGoal stores a session-scoped active goal. Compose injects it into outgoing
@@ -1853,7 +1890,6 @@ func (c *Controller) SetGoal(goal string) {
 func (c *Controller) SetGoalWithResearchMode(goal string, researchMode GoalResearchMode) {
 	goal = strings.TrimSpace(goal)
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if goal == "" {
 		c.goal = ""
 		c.goalStatus = GoalStatusStopped
@@ -1866,10 +1902,13 @@ func (c *Controller) SetGoalWithResearchMode(goal string, researchMode GoalResea
 		c.goalSelfCheckDone = false
 		c.goalIdleTurns = 0
 		c.goalStrict = false
-		c.saveGoalState()
+		path, data, _ := c.buildGoalStateLocked()
+		c.mu.Unlock()
+		c.writeGoalState(path, data)
 		return
 	}
 	if c.goal == goal && c.goalStatus == GoalStatusRunning && c.goalResearchMode == researchMode {
+		c.mu.Unlock()
 		return
 	}
 	c.goal = goal
@@ -1883,7 +1922,9 @@ func (c *Controller) SetGoalWithResearchMode(goal string, researchMode GoalResea
 	c.goalSelfCheckDone = false
 	c.goalIdleTurns = 0
 	c.goalStrict = false
-	c.saveGoalState()
+	path, data, _ := c.buildGoalStateLocked()
+	c.mu.Unlock()
+	c.writeGoalState(path, data)
 }
 
 func (c *Controller) ClearGoal() {
@@ -2200,11 +2241,15 @@ func (c *Controller) forkNamed(turn int, name string, switchToFork bool) (string
 	if err := sess.Save(newPath); err != nil {
 		return "", c.rewindFail(err)
 	}
+	forkPreview, forkTurns := agent.SessionPreviewFromMessages(forked)
 	if err := agent.SaveBranchMeta(newPath, agent.BranchMeta{
 		Name:             strings.TrimSpace(name),
 		ParentID:         parentID,
 		ForkTurn:         turn,
 		ForkMessageIndex: boundary,
+		Preview:          forkPreview,
+		Turns:            forkTurns,
+		SchemaVersion:    agent.BranchMetaCountsVersion,
 	}); err != nil {
 		return "", c.rewindFail(err)
 	}
@@ -2267,11 +2312,15 @@ func (c *Controller) Branch(name string) (string, error) {
 	if err := sess.Save(newPath); err != nil {
 		return "", c.rewindFail(err)
 	}
+	branchPreview, branchTurns := agent.SessionPreviewFromMessages(branched)
 	if err := agent.SaveBranchMeta(newPath, agent.BranchMeta{
 		Name:             strings.TrimSpace(name),
 		ParentID:         parentID,
 		ForkTurn:         -1,
 		ForkMessageIndex: len(branched),
+		Preview:          branchPreview,
+		Turns:            branchTurns,
+		SchemaVersion:    agent.BranchMetaCountsVersion,
 	}); err != nil {
 		return "", c.rewindFail(err)
 	}
@@ -2545,23 +2594,17 @@ func (c *Controller) snapshot(markActivity bool) error {
 			"label", c.Label(), "session_dir", c.SessionDir())
 		return errNoSessionPath
 	}
-	if !markActivity {
-		if _, err := agent.EnsureBranchMeta(path); err != nil {
-			return err
-		}
-	}
 	if err := s.Save(path); err != nil {
 		return err
 	}
-	if strings.TrimSpace(modelRef) != "" {
-		if err := agent.SetBranchModelPreserveUpdated(path, modelRef); err != nil {
-			return err
-		}
-	}
-	if markActivity {
-		return agent.TouchBranchMeta(path)
-	}
-	return nil
+	// Record the listing-only sidecar fields (model, preview, user-turn count)
+	// straight from the in-memory conversation, so the sidebar and resume picker
+	// never have to decode the whole .jsonl just to show them. markActivity bumps
+	// UpdatedAt exactly like the previous TouchBranchMeta did; false preserves it
+	// like SetBranchModelPreserveUpdated. The single write subsumes the old
+	// EnsureBranchMeta / SetBranchModel / TouchBranchMeta sequence.
+	preview, turns := agent.SessionPreviewFromMessages(s.Snapshot())
+	return agent.UpdateSessionMeta(path, modelRef, preview, turns, markActivity)
 }
 
 func (c *Controller) messageCount() int {
@@ -3247,42 +3290,45 @@ func (c *Controller) Bypass() bool {
 
 // --- memory ---
 //
-// c.mem is treated as an immutable snapshot guarded by c.mu: reads take the lock
-// and return the pointer; writes mutate disk then swap in a freshly discovered
-// snapshot. A turn-tail note is queued for each write so the change applies this
-// session without disturbing the cache-stable system prefix (it folds into the
-// prefix on the next session). All of these are no-ops returning "" when memory
-// is disabled.
+// c.mem is an immutable snapshot: reads take c.mu briefly and return the pointer.
+// Writes are serialized by memMu and do their disk I/O (the doc/store write plus
+// the memory.Load re-discovery) OFF c.mu, taking c.mu only to read the snapshot
+// pointer and to swap the freshly discovered snapshot in — so a write never holds
+// c.mu across a filesystem walk. A turn-tail note is queued for each write so the
+// change applies this session without disturbing the cache-stable system prefix
+// (it folds into the prefix on the next session). All of these are no-ops
+// returning "" when memory is disabled.
 
 // QuickAdd appends a one-line note to the doc-memory file for scope (project
 // REASONIX.md by default) — the write side of "#<note>". Returns the file written.
 func (c *Controller) QuickAdd(scope memory.Scope, note string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.mem == nil {
+	c.memMu.Lock()
+	defer c.memMu.Unlock()
+	mem := c.memSnapshot()
+	if mem == nil {
 		return "", nil
 	}
-	path := c.mem.DocPath(scope)
+	path := mem.DocPath(scope)
 	if path == "" {
 		return "", fmt.Errorf("no target file for memory scope %q", scope)
 	}
 	if err := memory.AppendDoc(path, note); err != nil {
 		return "", err
 	}
-	c.pendingMemory = append(c.pendingMemory, note)
-	c.refreshMemoryLocked()
+	c.applyMemoryWrite(mem, note)
 	return path, nil
 }
 
 // SaveDoc overwrites a recognized memory doc with body — the save side of the
 // desktop panel's in-place editor. Returns the file written.
 func (c *Controller) SaveDoc(path, body string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.mem == nil {
+	c.memMu.Lock()
+	defer c.memMu.Unlock()
+	mem := c.memSnapshot()
+	if mem == nil {
 		return "", nil
 	}
-	written, err := c.mem.WriteDoc(path, body)
+	written, err := mem.WriteDoc(path, body)
 	if err != nil {
 		return "", err
 	}
@@ -3290,9 +3336,8 @@ func (c *Controller) SaveDoc(path, body string) (string, error) {
 	// the pre-edit version this session, so handing the model the current text
 	// avoids a stale-guidance gap until the next session re-folds it into the
 	// prefix. Trimmed to a single tail note (drained by Compose), not per-turn.
-	c.pendingMemory = append(c.pendingMemory,
+	c.applyMemoryWrite(mem,
 		"Memory file "+written+" was just edited. Its current contents:\n"+strings.TrimSpace(body))
-	c.refreshMemoryLocked()
 	return written, nil
 }
 
@@ -3300,18 +3345,18 @@ func (c *Controller) SaveDoc(path, body string) (string, error) {
 // snapshot. It is the explicit user-confirmed counterpart to the model-owned
 // remember tool, used by management surfaces that preview a candidate first.
 func (c *Controller) SaveMemory(m memory.Memory) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.mem == nil {
+	c.memMu.Lock()
+	defer c.memMu.Unlock()
+	mem := c.memSnapshot()
+	if mem == nil {
 		return "", nil
 	}
-	path, err := c.mem.Store.Save(m)
+	path, err := mem.Store.Save(m)
 	if err != nil {
 		return "", err
 	}
-	c.pendingMemory = append(c.pendingMemory,
+	c.applyMemoryWrite(mem,
 		"Saved memory \""+m.Name+"\": "+strings.Join(strings.Fields(m.Description), " "))
-	c.refreshMemoryLocked()
 	return path, nil
 }
 
@@ -3321,17 +3366,17 @@ func (c *Controller) SaveMemory(m memory.Memory) (string, error) {
 // until the next session re-folds the index). The file is archived for
 // traceability by Store.Delete.
 func (c *Controller) ForgetMemory(name string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.mem == nil {
+	c.memMu.Lock()
+	defer c.memMu.Unlock()
+	mem := c.memSnapshot()
+	if mem == nil {
 		return nil
 	}
-	if err := c.mem.Store.Delete(name); err != nil {
+	if err := mem.Store.Delete(name); err != nil {
 		return err
 	}
-	c.pendingMemory = append(c.pendingMemory,
+	c.applyMemoryWrite(mem,
 		"Forgot memory \""+name+"\" — disregard its line still shown in the saved-memories index until next session.")
-	c.refreshMemoryLocked()
 	return nil
 }
 
@@ -3340,10 +3385,17 @@ func (c *Controller) ForgetMemory(name string) error {
 // applies this session without touching the cache-stable prefix. It also
 // refreshes the snapshot a memory panel reads.
 func (c *Controller) QueueMemory(note string) {
+	c.memMu.Lock()
+	defer c.memMu.Unlock()
+	if mem := c.memSnapshot(); mem != nil {
+		c.applyMemoryWrite(mem, note)
+		return
+	}
+	// Memory disabled — still queue the turn-tail note; there's no snapshot to
+	// re-discover.
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.pendingMemory = append(c.pendingMemory, note)
-	c.refreshMemoryLocked()
+	c.mu.Unlock()
 }
 
 // Memory returns the loaded memory snapshot (nil when memory is disabled), for
@@ -3355,13 +3407,28 @@ func (c *Controller) Memory() *memory.Set {
 	return c.mem
 }
 
-// refreshMemoryLocked re-discovers memory from disk so a later Memory() reflects
-// a just-applied write. Caller holds c.mu.
-func (c *Controller) refreshMemoryLocked() {
-	if c.mem == nil {
-		return
+// memSnapshot returns the current memory snapshot under a brief c.mu, so callers
+// can do the doc/store write and re-discovery off-lock. Holding memMu keeps the
+// returned pointer current until the matching applyMemoryWrite swaps it in.
+func (c *Controller) memSnapshot() *memory.Set {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mem
+}
+
+// applyMemoryWrite re-discovers memory from disk (off-lock, the expensive part)
+// then, under a brief c.mu, swaps the fresh snapshot in and queues the turn-tail
+// note so a later Memory() reflects the just-applied write. mem is the snapshot
+// taken at the start of the memMu-serialized write and supplies the discovery
+// roots. Callers hold memMu.
+func (c *Controller) applyMemoryWrite(mem *memory.Set, note string) {
+	reloaded := memory.Load(memory.Options{CWD: mem.CWD, UserDir: mem.UserDir})
+	c.mu.Lock()
+	if note != "" {
+		c.pendingMemory = append(c.pendingMemory, note)
 	}
-	c.mem = memory.Load(memory.Options{CWD: c.mem.CWD, UserDir: c.mem.UserDir})
+	c.mem = reloaded
+	c.mu.Unlock()
 }
 
 // --- approval bridge (agent gate → events) ---
