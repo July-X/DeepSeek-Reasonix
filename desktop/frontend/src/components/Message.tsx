@@ -10,10 +10,11 @@ import type { DisplayAttachment } from "../lib/attachmentDisplay";
 import { app } from "../lib/bridge";
 import { replaySubmitText } from "../lib/editReplay";
 import { useT } from "../lib/i18n";
+import { Tooltip } from "./Tooltip";
 import { useGSAPCollapse } from "../lib/useGSAPCollapse";
 import { displayReasoningText } from "../lib/reasoningDisplay";
 import type { Item, MessageActionScope } from "../lib/useController";
-import type { CheckpointMeta } from "../lib/types";
+import type { CheckpointMeta, MemoryCitation } from "../lib/types";
 
 type AssistantItem = Extract<Item, { kind: "assistant" }>;
 export type TurnActionMenu = "summary" | "rewind";
@@ -76,6 +77,60 @@ function mergeDisplayAttachments(existing: DisplayAttachment[], incoming: Displa
     merged.push(attachment);
   }
   return merged;
+}
+
+function MemoryCitations({ citations }: { citations?: MemoryCitation[] }) {
+  const t = useT();
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const clean = (citations ?? [])
+    .filter((citation) => (citation.source ?? citation.id ?? citation.note ?? "").trim() !== "")
+    .slice(0, 5);
+  useGSAPCollapse(bodyRef, open);
+  if (clean.length === 0) return null;
+  return (
+    <div className="msg-memory-citations">
+      <button
+        type="button"
+        className="msg-memory-citations__toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <ChevronRight className={`msg-memory-citations__chevron${open ? " msg-memory-citations__chevron--open" : ""}`} size={15} />
+        <span>{t("msg.memoryCompilerCitationsCount", { n: clean.length })}</span>
+      </button>
+      {open && (
+        <div ref={bodyRef} className="msg-memory-citations__body">
+          {clean.map((citation, index) => {
+            const lines = memoryCitationLines(citation, t);
+            return (
+              <div key={`${citation.id ?? citation.source}-${index}`} className="msg-memory-citations__item">
+                <div className="msg-memory-citations__source">
+                  <span>{memoryCitationSource(citation)}</span>
+                  {lines && <span className="msg-memory-citations__lines">{lines}</span>}
+                </div>
+                {citation.note && <div className="msg-memory-citations__note">{citation.note}</div>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function memoryCitationSource(citation: MemoryCitation): string {
+  const source = (citation.source || citation.id || "Memory v5").trim();
+  if (citation.kind === "compiler_reference" && source === "Memory v5") return "Memory v5 compiler";
+  return source;
+}
+
+function memoryCitationLines(citation: MemoryCitation, t: ReturnType<typeof useT>): string {
+  const start = citation.lineStart ?? 0;
+  const end = citation.lineEnd ?? 0;
+  if (start <= 0) return "";
+  if (end > 0 && end !== start) return t("msg.memoryCitationLineRange", { start, end });
+  return t("msg.memoryCitationLine", { line: start });
 }
 
 function messageDate(value?: number): Date {
@@ -421,9 +476,28 @@ export function TurnActions({
   };
   const actionMeta = (scope: MessageActionScope): string => {
     if ((scope === "code" || scope === "both") && checkpoint?.files?.length) {
-      return t("rewind.filesChanged", { count: checkpoint.files.length });
+      const total = checkpoint.files.length;
+      const turnCount = checkpoint.turnFileCount ?? 0;
+      if (turnCount > 0 && turnCount < total) {
+        return `${t("rewind.filesChanged", { count: total })} (${t("rewind.turnFiles", { count: turnCount })})`;
+      }
+      return t("rewind.filesChanged", { count: total });
     }
     return "";
+  };
+  const actionTooltipLabel = (scope: MessageActionScope) => {
+    const reason = actionDisabledReason(scope);
+    if (reason) return <span>{reason}</span>;
+    if ((scope === "code" || scope === "both") && checkpoint?.files?.length) {
+      return (
+        <div className="rewind__files-tooltip">
+          {checkpoint.files.map((file) => (
+            <div key={file}>{file.split(/[/\\]/).pop() || file}</div>
+          ))}
+        </div>
+      );
+    }
+    return undefined;
   };
   const runAction = (scope: MessageActionScope) => {
     setConfirmScope(null);
@@ -441,7 +515,8 @@ export function TurnActions({
   const renderAction = (scope: MessageActionScope, danger = false) => {
     const disabledReason = actionDisabledReason(scope);
     const meta = actionMeta(scope);
-    return (
+    const tipLabel = actionTooltipLabel(scope);
+    const button = (
       <button
         className={[
           "rewind__menu-item",
@@ -450,13 +525,14 @@ export function TurnActions({
         ].filter(Boolean).join(" ")}
         type="button"
         disabled={Boolean(disabledReason)}
-        title={disabledReason || undefined}
+        {...(tipLabel ? {} : { title: disabledReason || undefined })}
         onClick={() => selectRewind(scope)}
       >
         <span>{actionLabel(scope)}</span>
         {meta && <span className="rewind__menu-meta">{meta}</span>}
       </button>
     );
+    return tipLabel ? <Tooltip key={scope} label={tipLabel} side="top" block fill>{button}</Tooltip> : button;
   };
   const forkDisabledReason = canAct ? actionDisabledReason("fork") : "";
   const toggleMenu = (menu: TurnActionMenu) => {
@@ -543,6 +619,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   defaultExpanded = false,
   expandWhileStreaming = true,
   truncateStreamingReasoning = false,
+  creationMode = false,
 }: {
   item: AssistantItem;
   defaultExpanded?: boolean;
@@ -550,6 +627,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   expandWhileStreaming?: boolean;
   /** Opt-in for compact mode to keep live DeepSeek reasoning from growing an unbounded DOM. */
   truncateStreamingReasoning?: boolean;
+  creationMode?: boolean;
 }) {
   const t = useT();
   const reasoningBodyRef = useRef<HTMLDivElement>(null);
@@ -628,9 +706,10 @@ export const AssistantMessage = memo(function AssistantMessage({
       )}
       {hasText && (
         <div className="msg__body">
-          <Markdown text={item.text} />
+          <Markdown text={item.text} plainStatusBlocks={creationMode} />
         </div>
       )}
+      <MemoryCitations citations={item.memoryCitations} />
     </div>
   );
 });

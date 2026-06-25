@@ -61,10 +61,6 @@ type Spec struct {
 	// LowPriority runs a stdio subprocess below normal scheduling priority, for
 	// background indexers that must not starve the user's machine.
 	LowPriority bool
-	// SharedHostBackgroundStart lets a known background-tier stdio server connect
-	// at desktop tab startup even when the host is shared by several tabs. Keep
-	// this opt-in: most background MCP servers should stay deferred until used.
-	SharedHostBackgroundStart bool
 }
 
 // transport carries JSON-RPC messages to and from one MCP server. call sends a
@@ -565,6 +561,20 @@ func (h *Host) Failures() []Failure {
 	return out
 }
 
+// ConnectingServers returns server names whose startup handshake is currently in
+// flight. It is intentionally status-only: connected clients and failures remain
+// the source of truth for ready/issue states.
+func (h *Host) ConnectingServers() []string {
+	h.spawningMu.Lock()
+	defer h.spawningMu.Unlock()
+	out := make([]string, 0, len(h.spawning))
+	for name := range h.spawning {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // RecordFailure stores a failed MCP connection attempt for status UIs.
 func (h *Host) RecordFailure(s Spec, err error) {
 	h.mu.Lock()
@@ -1018,12 +1028,13 @@ func (c *Client) listTools(ctx context.Context) ([]tool.Tool, error) {
 		}
 		toolInfos = append(toolInfos, ToolInfo{Name: t.Name, Description: t.Description})
 		tools = append(tools, &remoteTool{
-			client:   c,
-			name:     toolName(c.name, visibleName),
-			rawName:  t.Name,
-			desc:     t.Description,
-			schema:   canonicalizeSchema(t.InputSchema),
-			readOnly: c.spec.toolReadOnly(t.Name, hinted),
+			client:          c,
+			name:            toolName(c.name, visibleName),
+			rawName:         t.Name,
+			desc:            t.Description,
+			schema:          canonicalizeSchema(t.InputSchema),
+			readOnly:        c.spec.toolReadOnly(t.Name, hinted),
+			readOnlyTrusted: c.spec.ReadOnlyToolNames[t.Name],
 		})
 	}
 	sort.SliceStable(toolInfos, func(i, j int) bool { return toolInfos[i].Name < toolInfos[j].Name })
@@ -1104,6 +1115,10 @@ type remoteTool struct {
 	desc     string
 	schema   json.RawMessage
 	readOnly bool // from MCP readOnlyHint or trusted first-party Spec override
+	// readOnlyTrusted is true only when readOnly came from a first-party
+	// Spec.ReadOnlyToolNames override, not the server's readOnlyHint. Plan mode
+	// uses it to decide whether to trust ReadOnly() at face value.
+	readOnlyTrusted bool
 }
 
 func (t *remoteTool) Name() string        { return t.name }
@@ -1113,6 +1128,14 @@ func (t *remoteTool) Description() string { return t.desc }
 // It defaults to false: opaque third-party tools must declare readOnlyHint
 // before joining reader-default permission handling or plan-mode execution.
 func (t *remoteTool) ReadOnly() bool { return t.readOnly }
+
+// PlanModeUntrustedReadOnly reports true when ReadOnly() is true only because the
+// MCP server self-reported readOnlyHint. A first-party ReadOnlyToolNames override
+// is trusted, so it returns false. Plan mode treats an untrusted read-only tool
+// like a writer unless it is declared in plan_mode_allowed_tools.
+func (t *remoteTool) PlanModeUntrustedReadOnly() bool {
+	return t.readOnly && !t.readOnlyTrusted
+}
 
 func (t *remoteTool) Schema() json.RawMessage {
 	if len(t.schema) == 0 {
