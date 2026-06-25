@@ -31,11 +31,15 @@ func (f *fakeAutoPlanClassifier) NeedsPlan(ctx context.Context, input string, sc
 }
 
 type fakeTurnRunner struct {
-	inputs []string
+	inputs               []string
+	memoryCompilerInputs []string
 }
 
 func (f *fakeTurnRunner) Run(ctx context.Context, input string) error {
 	f.inputs = append(f.inputs, input)
+	if source, ok := agent.MemoryCompilerSourceInputFromContext(ctx); ok {
+		f.memoryCompilerInputs = append(f.memoryCompilerInputs, source)
+	}
 	return nil
 }
 
@@ -107,6 +111,24 @@ func TestComposePlanModeMarker(t *testing.T) {
 	got := c.Compose("hi")
 	if !strings.HasPrefix(got, PlanModeMarker) || !strings.HasSuffix(got, "hi") {
 		t.Errorf("plan on: Compose = %q, want marker-prefixed", got)
+	}
+}
+
+func TestPlanModeMarkerMatchesPolicy(t *testing.T) {
+	for _, want := range []string{"research", "ask", "todo_write", "read_only_task", "read_only_skill"} {
+		if !strings.Contains(PlanModeMarker, want) {
+			t.Fatalf("PlanModeMarker should describe %q as available:\n%s", want, PlanModeMarker)
+		}
+	}
+	for _, forbidden := range []string{"task", "complete_step"} {
+		if strings.Contains(PlanModeMarker, forbidden+" are available") || strings.Contains(PlanModeMarker, forbidden+",") {
+			t.Fatalf("PlanModeMarker must not list blocked tool %q as available:\n%s", forbidden, PlanModeMarker)
+		}
+	}
+	for _, blocked := range []string{"write files", "unsafe shell commands", "install capabilities", "mutate memory", "delegate", "mark execution steps complete"} {
+		if !strings.Contains(PlanModeMarker, blocked) {
+			t.Fatalf("PlanModeMarker should mention blocked capability %q:\n%s", blocked, PlanModeMarker)
+		}
 	}
 }
 
@@ -766,6 +788,11 @@ func TestStripComposePrefixes(t *testing.T) {
 			want:  "explain this function",
 		},
 		{
+			name:  "legacy plan mode marker stripped",
+			input: legacyPlanModeMarker + "\n\nexplain this function",
+			want:  "explain this function",
+		},
+		{
 			name:  "plan mode marker without trailing newlines",
 			input: PlanModeMarker,
 			want:  "",
@@ -801,6 +828,63 @@ func TestStripComposePrefixes(t *testing.T) {
 			got := StripComposePrefixes(tt.input)
 			if got != tt.want {
 				t.Errorf("StripComposePrefixes() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStripReferencedContextPrefix(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "plain user message unchanged",
+			input: "explain this function",
+			want:  "explain this function",
+		},
+		{
+			name:  "file reference stripped",
+			input: "Referenced context:\n\n<file path=\"main.go\">\nfunc main() {}\n</file>\n\nexplain this function",
+			want:  "explain this function",
+		},
+		{
+			name:  "multiple file references stripped",
+			input: "Referenced context:\n\n<file path=\"a.go\">\npackage a\n</file>\n\n<file path=\"b.go\">\npackage b\n</file>\n\ncompare these files",
+			want:  "compare these files",
+		},
+		{
+			name:  "dir reference stripped",
+			input: "Referenced context:\n\n<dir path=\"src\">\nmain.go\nutil.go\n</dir>\n\nlist the files",
+			want:  "list the files",
+		},
+		{
+			name:  "resource reference stripped",
+			input: "Referenced context:\n\n<resource ref=\"@server/res\">\ndata\n</resource>\n\nanalyze this",
+			want:  "analyze this",
+		},
+		{
+			name:  "image reference stripped",
+			input: "Referenced context:\n\n<image path=\"screenshot.png\">\n[image attachment available at @screenshot.png]\n</image>\n\nwhat is in this image",
+			want:  "what is in this image",
+		},
+		{
+			name:  "only reference no user text",
+			input: "Referenced context:\n\n<file path=\"main.go\">\nfunc main() {}\n</file>\n\n",
+			want:  "",
+		},
+		{
+			name:  "empty input",
+			input: "",
+			want:  "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := StripReferencedContextPrefix(tt.input)
+			if got != tt.want {
+				t.Errorf("StripReferencedContextPrefix() = %q, want %q", got, tt.want)
 			}
 		})
 	}

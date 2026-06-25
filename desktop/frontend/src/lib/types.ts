@@ -17,8 +17,10 @@ export type EventKind =
   | "turn_done"
   | "compaction_started"
   | "compaction_done"
+  | "mcp_surface_ready"
   | "retrying"
-  | "steer";
+  | "steer"
+  | "memory_compiler_stats";
 
 export interface WireCompaction {
   trigger?: string; // "auto" | "manual"
@@ -49,6 +51,18 @@ export interface WireTool {
   profile?: WireProfile; // subagent model/effort resolved for this call
 }
 
+export interface WireCacheDiagnostics {
+  prefixHash: string;
+  prefixChanged: boolean;
+  prefixChangeReasons?: string[];
+  systemHash: string;
+  toolsHash: string;
+  logRewriteVersion: number;
+  toolSchemaTokens: number;
+  cacheMissTokens: number;
+  cacheHitTokens: number;
+}
+
 export interface WireUsage {
   promptTokens: number;
   completionTokens: number;
@@ -57,6 +71,7 @@ export interface WireUsage {
   cacheMissTokens: number;
   reasoningTokens?: number;
   source?: string;
+  cacheDiagnostics?: WireCacheDiagnostics;
   // Session-cumulative cache tokens — the status bar shows the aggregate
   // hit-rate (Σhit/Σ(hit+miss)), steadier than the single-turn cacheHitTokens.
   sessionCacheHitTokens: number;
@@ -97,10 +112,38 @@ export interface QuestionAnswer {
   selected: string[];
 }
 
+export interface MemoryCitation {
+  id?: string;
+  source: string;
+  lineStart?: number;
+  lineEnd?: number;
+  note?: string;
+  kind?: string;
+}
+
+export interface MemoryCompilerStats {
+  injected: boolean;
+  usefulIR: boolean;
+  compiledTokens: number;
+  irOverheadTokens: number;
+  memoryReferences: number;
+  constraints: number;
+  riskNotes: number;
+  executionSteps: number;
+  totalNodes: number;
+  highSignalNodes: number;
+  toolResultNodes: number;
+  decisionNodes: number;
+  strategyCount: number;
+  learningCount: number;
+}
+
 export interface WireEvent {
   kind: EventKind;
   text?: string;
   reasoning?: string;
+  memoryCitations?: MemoryCitation[];
+  memoryCompiler?: MemoryCompilerStats;
   level?: "info" | "warn";
   tool?: WireTool;
   usage?: WireUsage;
@@ -240,6 +283,7 @@ export interface HistoryMessage {
   submitText?: string;
   createdAt?: number;
   reasoning?: string;
+  memoryCitations?: MemoryCitation[];
   level?: "info" | "warn";
   toolCalls?: HistoryToolCall[];
   toolCallId?: string;
@@ -284,6 +328,7 @@ export interface CheckpointMeta {
   turn: number;
   prompt: string;
   files: string[];
+  turnFileCount?: number;
   time: number; // unix ms
   canCode?: boolean;
   canConversation?: boolean;
@@ -486,14 +531,17 @@ export interface ServerView {
   name: string;
   transport: string;
   status: "connected" | "deferred" | "failed" | "initializing" | "disabled";
+  startIntent?: "off" | "automatic" | string;
+  runtimeState?: "idle" | "connecting" | "ready" | "issue" | string;
   builtIn?: boolean;
   configured?: boolean;
   autoStart: boolean;
-  tier?: "lazy" | "background" | "eager" | string;
+  tier?: "background" | "eager" | string;
   command?: string;
   args?: string[];
   url?: string;
   envKeys?: string[];
+  headerKeys?: string[];
   tools: number;
   prompts: number;
   resources: number;
@@ -547,6 +595,7 @@ export interface MCPServerInput {
   args: string[];
   url: string;
   env?: Record<string, string> | null;
+  headers?: Record<string, string> | null;
 }
 
 export interface ModelInfo {
@@ -898,6 +947,7 @@ export interface SettingsView {
   checkUpdates: boolean; // check for new versions on startup
   telemetry: boolean; // anonymous launch ping (install id + version + OS)
   metrics: boolean; // aggregate desktop metrics (anonymous signal/bucket counts)
+  memoryCompilerEnabled: boolean; // Memory v5 execution compiler
   configPath: string;
   providerKinds: string[]; // provider implementations the kernel registered (for the kind picker)
   autoApproveTools: boolean;

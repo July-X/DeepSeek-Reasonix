@@ -534,8 +534,9 @@ function ShortcutsSection() {
               </div>
               <div className="shortcuts-settings__control">
                 <button
-                  className={`shortcuts-settings__key${isRecording ? " shortcuts-settings__key--recording" : ""}`}
+                  className={`shortcuts-settings__key${isRecording ? " shortcuts-settings__key--recording" : ""}${definition.configurable === false ? " shortcuts-settings__key--locked" : ""}`}
                   type="button"
+                  disabled={definition.configurable === false}
                   aria-label={isRecording ? t("settings.shortcutsRecording") : display}
                   aria-pressed={isRecording}
                   onClick={() => {
@@ -785,8 +786,8 @@ function normalizeSettingsView(view: SettingsView | null | undefined): SettingsV
     noProxy: "",
     proxy: { type: "socks5", server: "", port: 0, username: "", password: "" },
   };
-  const agent = view.agent ?? { temperature: 0, maxSteps: 0, plannerMaxSteps: 12, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" };
-  agent.plannerMaxSteps = Number.isFinite(agent.plannerMaxSteps) ? Math.max(0, Math.trunc(agent.plannerMaxSteps)) : 12;
+  const agent = view.agent ?? { temperature: 0, maxSteps: 0, plannerMaxSteps: 0, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" };
+  agent.plannerMaxSteps = Number.isFinite(agent.plannerMaxSteps) ? Math.max(0, Math.trunc(agent.plannerMaxSteps)) : 0;
   agent.maxSteps = Number.isFinite(agent.maxSteps) ? Math.max(0, Math.trunc(agent.maxSteps)) : 0;
   agent.reasoningLanguage = normalizeReasoningLanguage(agent.reasoningLanguage);
   return {
@@ -822,6 +823,7 @@ function normalizeSettingsView(view: SettingsView | null | undefined): SettingsV
     statusBarStyle: normalizeStatusBarStyle(view.statusBarStyle),
     statusBarItems: normalizeStatusBarItems(view.statusBarItems),
     checkUpdates: view.checkUpdates !== false,
+    memoryCompilerEnabled: view.memoryCompilerEnabled !== false,
   };
 }
 
@@ -938,6 +940,7 @@ function GeneralSection({ s, busy, apply, agentRunning }: SectionProps & { agent
   useEffect(() => onDisplayModeChange((mode) => setDisplayMode(mode)), []);
   useEffect(() => () => mouseDragCleanupRef.current?.(), []);
   const autoPlan = normalizeAutoPlan(s.autoPlan);
+  const memoryCompilerEnabled = s.memoryCompilerEnabled !== false;
   const languagePref = normalizeLangPref(s.desktopLanguage);
   const desktopLayoutStyle = normalizeDesktopLayoutStyle(s.desktopLayoutStyle);
   const [genMusicPreset, setGenMusicPreset] = useState<GenerativePreset>(getGenerativePreset());
@@ -1168,6 +1171,13 @@ function GeneralSection({ s, busy, apply, agentRunning }: SectionProps & { agent
             </button>
           ))}
         </div>
+      </SettingsField>
+      <SettingsField label={t("settings.memoryCompiler")} hint={t("settings.memoryCompilerHint")}>
+        <ToggleSegment
+          value={memoryCompilerEnabled}
+          disabled={busy}
+          onChange={(enabled) => void apply(() => app.SetMemoryCompilerEnabled(enabled))}
+        />
       </SettingsField>
       <SettingsField label={t("settings.sound")} hint={t("settings.soundHint")} stacked>
         <div className={`settings-sound-editor${soundExpanded ? " settings-sound-editor--expanded" : ""}`}>
@@ -2979,7 +2989,7 @@ function ModelsSection({ s, busy, apply, backgroundApply }: ModelsSectionProps) 
     : !providerIsConfigured(defaultProviderView)
       ? t("settings.modelNeedsKey", { provider: modelProviderLabel(defaultProvider, defaultProviderView, t) })
       : "";
-  const agent = s.agent ?? { temperature: 0, maxSteps: 0, plannerMaxSteps: 12, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" };
+  const agent = s.agent ?? { temperature: 0, maxSteps: 0, plannerMaxSteps: 0, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" };
   const setAgentSteps = (maxSteps: number, plannerMaxSteps: number) => (
     app.SetAgentParams(agent.temperature, maxSteps, plannerMaxSteps, agent.systemPrompt)
   );

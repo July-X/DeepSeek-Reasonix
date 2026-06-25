@@ -191,6 +191,7 @@ export interface AppBindings {
   AddSkillPath(path: string): Promise<void>;
   RemoveSkillPath(path: string): Promise<void>;
   RefreshSkills(): Promise<void>;
+  ReloadCommands(): Promise<void>;
   SetSkillEnabled(name: string, enabled: boolean): Promise<void>;
   SetMCPServerEnabled(name: string, enabled: boolean): Promise<void>;
   SetMCPServerTier(name: string, tier: string): Promise<void>;
@@ -279,6 +280,7 @@ export interface AppBindings {
   SetDesktopCheckUpdates(enabled: boolean): Promise<void>;
   SetDesktopTelemetry(enabled: boolean): Promise<void>;
   SetDesktopMetrics(enabled: boolean): Promise<void>;
+  SetMemoryCompilerEnabled(enabled: boolean): Promise<void>;
   SetExpandThinking(on: boolean): Promise<void>;
   MigrateDesktopPreferences(language: string, theme: string, style: string): Promise<void>;
   SetAgentParams(temperature: number, maxSteps: number, plannerMaxSteps: number, systemPrompt: string): Promise<void>;
@@ -305,6 +307,8 @@ export interface AppBindings {
   OpenGlobalTab(topicID: string): Promise<TabMeta>;
   OpenTopicSession(scope: string, workspaceRoot: string, topicID: string, sessionPath: string): Promise<TabMeta>;
   EnsureBlankTab(scope: string, workspaceRoot: string): Promise<TabMeta>;
+  ActivateTopic(scope: string, workspaceRoot: string, topicID: string, sessionPath: string): Promise<TabMeta>;
+  EnsureBlankSurface(scope: string, workspaceRoot: string): Promise<TabMeta>;
   SetActiveTab(tabID: string): Promise<void>;
   ReorderTabs(tabIDs: string[]): Promise<void>;
   CloseTab(tabID: string): Promise<void>;
@@ -527,7 +531,7 @@ function bridgeBreadcrumb(method: string): string {
     return `turn ${method}`;
   if (/^(SetModel|SetEffort|SetTokenMode|SetDefaultModel|SetPlannerModel|SetSubagentModel|SetSubagentEffort)/.test(method))
     return `model ${method}`;
-  if (/^(SetDesktop|SetCloseBehavior|SetDisplayMode|SetStatusBar|SetExpandThinking|SetAutoPlan|SetReasoningLanguage)/.test(method))
+  if (/^(SetDesktop|SetCloseBehavior|SetDisplayMode|SetStatusBar|SetExpandThinking|SetAutoPlan|SetMemoryCompilerEnabled|SetReasoningLanguage)/.test(method))
     return `settings ${method}`;
   if (/^(SaveProvider|AddOfficialProviderAccess|RemoveProviderAccess|DeleteProvider|SetProviderKey|ClearProviderKey|FetchProviderModels|ConnectKey)/.test(method))
     return `provider ${method}`;
@@ -536,7 +540,7 @@ function bridgeBreadcrumb(method: string): string {
     return `mcp ${method}`;
   if (/^(AddSkillPath|RemoveSkillPath|RefreshSkills|SetSkillEnabled|AcceptSkillSuggestion)/.test(method))
     return `skill ${method}`;
-  if (/^(OpenProjectTab|OpenGlobalTab|EnsureBlankTab|SetActiveTab|CloseTab|ReorderTabs|CreateTopic|RenameTopic|DeleteTopic|TrashTopic|RenameProject|RemoveWorkspace|SwitchWorkspace|PickWorkspace)/.test(method))
+  if (/^(OpenProjectTab|OpenGlobalTab|OpenTopicSession|EnsureBlankTab|ActivateTopic|EnsureBlankSurface|SetActiveTab|CloseTab|ReorderTabs|CreateTopic|RenameTopic|DeleteTopic|TrashTopic|RenameProject|RemoveWorkspace|SwitchWorkspace|PickWorkspace)/.test(method))
     return `nav ${method}`;
   return "";
 }
@@ -803,7 +807,7 @@ function makeMockApp(): AppBindings {
       noProxy: "",
       proxy: { type: "socks5", server: "127.0.0.1", port: 7890, username: "", password: "" },
     },
-    agent: { temperature: 0.2, maxSteps: 0, plannerMaxSteps: 12, systemPrompt: "You are Reasonix, a coding agent.", coldResumePrune: true, reasoningLanguage: "auto" },
+    agent: { temperature: 0.2, maxSteps: 0, plannerMaxSteps: 0, systemPrompt: "You are Reasonix, a coding agent.", coldResumePrune: true, reasoningLanguage: "auto" },
     bot: {
       enabled: !freshMock,
       model: "",
@@ -921,6 +925,7 @@ function makeMockApp(): AppBindings {
     checkUpdates: true,
     telemetry: true,
     metrics: true,
+    memoryCompilerEnabled: true,
     configPath: "~/projects/reasonix/reasonix.toml",
     providerKinds: ["openai"],
     autoApproveTools: false,
@@ -1062,6 +1067,58 @@ function makeMockApp(): AppBindings {
     return Boolean(topic && topic.label === t("mock.newSession") && !topic.turns && !topic.lastActivityAt && !topic.status);
   };
   const mockTopicRunsInScenario = (topicId: string) => runningMock && mockTopicIsRunning(topicId);
+  const mockLongTranscriptHistory = (): HistoryMessage[] => {
+    const out: HistoryMessage[] = [];
+    for (let i = 1; i <= 18; i++) {
+      out.push({
+        role: "user",
+        content: `第 ${i} 轮：检查聊天滚动定位，切换会话后应该自动停在最新消息底部。`,
+      });
+      if (i === 4) {
+        out.push({ role: "phase", content: "复现切换会话后的滚动位置" });
+      }
+      if (i === 8) {
+        const toolID = "mock-scroll-layout-check";
+        out.push({
+          role: "assistant",
+          content: "我会先读取滚动容器尺寸，再确认是否存在动态高度变化导致的底部偏移。",
+          reasoning: "旧实现只重置 stick 标志，没有主动等待布局稳定；AskCard、Approval、Todo 这类卡片可能在下一帧改变高度。",
+          toolCalls: [{ id: toolID, name: "bash", arguments: JSON.stringify({ command: "npm run check:css && pnpm typecheck" }) }],
+        });
+        out.push({
+          role: "tool",
+          toolCallId: toolID,
+          toolName: "bash",
+          content: "CSS syntax check passed\nz-index token check passed\ntsc --noEmit passed\n",
+        });
+        continue;
+      }
+      if (i === 13) {
+        out.push({ role: "notice", level: "info", content: "模拟提示：用户向上查看历史后，右下角应出现跳到底部按钮。" });
+      }
+      out.push({
+        role: "assistant",
+        content: [
+          `第 ${i} 轮结果：当前滚动契约会在切换会话或 reveal 信号到达后执行强制贴底。`,
+          "它会先立即设置 scrollTop 到 scrollHeight，再连续几个 animation frame 复查，避免动态内容把底部再次推走。",
+          "如果用户主动向上滚动，普通 streaming 不会强行拉回；只有点击跳到底部按钮或显式切换会话才会重新贴底。",
+        ].join("\n\n"),
+      });
+    }
+    out.push({
+      role: "compaction",
+      content: "",
+      trigger: "manual",
+      messages: 36,
+      summary: "Mock 长会话用于验证桌面端 Transcript 自动贴底、多帧布局修正和跳到底部按钮。",
+      archive: "mock-scroll-preview",
+    });
+    out.push({
+      role: "assistant",
+      content: "最终状态：这条消息应该位于真实底部。向上滚动后，右下角会显示跳到底部按钮；点击按钮后应回到这里。",
+    });
+    return out;
+  };
   const mockTopicHistory = (topicId: string): HistoryMessage[] => {
     switch (topicId) {
       case "topic_product":
@@ -1103,24 +1160,7 @@ function makeMockApp(): AppBindings {
           },
         ];
       case "topic_dev_standard":
-        return [
-          {
-            role: "user",
-            content: [
-              "[[reasonix-im]]",
-              "provider=lark",
-              "label=Feishu / Lark",
-              "sender=ou_mock_user_001",
-              "chat=p2p 会话",
-              "[[/reasonix-im]]",
-              "你可以做什么",
-            ].join("\n"),
-          },
-          {
-            role: "assistant",
-            content: "我可以在桌面端帮你处理代码编写、文件操作、项目分析和问题定位。来自 IM 的请求会进入同一条聊天时间线，桌面端继续承载模型调用、工具执行和上下文管理。",
-          },
-        ];
+        return mockLongTranscriptHistory();
       case "topic_p3b_pd":
         return [
           { role: "user", content: "把 p3b P&D 的范围和风险重新整理成可执行计划。" },
@@ -1698,7 +1738,7 @@ function makeMockApp(): AppBindings {
         async ClearSession() {},
     async Checkpoints() {
       return [
-        { turn: 0, prompt: "你好呀", files: ["src/App.tsx"], time: Date.now() - 30_000, canCode: true, canConversation: true },
+        { turn: 0, prompt: "你好呀", files: ["src/App.tsx"], turnFileCount: 1, time: Date.now() - 30_000, canCode: true, canConversation: true },
       ];
     },
     async CheckpointsForTab() {
@@ -1945,6 +1985,8 @@ function makeMockApp(): AppBindings {
         command: input.command,
         args: input.args,
         url: input.url,
+        envKeys: input.env ? Object.keys(input.env).sort() : undefined,
+        headerKeys: input.headers ? Object.keys(input.headers).sort() : undefined,
         tools,
         prompts: 0,
         resources: 0,
@@ -1958,7 +2000,7 @@ function makeMockApp(): AppBindings {
     async UpdateMCPServer(name: string, input: MCPServerInput) {
       capServers = capServers.map((s) => {
         if (s.name !== name) return s;
-        const connected = s.status === "connected" || s.status === "failed" || s.tier !== "lazy";
+        const connected = s.status === "connected" || s.status === "failed" || s.autoStart !== false;
         const nextStatus = s.status === "disabled" ? "disabled" : connected ? "connected" : "deferred";
         const nextTools = nextStatus === "connected" ? s.tools || (input.transport === "stdio" ? 3 : 5) : 0;
         return {
@@ -1969,6 +2011,7 @@ function makeMockApp(): AppBindings {
           args: input.transport === "stdio" ? input.args : [],
           url: input.transport === "stdio" ? "" : input.url,
           envKeys: input.env ? Object.keys(input.env).sort() : s.envKeys,
+          headerKeys: input.headers ? Object.keys(input.headers).sort() : s.headerKeys,
           tools: nextTools,
           error: undefined,
           authStatus: nextStatus !== "connected" && input.transport !== "stdio" ? "possible" : undefined,
@@ -1995,7 +2038,7 @@ function makeMockApp(): AppBindings {
         s.name === name
           ? {
               ...s,
-              status: s.tier === "background" || s.tier === "eager" ? "initializing" : "deferred",
+              status: s.autoStart === false ? "disabled" : "initializing",
               tools: 0,
               error: undefined,
               authStatus: s.transport !== "stdio" ? "possible" : undefined,
@@ -2034,6 +2077,7 @@ function makeMockApp(): AppBindings {
       }
     },
     async RefreshSkills() {},
+    async ReloadCommands() {},
     async SetSkillEnabled(name: string, enabled: boolean) {
       const skill = capSkills.find((s) => s.name === name);
       if (skill) skill.enabled = enabled;
@@ -2056,7 +2100,6 @@ function makeMockApp(): AppBindings {
     async SetMCPServerTier(name: string, tier: string) {
       capServers = capServers.map((s) => {
         if (s.name !== name) return s;
-        if (tier === "lazy") return { ...s, tier, autoStart: true };
         const tools = s.tools || (s.transport === "stdio" ? 3 : 5);
         return { ...s, tier, autoStart: true, status: "connected", tools, error: undefined, authStatus: undefined, authUrl: undefined };
       });
@@ -2599,6 +2642,9 @@ function makeMockApp(): AppBindings {
         async SetDesktopMetrics(enabled: boolean) {
           settings.metrics = enabled;
         },
+        async SetMemoryCompilerEnabled(enabled: boolean) {
+          settings.memoryCompilerEnabled = enabled;
+        },
         async SetExpandThinking(_on: boolean) {},
         async MigrateDesktopPreferences(language: string, theme: string, style: string) {
           if (!settings.desktopLanguage) settings.desktopLanguage = language === "en" || language === "zh" || language === "zh-TW" ? language : "";
@@ -2779,6 +2825,20 @@ function makeMockApp(): AppBindings {
       }
       const topic = await this.CreateTopic(targetScope, targetRoot, "");
       return targetScope === "global" ? this.OpenGlobalTab(topic.id) : this.OpenProjectTab(targetRoot, topic.id);
+    },
+    async ActivateTopic(scope: string, workspaceRoot: string, topicID: string, sessionPath: string) {
+      const tab = sessionPath
+        ? await this.OpenTopicSession(scope, workspaceRoot, topicID, sessionPath)
+        : scope === "project"
+          ? await this.OpenProjectTab(workspaceRoot, topicID)
+          : await this.OpenGlobalTab(topicID);
+      mockTabs = mockTabs.filter((item) => item.id === tab.id).map((item) => ({ ...item, active: true }));
+      return { ...mockTabs[0] };
+    },
+    async EnsureBlankSurface(scope: string, workspaceRoot: string) {
+      const tab = await this.EnsureBlankTab(scope, workspaceRoot);
+      mockTabs = mockTabs.filter((item) => item.id === tab.id).map((item) => ({ ...item, active: true }));
+      return { ...mockTabs[0] };
     },
     async SetActiveTab(_tabID: string) {
       setMockActiveTab(_tabID);

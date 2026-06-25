@@ -1,12 +1,11 @@
-// Lazy-tier MCP placeholder tools. A "lazy" plugin registers cheap placeholder
-// entries in the tool registry at boot — using the on-disk schema cache when
-// it exists — and defers the actual subprocess spawn / handshake to the first
-// model call. A "background" plugin is identical except it also kicks the
-// spawn off at boot so by the time the model calls, the swap is already done.
+// MCP placeholder tools. Background startup registers cheap placeholder entries
+// in the tool registry at boot — using the on-disk schema cache when it exists —
+// and kicks the real subprocess spawn / handshake immediately. By the time the
+// model calls a tool, the swap is usually already done.
 //
-// Why the indirection: a lazy/background server still needs stable placeholder
-// tools before the real handshake finishes. Once it does finish, lazySpawn swaps
-// the placeholders for real tools through tool.Registry's own lock, so the next
+// Why the indirection: a background server still needs stable placeholder tools
+// before the real handshake finishes. Once it does finish, lazySpawn swaps the
+// placeholders for real tools through tool.Registry's own lock, so the next
 // model request sees the real schemas without waiting for another placeholder
 // Execute call.
 package plugin
@@ -66,8 +65,8 @@ type lazySpawn struct {
 	removePrefix string
 }
 
-// kick starts the spawn if it has not yet started. Used by background-tier
-// registration; lazy-tier kicks on first call instead.
+// kick starts the spawn if it has not yet started. Background registration calls
+// this immediately; tests may leave it idle to exercise the placeholder path.
 func (s *lazySpawn) kick() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -90,14 +89,15 @@ func (s *lazySpawn) kick() {
 // reacquires mu to publish the result.
 func (s *lazySpawn) run() {
 	real, err := s.host.Add(s.ctx, s.spec)
+	var cacheTools []tool.Tool
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err != nil {
 		if errors.Is(err, ErrSpawningInFlight) {
 			// Another tab is already spawning this server; reset to idle so
 			// the next call retries instead of recording a spurious failure.
 			s.state = spawnIdle
 			s.spawnErr = nil
+			s.mu.Unlock()
 			return
 		}
 		if IsServerAlreadyConnected(err) {
@@ -111,17 +111,22 @@ func (s *lazySpawn) run() {
 				}
 				s.state = spawnReady
 				s.trySwap()
+				cacheTools = tools
+				s.mu.Unlock()
+				saveLazyCachedSchema(s.spec, cacheTools)
 				return
 			}
 			// ToolsFor failed — still not a real failure; just mark failed
 			// without recording it so /mcp status stays clean.
 			s.state = spawnFailed
 			s.spawnErr = err
+			s.mu.Unlock()
 			return
 		}
 		s.state = spawnFailed
 		s.spawnErr = err
 		s.host.RecordFailure(s.spec, err)
+		s.mu.Unlock()
 		return
 	}
 	s.real = make(map[string]tool.Tool, len(real))
@@ -130,6 +135,17 @@ func (s *lazySpawn) run() {
 	}
 	s.state = spawnReady
 	s.trySwap()
+	cacheTools = real
+	s.mu.Unlock()
+	saveLazyCachedSchema(s.spec, cacheTools)
+}
+
+func saveLazyCachedSchema(spec Spec, real []tool.Tool) {
+	_ = SaveCachedSchema(spec.Name, CachedSchema{
+		SpecHash:     SpecFingerprint(spec),
+		Capabilities: map[string]bool{},
+		Tools:        cacheableToolsOf(real),
+	})
 }
 
 // trySwap installs the real tools into reg if the spawn is ready and the
@@ -156,6 +172,10 @@ type lazyTool struct {
 	desc     string
 	schema   json.RawMessage
 	readOnly bool
+	// readOnlyTrusted mirrors remoteTool: true only for a first-party
+	// ReadOnlyToolNames override, so plan mode can tell trusted first-party
+	// read-only from an untrusted server readOnlyHint.
+	readOnlyTrusted bool
 	// hasCache true → schema is trusted, so Execute runs the handshake
 	// synchronously and forwards in one turn. false → schema is empty, so we
 	// can't honour the model's call; we kick the spawn async and ask for a
@@ -167,6 +187,12 @@ type lazyTool struct {
 func (lt *lazyTool) Name() string        { return lt.name }
 func (lt *lazyTool) Description() string { return lt.desc }
 func (lt *lazyTool) ReadOnly() bool      { return lt.readOnly }
+
+// PlanModeUntrustedReadOnly mirrors remoteTool: true when ReadOnly() is true only
+// from an untrusted server readOnlyHint, false for a first-party override.
+func (lt *lazyTool) PlanModeUntrustedReadOnly() bool {
+	return lt.readOnly && !lt.readOnlyTrusted
+}
 func (lt *lazyTool) Schema() json.RawMessage {
 	if len(lt.schema) == 0 {
 		return json.RawMessage(`{"type":"object"}`)
@@ -296,16 +322,16 @@ func (lt *lazyTool) Execute(ctx context.Context, args json.RawMessage) (string, 
 	}
 
 	sp.mu.Unlock()
-	return "", fmt.Errorf("lazy plugin %q in unexpected state", sp.spec.Name)
+	return "", fmt.Errorf("deferred plugin %q in unexpected state", sp.spec.Name)
 }
 
-// LazyToolset returns the placeholder tools to register for one lazy/background
-// spec. When cs is non-nil (cache hit) the returned slice has one lazyTool per
-// cached tool, carrying the cached schema so the model can pass real args;
-// the first Execute runs the handshake synchronously and swaps in real tools.
-// When cs is nil (cache miss) the returned slice has a single stub named
-// "mcp__<server>__connect": the model can call it to drive the spawn, and the
-// real tools surface on the next turn.
+// LazyToolset returns the placeholder tools to register for one background spec.
+// The name is historical: when cs is non-nil (cache hit) the returned slice has
+// one lazyTool per cached tool, carrying the cached schema so the model can pass
+// real args. If the background handshake is still pending, Execute waits for it
+// and swaps in real tools. When cs is nil (cache miss) the returned slice has a
+// single stub named "mcp__<server>__connect": the model can call it to wait for
+// the spawn, and the real tools surface on the next turn.
 //
 // kick=true (background tier) also fires off the spawn immediately, so an
 // idle session warms up without waiting for the first model call.
@@ -341,12 +367,13 @@ func LazyToolset(spec Spec, cs *CachedSchema, host *Host, reg *tool.Registry, se
 				visibleName = strings.TrimPrefix(visibleName, spec.StripRawPrefix)
 			}
 			out = append(out, &lazyTool{
-				shared:   shared,
-				name:     toolName(spec.Name, visibleName),
-				desc:     ct.Description,
-				schema:   ct.Schema,
-				readOnly: spec.toolReadOnly(ct.Name, ct.ReadOnly),
-				hasCache: true,
+				shared:          shared,
+				name:            toolName(spec.Name, visibleName),
+				desc:            ct.Description,
+				schema:          ct.Schema,
+				readOnly:        spec.toolReadOnly(ct.Name, ct.ReadOnly),
+				readOnlyTrusted: spec.ReadOnlyToolNames[ct.Name],
+				hasCache:        true,
 			})
 		}
 	}
