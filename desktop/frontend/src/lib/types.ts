@@ -296,6 +296,7 @@ export interface HistoryMessage {
   role: string;
   content: string;
   submitText?: string;
+  checkpointTurn?: number;
   createdAt?: number;
   reasoning?: string;
   memoryCitations?: MemoryCitation[];
@@ -396,6 +397,10 @@ export interface ContextInfo {
   window: number;
   sessionTokens: number;
   compactRatio?: number;
+  sessionCost?: number;
+  sessionCurrency?: string;
+  cacheHitTokens?: number;
+  cacheMissTokens?: number;
 }
 
 export interface Meta {
@@ -408,6 +413,7 @@ export interface Meta {
   workspaceName?: string;
   workspacePath?: string;
   gitBranch?: string;
+  imageInputEnabled?: boolean;
   autoApproveTools?: boolean;
   bypass?: boolean; // legacy JSON key for YOLO/full-access tool auto-approval
   collaborationMode?: CollaborationMode;
@@ -490,13 +496,17 @@ export interface CommandInfo {
 
 export interface DirEntry {
   name: string;
+  path?: string;
   isDir: boolean;
+  displayName?: string;
+  displayPath?: string;
 }
 
 export interface DroppedItem {
   kind: "workspace" | "attachment";
   path: string;
   isDir?: boolean;
+  displayPath?: string;
   previewUrl?: string;
 }
 
@@ -569,6 +579,7 @@ export interface ServerView {
   resources: number;
   error?: string;
   toolList?: MCPToolView[];
+  trustedReadOnlyTools?: string[];
   authStatus?: "none" | "possible" | "required" | string;
   authUrl?: string;
   authConfigured?: boolean;
@@ -576,6 +587,7 @@ export interface ServerView {
 export interface MCPToolView {
   name: string;
   description: string;
+  readOnlyHint?: boolean;
 }
 export interface SkillView {
   name: string;
@@ -618,6 +630,7 @@ export interface MCPServerInput {
   url: string;
   env?: Record<string, string> | null;
   headers?: Record<string, string> | null;
+  trustedReadOnlyTools?: string[];
 }
 
 export interface ModelInfo {

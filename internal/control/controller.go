@@ -92,11 +92,12 @@ type Controller struct {
 	reasoningLanguage string
 	// disableColdResumePrune skips stale-tool-result elision on cold resume.
 	// Zero value keeps the prune on (the cheaper default).
-	disableColdResumePrune bool
-	shell                  sandbox.Shell // interpreter for user-invoked "!" commands; zero = auto
-	classifier             autoPlanClassifier
-	startedOnce            bool                             // guards the one-shot SessionStart hook on first turn
-	onRemember             func(rule string) RememberResult // set via Options; invoked when user picks "always allow"
+	disableColdResumePrune     bool
+	shell                      sandbox.Shell // interpreter for user-invoked "!" commands; zero = auto
+	classifier                 autoPlanClassifier
+	startedOnce                bool                             // guards the one-shot SessionStart hook on first turn
+	onRemember                 func(rule string) RememberResult // set via Options; invoked when user picks "always allow"
+	onRememberMCPReadOnlyTrust func(serverName, rawToolName string) MCPReadOnlyTrustResult
 
 	// balanceURL/balanceKey target the active provider's optional wallet-balance
 	// endpoint (empty when the provider declares none). Captured at build so a
@@ -127,6 +128,14 @@ type Controller struct {
 	// command discovery, and the guard root for checkpoint restore writes. It is
 	// surfaced to frontends via WorkspaceRoot().
 	workspaceRoot string
+
+	// externalFolderRefs maps session-generated @ tokens to user-dropped
+	// directories outside workspaceRoot. It is intentionally per-controller:
+	// dragging a folder authorizes that folder for this chat session only, without
+	// widening scoped @ resolution to arbitrary absolute paths.
+	externalFolderRefsMu   sync.RWMutex
+	externalFolderRefs     map[string]string
+	externalFolderToolRefs externalFolderToolRefs
 
 	// checkpoints owns the snapshot-based rewind bookkeeping (the per-session
 	// store, the monotonic turn counter, and the conversation-rewind boundary map)
@@ -168,6 +177,7 @@ type pendingApproval struct {
 	tool      string
 	subject   string
 	reason    string
+	fresh     bool
 	autoDrain bool
 	reply     chan approvalReply
 }
@@ -216,6 +226,21 @@ type RememberResult struct {
 	Err       error
 }
 
+// MCPReadOnlyTrustResult describes what happened when a trusted MCP read-only
+// tool was persisted.
+type MCPReadOnlyTrustResult struct {
+	Server    string
+	Tool      string
+	Path      string
+	Saved     bool
+	CoveredBy string
+	Err       error
+}
+
+type externalFolderToolRefs interface {
+	RegisterReadRoot(token, root string)
+}
+
 // Options carries the already-built pieces setup assembles. Lifecycle metadata
 // lets the controller mint and rotate session files; Host/Commands are surfaced
 // to frontends that resolve MCP prompts and slash commands.
@@ -252,8 +277,9 @@ type Options struct {
 	PluginCtx context.Context
 	// WorkspaceRoot is the project root checkpoint restores are confined to ("" =
 	// no confinement). Frontends pass the cwd they launched the session in.
-	WorkspaceRoot string
-	AutoPlan      string
+	WorkspaceRoot          string
+	ExternalFolderToolRefs externalFolderToolRefs
+	AutoPlan               string
 	// ResponseLanguage controls final-answer language preference. Empty/auto
 	// means no transient injection because the stable language policy follows the
 	// current user turn.
@@ -274,6 +300,10 @@ type Options struct {
 	// persist to disk (e.g. "Bash(go test:*)"). The callback is wired into the
 	// permission Gate on EnableInteractiveApproval.
 	OnRemember func(rule string) RememberResult
+	// OnRememberMCPReadOnlyTrust persists a raw MCP tool name as trusted
+	// read-only when the user chooses "always allow" from the plan-mode trust
+	// prompt.
+	OnRememberMCPReadOnlyTrust func(serverName, rawToolName string) MCPReadOnlyTrustResult
 	// PlanModeAllowedTools names extra custom tools the plan-mode policy may treat
 	// as read-only. Known blocked tools and unsafe bash still lose.
 	PlanModeAllowedTools []string
@@ -299,36 +329,38 @@ func New(opts Options) *Controller {
 		pluginCtx = context.Background()
 	}
 	c := &Controller{
-		runner:                 opts.Runner,
-		executor:               opts.Executor,
-		guardianSess:           opts.Guardian,
-		guardianPath:           guardian.PathFor(opts.SessionPath),
-		sink:                   sink,
-		policy:                 opts.Policy,
-		label:                  opts.Label,
-		modelRef:               opts.ModelRef,
-		systemPrompt:           opts.SystemPrompt,
-		sessionDir:             opts.SessionDir,
-		sessionPath:            opts.SessionPath,
-		commands:               atomic.Pointer[[]command.Command]{},
-		skills:                 newSkillSet(opts.Skills, opts.AllSkills, opts.SkillStore, opts.AllSkillStore),
-		hooks:                  opts.Hooks,
-		memory:                 newMemoryManager(opts.Memory),
-		cleanup:                opts.Cleanup,
-		autoPlan:               normalizeAutoPlan(opts.AutoPlan),
-		responseLanguage:       config.NormalizeLanguage(opts.ResponseLanguage),
-		reasoningLanguage:      config.NormalizeReasoningLanguage(opts.ReasoningLanguage),
-		disableColdResumePrune: opts.DisableColdResumePrune,
-		shell:                  opts.Shell,
-		classifier:             classifier,
-		onRemember:             opts.OnRemember,
-		balanceURL:             opts.BalanceURL,
-		balanceKey:             opts.BalanceKey,
-		balanceClient:          opts.BalanceClient,
-		jobs:                   opts.Jobs,
-		mcp:                    newMcpManager(opts.Host, opts.Registry, pluginCtx),
-		workspaceRoot:          opts.WorkspaceRoot,
-		approval:               newApprovalManager(opts.Policy, ToolApprovalAsk, opts.ApprovalTimeout),
+		runner:                     opts.Runner,
+		executor:                   opts.Executor,
+		guardianSess:               opts.Guardian,
+		guardianPath:               guardian.PathFor(opts.SessionPath),
+		sink:                       sink,
+		policy:                     opts.Policy,
+		label:                      opts.Label,
+		modelRef:                   opts.ModelRef,
+		systemPrompt:               opts.SystemPrompt,
+		sessionDir:                 opts.SessionDir,
+		sessionPath:                opts.SessionPath,
+		commands:                   atomic.Pointer[[]command.Command]{},
+		skills:                     newSkillSet(opts.Skills, opts.AllSkills, opts.SkillStore, opts.AllSkillStore),
+		hooks:                      opts.Hooks,
+		memory:                     newMemoryManager(opts.Memory),
+		cleanup:                    opts.Cleanup,
+		autoPlan:                   normalizeAutoPlan(opts.AutoPlan),
+		responseLanguage:           config.NormalizeLanguage(opts.ResponseLanguage),
+		reasoningLanguage:          config.NormalizeReasoningLanguage(opts.ReasoningLanguage),
+		disableColdResumePrune:     opts.DisableColdResumePrune,
+		shell:                      opts.Shell,
+		classifier:                 classifier,
+		onRemember:                 opts.OnRemember,
+		onRememberMCPReadOnlyTrust: opts.OnRememberMCPReadOnlyTrust,
+		balanceURL:                 opts.BalanceURL,
+		balanceKey:                 opts.BalanceKey,
+		balanceClient:              opts.BalanceClient,
+		jobs:                       opts.Jobs,
+		mcp:                        newMcpManager(opts.Host, opts.Registry, pluginCtx),
+		workspaceRoot:              opts.WorkspaceRoot,
+		externalFolderToolRefs:     opts.ExternalFolderToolRefs,
+		approval:                   newApprovalManager(opts.Policy, ToolApprovalAsk, opts.ApprovalTimeout),
 	}
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
@@ -1211,9 +1243,16 @@ func (c *Controller) Approve(id string, allow, session, persist bool) {
 // Interactive frontends (chat, desktop) call this; the headless run keeps the
 // silent gate and a nil asker from setup.
 func (c *Controller) EnableInteractiveApproval() {
+	trustGate := planModeReadOnlyTrustApprover{c}
 	if c.executor != nil {
 		c.executor.SetGate(c.newInteractiveGate())
+		c.executor.SetPlanModeReadOnlyTrustGate(trustGate)
 		c.executor.SetAsker(c)
+	}
+	if setter, ok := c.runner.(interface {
+		SetPlanModeReadOnlyTrustGate(agent.PlanModeReadOnlyTrustGate)
+	}); ok {
+		setter.SetPlanModeReadOnlyTrustGate(trustGate)
 	}
 }
 
@@ -1602,6 +1641,10 @@ func (c *Controller) Checkpoints() []checkpoint.Meta {
 	return c.checkpoints.list()
 }
 
+func (c *Controller) CheckpointTurnsByMessageIndex() map[int]int {
+	return c.checkpoints.turnsByMessageIndex()
+}
+
 // rewindFail emits the error as a Warn notice (so a frontend that swallows the
 // returned error — e.g. the desktop bridge's .catch — still shows the user why
 // the rewind did nothing) and returns it.
@@ -1859,6 +1902,7 @@ func (c *Controller) SwitchBranch(ref string) (agent.BranchInfo, error) {
 	c.mu.Unlock()
 	c.setActiveJobSession(match.Path)
 	c.rebindCheckpoints(match.Path)
+	c.restoreTerminalGoalTodos(match.Path)
 	c.loadGuardianSession()
 	c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 		Text: fmt.Sprintf("switched to branch %s", branchDisplayName(match))})
@@ -1956,6 +2000,7 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 	c.mu.Unlock()
 	c.setActiveJobSession(path)
 	c.rebindCheckpoints(path)
+	c.restoreTerminalGoalTodos(path)
 	c.loadGuardianSession()
 	c.maybeColdResumePrune(path)
 }
@@ -2114,6 +2159,41 @@ func (c *Controller) messageCount() int {
 		return 0
 	}
 	return len(c.executor.Session().Snapshot())
+}
+
+// stripTurnMessagesAfter truncates the executor's session to keep only messages
+// before the given index, discarding an incomplete turn (the user prompt plus
+// every assistant / tool message that followed).  It is called when the user
+// explicitly cancels a turn so the next prompt starts clean — the model won't
+// see leftover in-progress todo items or partial tool calls and re-execute
+// interrupted work.
+func (c *Controller) stripTurnMessagesAfter(idx int) {
+	if c.executor == nil {
+		return
+	}
+	msgs := c.executor.Session().Snapshot()
+	if len(msgs) <= idx {
+		return
+	}
+	c.executor.Session().Replace(msgs[:idx])
+	// Rebuild canonical todo state from the truncated transcript so
+	// Controller.Todos(), goal readiness, and the task panel no longer see
+	// the in_progress items written by the cancelled turn.
+	c.executor.RebuildTodoState()
+	// The mid-turn autosave may have already written a partial transcript to
+	// disk.  snapshotActivityIfChanged skips the write when messageCount()
+	// returns to startMessages, so force a flush here to overwrite the stale
+	// file.  We call Session.Save directly to cover the edge case where the
+	// strip leaves only a system message (HasContent() == false), which would
+	// cause snapshot() to return early without writing.
+	c.mu.Lock()
+	path := c.sessionPath
+	c.mu.Unlock()
+	if path != "" {
+		if err := c.executor.Session().Save(path); err != nil {
+			slog.Warn("controller: post-cancel transcript flush", "err", err)
+		}
+	}
 }
 
 func (c *Controller) snapshotActivityIfChanged(startMessages int) {
@@ -2462,14 +2542,32 @@ func (c *Controller) ConnectMCPServer(e config.PluginEntry) (int, error) {
 func (c *Controller) connectMCPServer(e config.PluginEntry) (int, error) {
 	exp := e.ExpandedPlugin()
 	return c.mcp.connectSpec(plugin.ApplyKnownOverrides(plugin.Spec{
-		Name:    exp.Name,
-		Type:    exp.Type,
-		Command: exp.Command,
-		Args:    exp.Args,
-		Env:     exp.Env,
-		URL:     exp.URL,
-		Headers: exp.Headers,
+		Name:              exp.Name,
+		Type:              exp.Type,
+		Command:           exp.Command,
+		Args:              exp.Args,
+		Env:               exp.Env,
+		URL:               exp.URL,
+		Headers:           exp.Headers,
+		ReadOnlyToolNames: trustedReadOnlyToolNames(exp.TrustedReadOnlyTools),
 	}, c.WorkspaceRoot()))
+}
+
+func trustedReadOnlyToolNames(names []string) map[string]bool {
+	if len(names) == 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			out[name] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // ImportMCPEntries persists selected MCP entries and attempts to connect them
@@ -2609,6 +2707,23 @@ func (c *Controller) Label() string { return c.label }
 // (the directory that file-writers and @-references are scoped to).
 // Empty means no scoping is in effect.
 func (c *Controller) WorkspaceRoot() string { return c.workspaceRoot }
+
+func (c *Controller) imageInputEnabled() bool {
+	ref := c.modelRef
+	cfg, err := config.LoadForRoot(c.workspaceRoot)
+	if err == nil && ref == "" {
+		ref = cfg.DefaultModel
+	}
+	if err != nil || ref == "" {
+		return false
+	}
+	entry, ok := cfg.ResolveModel(ref)
+	return ok && config.EffectiveVision(entry)
+}
+
+// ImageInputEnabled reports whether the current model accepts direct image
+// inputs, so frontends can gate image-only UX before a turn starts.
+func (c *Controller) ImageInputEnabled() bool { return c.imageInputEnabled() }
 
 // InheritLifecycleFrom carries same-session lifecycle state across controller
 // rebuilds, such as model switches that preserve the conversation.
@@ -2829,6 +2944,32 @@ func (g gateApprover) ApproveWithReason(ctx context.Context, tool, subject strin
 	}
 	allow, remember, err := g.c.requestApproval(ctx, tool, subject, args)
 	return allow, remember, "", err
+}
+
+type planModeReadOnlyTrustApprover struct{ c *Controller }
+
+func (p planModeReadOnlyTrustApprover) CheckPlanModeReadOnlyTrust(ctx context.Context, req agent.PlanModeReadOnlyTrustRequest) (bool, string, error) {
+	server := strings.TrimSpace(req.ServerName)
+	rawTool := strings.TrimSpace(req.RawToolName)
+	if server == "" || rawTool == "" {
+		return false, "this MCP tool did not expose enough metadata to remember a read-only trust decision.", nil
+	}
+	subject := fmt.Sprintf("MCP %s/%s as read-only for planning and research", server, rawTool)
+	reason := "This MCP tool reports read-only, but external read-only hints need your confirmation before plan mode can use them. Choose always allow to remember this trust for future planning and read-only research."
+	reply, err := p.c.requestFreshApprovalDecision(ctx, req.ToolName, subject, req.Args, reason)
+	if err != nil {
+		return false, "approval aborted", err
+	}
+	if !reply.allow {
+		return false, "the user declined to trust this MCP read-only hint — do not retry it; continue with other trusted read-only tools or ask how to proceed.", nil
+	}
+	if reply.session {
+		p.c.approval.grantSession(req.ToolName, subject)
+	}
+	if reply.persist && p.c.onRememberMCPReadOnlyTrust != nil {
+		p.c.emitMCPReadOnlyTrustResult(p.c.onRememberMCPReadOnlyTrust(server, rawTool))
+	}
+	return true, "", nil
 }
 
 func approvalDisplaySubject(tool, subject string, args json.RawMessage) string {
@@ -3219,11 +3360,42 @@ func (c *Controller) requestApproval(ctx context.Context, tool, subject string, 
 }
 
 func (c *Controller) requestApprovalWithReason(ctx context.Context, tool, subject string, args json.RawMessage, reason string) (bool, bool, error) {
+	r, err := c.requestApprovalDecision(ctx, tool, subject, args, reason)
+	if err != nil {
+		return false, false, err
+	}
+	// Plan approvals are one-shot — never persist a session grant for them, or
+	// every future plan would auto-approve.
+	if r.allow && r.session && !requiresFreshApprovalTool(tool) {
+		c.approval.grantSession(tool, subject)
+	}
+	if r.allow && r.persist && !requiresFreshApprovalTool(tool) && c.onRemember != nil {
+		c.emitRememberResult(c.onRemember(permission.RememberRuleForScope(tool, subject)))
+	}
+	return r.allow, false, nil
+}
+
+func (c *Controller) requestApprovalDecision(ctx context.Context, tool, subject string, args json.RawMessage, reason string) (approvalReply, error) {
+	return c.requestApprovalDecisionWithOptions(ctx, tool, subject, args, reason, approvalDecisionOptions{})
+}
+
+func (c *Controller) requestFreshApprovalDecision(ctx context.Context, tool, subject string, args json.RawMessage, reason string) (approvalReply, error) {
+	return c.requestApprovalDecisionWithOptions(ctx, tool, subject, args, reason, approvalDecisionOptions{fresh: true})
+}
+
+type approvalDecisionOptions struct {
+	// fresh marks a user trust/business decision rather than an ordinary tool
+	// permission. It may reuse an explicit session grant, but YOLO/auto approval
+	// must not answer or drain the prompt.
+	fresh bool
+}
+
+func (c *Controller) requestApprovalDecisionWithOptions(ctx context.Context, tool, subject string, args json.RawMessage, reason string, opts approvalDecisionOptions) (approvalReply, error) {
 	// YOLO/full access and the just-approved-plan execution window auto-allow
 	// approval-gated tools without prompting. Plan approval is a user decision,
 	// not a tool permission, so it deliberately stays interactive.
-	if c.approval.preApproved(tool, subject) {
-		return true, false, nil
+	if c.approval.preApprovedForDecision(tool, subject, opts.fresh) {
+		return approvalReply{allow: true}, nil
 	}
 
 	c.approval.promptMu.Lock()
@@ -3231,10 +3403,16 @@ func (c *Controller) requestApprovalWithReason(ctx context.Context, tool, subjec
 
 	// Re-check: a session grant may have landed while we queued behind another
 	// prompt for the same subject.
-	if c.approval.preApproved(tool, subject) {
-		return true, false, nil
+	if c.approval.preApprovedForDecision(tool, subject, opts.fresh) {
+		return approvalReply{allow: true}, nil
 	}
-	id, reply := c.approval.register(tool, subject, reason)
+	var id string
+	var reply chan approvalReply
+	if opts.fresh {
+		id, reply = c.approval.registerDecision(tool, subject, reason, true)
+	} else {
+		id, reply = c.approval.register(tool, subject, reason)
+	}
 
 	c.sink.Emit(event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{ID: id, Tool: tool, Subject: subject, Reason: reason}})
 	if hookSubject, hookArgs, ok := permissionRequestHookPayload(tool, subject, args); ok {
@@ -3249,18 +3427,10 @@ func (c *Controller) requestApprovalWithReason(ctx context.Context, tool, subjec
 
 	select {
 	case r := <-reply:
-		// Plan approvals are one-shot — never persist a session grant for them, or
-		// every future plan would auto-approve.
-		if r.allow && r.session && !requiresFreshApprovalTool(tool) {
-			c.approval.grantSession(tool, subject)
-		}
-		if r.allow && r.persist && !requiresFreshApprovalTool(tool) && c.onRemember != nil {
-			c.emitRememberResult(c.onRemember(permission.RememberRuleForScope(tool, subject)))
-		}
-		return r.allow, false, nil
+		return r, nil
 	case <-waitCtx.Done():
 		c.approval.cancel(id)
-		return false, false, waitCtx.Err()
+		return approvalReply{}, waitCtx.Err()
 	}
 }
 
@@ -3278,6 +3448,25 @@ func (c *Controller) emitRememberResult(r RememberResult) {
 		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(i18n.M.PermissionSavedFmt, r.Path, r.Rule)})
 	case strings.TrimSpace(r.CoveredBy) != "":
 		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(i18n.M.PermissionAlreadyAllowedFmt, r.Path, r.CoveredBy)})
+	}
+}
+
+func (c *Controller) emitMCPReadOnlyTrustResult(r MCPReadOnlyTrustResult) {
+	server := strings.TrimSpace(r.Server)
+	toolName := strings.TrimSpace(r.Tool)
+	if r.Err != nil {
+		c.sink.Emit(event.Event{
+			Kind:  event.Notice,
+			Level: event.LevelWarn,
+			Text:  fmt.Sprintf(i18n.M.MCPReadOnlyTrustFailedFmt, server, toolName, r.Err),
+		})
+		return
+	}
+	switch {
+	case r.Saved:
+		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(i18n.M.MCPReadOnlyTrustSavedFmt, r.Path, server, toolName)})
+	case strings.TrimSpace(r.CoveredBy) != "":
+		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(i18n.M.MCPReadOnlyTrustAlreadyFmt, r.Path, server, r.CoveredBy)})
 	}
 }
 

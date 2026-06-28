@@ -39,9 +39,10 @@ interface AttachmentDedupKey {
   source: string;
 }
 
-interface WorkspaceReference {
+export interface WorkspaceReference {
   path: string;
   isDir?: boolean;
+  displayPath?: string;
 }
 
 const LONG_PASTE_MIN_CHARS = 2000;
@@ -107,6 +108,10 @@ function attachmentExt(name: string): string {
   return dot >= 0 ? name.slice(dot + 1).toUpperCase() : "";
 }
 
+function hasImageAttachments(items: Attachment[]): boolean {
+  return items.some((attachment) => Boolean(attachment.previewUrl));
+}
+
 function displayRefName(name: string): string {
   return name.replace(/[\[\]\(\)\r\n]+/g, " ").replace(/\s+/g, " ").trim() || "attachment";
 }
@@ -125,6 +130,29 @@ function sortComposerAttachments(items: Attachment[]): Attachment[] {
 
 function workspaceReferenceKey(ref: WorkspaceReference): string {
   return `${ref.isDir ? "dir" : "file"}:${ref.path}`;
+}
+
+function dirEntrySubmitPath(entry: DirEntry, atDir: string): string {
+  return entry.path || atDir + entry.name;
+}
+
+function dirEntryMenuLabel(entry: DirEntry): string {
+  return entry.displayName || entry.name;
+}
+
+export function composerPickFileEntry(
+  text: string,
+  atRaw: string | null,
+  atDir: string,
+  entry: DirEntry,
+): { text: string; workspaceRef?: WorkspaceReference } {
+  const atPos = text.length - (atRaw?.length ?? 0) - 1; // index of '@'
+  const prefix = text.slice(0, Math.max(0, atPos));
+  const refPath = dirEntrySubmitPath(entry, atDir);
+  if (entry.path || entry.displayPath) {
+    return { text: prefix, workspaceRef: { path: refPath, isDir: entry.isDir, displayPath: entry.displayPath } };
+  }
+  return { text: prefix + "@" + refPath + (entry.isDir ? "/" : " ") };
 }
 
 function emptyComposerDraft(): ComposerDraft {
@@ -385,6 +413,7 @@ export function Composer({
   goal,
   cwd,
   modelLabel,
+  imageInputEnabled = true,
   tabId,
   effort,
   onSend,
@@ -417,6 +446,7 @@ export function Composer({
   goal?: string;
   cwd?: string;
   modelLabel: string;
+  imageInputEnabled?: boolean;
   tabId?: string;
   effort?: EffortInfo;
   onSend: (displayText: string, submitText?: string) => void | Promise<void>;
@@ -952,7 +982,7 @@ export function Composer({
 
   const removeAttachment = (path: string) => {
     forgetAttachment(path);
-    setAttachments((prev) => prev.filter((x) => x.path !== path));
+    setAttachments(attachmentsRef.current.filter((x) => x.path !== path));
     requestAnimationFrame(() => taRef.current?.focus());
   };
 
@@ -1083,12 +1113,18 @@ export function Composer({
   const activeGoal = (goal ?? "").trim();
   const goalModeOn = collaborationMode === "goal";
   const tokenModeOn = tokenMode === "economy";
+  const warnImageInputFallback = useCallback((message = t("composer.imageInputUnsupported")) => {
+    showToast(message, "warn");
+  }, [showToast, t]);
 
   const submit = async () => {
     if (disabled || submitDisabled || readOnly || submittingRef.current) return;
     const submitDraftKey = activeDraftKeyRef.current;
     const trimmedText = text.trim();
     if (pendingPaste > 0) return;
+    if (!imageInputEnabled && hasImageAttachments(attachmentsRef.current)) {
+      warnImageInputFallback();
+    }
     if (!trimmedText && attachments.length === 0 && workspaceRefs.length === 0) {
       if (goalModeOn && !activeGoal) {
         setComposerPrompt(t("composer.goalInputRequired"));
@@ -1106,7 +1142,7 @@ export function Composer({
         ...orderedAttachments.map((a) => `@${a.path}`),
       ].join(" ");
       const displayRefs = [
-        ...workspaceRefs.map((ref) => formatWorkspaceReference(ref.path, ref.isDir)),
+        ...workspaceRefs.map((ref) => formatWorkspaceReference(ref.displayPath || ref.path, ref.isDir)),
         ...orderedAttachments.map(formatAttachmentDisplayReference),
       ].join(" ");
       const displayText = [trimmedText, displayRefs].filter(Boolean).join(trimmedText && displayRefs ? " " : "");
@@ -1214,7 +1250,7 @@ export function Composer({
         if (attachmentSeenInDraft(sourceDraftKey, key)) continue;
         const item = await app.AttachDropped(path);
         if (item.kind === "workspace") {
-          addWorkspaceReferenceToDraft(sourceDraftKey, { path: item.path, isDir: item.isDir });
+          addWorkspaceReferenceToDraft(sourceDraftKey, { path: item.path, isDir: item.isDir, displayPath: item.displayPath });
         } else {
           addAttachmentToDraft(sourceDraftKey, { path: item.path, previewUrl: item.previewUrl, displayName: baseName(path) }, key);
         }
@@ -1496,10 +1532,14 @@ export function Composer({
   };
 
   const pickEntry = (e: DirEntry) => {
-    const atPos = text.length - (atRaw?.length ?? 0) - 1; // index of '@'
-    const prefix = text.slice(0, atPos);
+    const picked = composerPickFileEntry(text, atRaw, atDir, e);
+    if (picked.workspaceRef) {
+      setTextCaretEnd(picked.text);
+      addWorkspaceReference(picked.workspaceRef);
+      return;
+    }
     // A directory keeps the menu open (trailing "/"); a file completes it (space).
-    setTextCaretEnd(prefix + "@" + atDir + e.name + (e.isDir ? "/" : " "));
+    setTextCaretEnd(picked.text);
   };
 
   // --- past:chats session reference ---
@@ -2066,7 +2106,7 @@ export function Composer({
           <VirtualMenu
             items={atMenuItems}
             activeIndex={active}
-            itemKey={(it) => (it.kind === "pastChats" ? "past:chats" : (it.entry.isDir ? "d:" : "f:") + it.entry.name)}
+            itemKey={(it) => (it.kind === "pastChats" ? "past:chats" : (it.entry.isDir ? "d:" : "f:") + (it.entry.path || it.entry.name))}
             renderItem={(it, i) =>
               it.kind === "pastChats" ? (
                 <button
@@ -2097,7 +2137,7 @@ export function Composer({
                     <FileText size={13} className="filemenu__icon" />
                   )}
                   <span className="slashmenu__name slashmenu__name--file">
-                    {it.entry.name}
+                    {dirEntryMenuLabel(it.entry)}
                     {it.entry.isDir ? "/" : ""}
                   </span>
                 </button>
@@ -2142,11 +2182,11 @@ export function Composer({
             <ComposerContextCard
               key={workspaceReferenceKey(ref)}
               variant="workspace"
-              tooltipLabel={formatWorkspaceReference(ref.path, ref.isDir)}
+              tooltipLabel={ref.displayPath ? formatWorkspaceReference(ref.displayPath, ref.isDir) : formatWorkspaceReference(ref.path, ref.isDir)}
               removeLabel={t("composer.removeReference")}
               onRemove={() => removeWorkspaceReference(ref)}
               folder={Boolean(ref.isDir)}
-              label={ref.isDir ? `${baseName(ref.path)}/` : baseName(ref.path)}
+              label={ref.isDir ? `${baseName(ref.displayPath || ref.path)}/` : baseName(ref.displayPath || ref.path)}
             />
           ))}
           {sessionRefs.map((ref) => (

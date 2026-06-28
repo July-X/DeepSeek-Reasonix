@@ -239,7 +239,7 @@ func (a *App) detachSessionRuntime(tab *WorkspaceTab) bool {
 		return false
 	}
 	if tab.sink != nil {
-		tab.sink.ctx = nil
+		tab.sink.clearContext()
 	}
 	a.mu.Lock()
 	a.ensureDetachedSessionsLocked()
@@ -299,7 +299,11 @@ func (a *App) detachRuntimeForReplacement(tab *WorkspaceTab) bool {
 	}
 	if detached.sink != nil {
 		detached.sink.tabID = detached.ID
-		detached.sink.ctx = nil
+		// clearContext (locked nil + drain the queued emitter), not a bare
+		// ctx=nil: the latter both data-races s.ctx and leaves already-queued
+		// events to flush onto the rebound tab after this session is backgrounded
+		// (#5352 — stale "AI 不断输出" on the now-visible session).
+		detached.sink.clearContext()
 	}
 
 	a.mu.Lock()
@@ -321,7 +325,7 @@ func applyRuntimeTab(target, source *WorkspaceTab, key string, wailsCtx context.
 	if source.sink != nil {
 		source.sink.tabID = target.ID
 		source.sink.app = app
-		source.sink.ctx = wailsCtx
+		source.sink.setContext(wailsCtx)
 	}
 
 	target.Ctrl = source.Ctrl
@@ -671,6 +675,9 @@ func (s *tabEventSink) Emit(e event.Event) {
 				m.persist()
 			}
 		}
+		if e.Kind == event.TurnDone {
+			s.flushPlannerDisplay()
+		}
 	}
 	s.emitRuntimeEvent(eventChannel, toWireTab(e, s.tabID))
 	if s.app != nil {
@@ -690,7 +697,6 @@ func (s *tabEventSink) Emit(e event.Event) {
 	}
 	// Persist after each turn so a force-kill loses at most the in-flight prompt.
 	if e.Kind == event.TurnDone && s.app != nil {
-		s.flushPlannerDisplay()
 		s.app.scheduleTabSnapshot(s.tabID)
 	}
 }
@@ -1333,6 +1339,9 @@ func (a *App) OpenTopicSession(scope, workspaceRoot, topicID, sessionPath string
 // the classic tab path, then prunes every non-active visible tab so historical
 // clicks do not accumulate hidden startup work.
 func (a *App) ActivateTopic(scope, workspaceRoot, topicID, sessionPath string) (TabMeta, error) {
+	a.singleSurfaceMu.Lock()
+	defer a.singleSurfaceMu.Unlock()
+
 	var meta TabMeta
 	var err error
 	if strings.TrimSpace(sessionPath) != "" {
@@ -1352,6 +1361,9 @@ func (a *App) ActivateTopic(scope, workspaceRoot, topicID, sessionPath string) (
 // creating or reusing a blank session, it removes other visible tabs while
 // preserving running runtimes as detached background sessions.
 func (a *App) EnsureBlankSurface(scope, workspaceRoot string) (TabMeta, error) {
+	a.singleSurfaceMu.Lock()
+	defer a.singleSurfaceMu.Unlock()
+
 	meta, err := a.EnsureBlankTab(scope, workspaceRoot)
 	if err != nil {
 		return TabMeta{}, err
@@ -1865,6 +1877,9 @@ func (a *App) keepOnlyVisibleTab(tabID string) (TabMeta, error) {
 }
 
 func (a *App) applySingleSurfaceTabPolicy() error {
+	a.singleSurfaceMu.Lock()
+	defer a.singleSurfaceMu.Unlock()
+
 	a.mu.RLock()
 	tabID := a.activeTabID
 	if tabID == "" || a.tabs[tabID] == nil {
@@ -4454,6 +4469,7 @@ type topicTrashTarget struct {
 }
 
 func (a *App) topicTrashTargets(topicID string) ([]topicTrashTarget, error) {
+	topicID = strings.TrimSpace(topicID)
 	var targets []topicTrashTarget
 	seen := map[string]bool{}
 	addTarget := func(dir, path string) error {
@@ -4473,15 +4489,15 @@ func (a *App) topicTrashTargets(topicID string) ([]topicTrashTarget, error) {
 		return nil
 	}
 	for _, dir := range a.knownSessionDirs() {
-		infos, err := agent.ListSessions(dir)
+		index, err := topicSessionIndexForDir(dir)
 		if err != nil {
 			return nil, err
 		}
-		for _, info := range infos {
-			if info.TopicID != topicID {
+		for _, match := range index.byTopic[topicID] {
+			if agent.IsCleanupPending(match.path) {
 				continue
 			}
-			if err := addTarget(dir, info.Path); err != nil {
+			if err := addTarget(dir, match.path); err != nil {
 				return nil, err
 			}
 		}
@@ -5050,7 +5066,7 @@ func currentTabCollaborationMode(tab *WorkspaceTab) string {
 	if tab == nil {
 		return "normal"
 	}
-	if tab.Ctrl != nil && tab.Ctrl.PlanMode() {
+	if tabModeHasPlan(currentTabMode(tab)) {
 		return "plan"
 	}
 	if strings.TrimSpace(currentTabGoal(tab)) != "" && currentTabGoalStatus(tab) == control.GoalStatusRunning {

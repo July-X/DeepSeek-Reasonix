@@ -3698,6 +3698,18 @@ a[href] {
   color: var(--fg-faint);
   font-variant-numeric: tabular-nums;
 }
+.msg-meta__indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--fg-faint);
+  opacity: 0.45;
+  cursor: default;
+  user-select: none;
+  flex-shrink: 0;
+}
 .msg-meta__btn,
 .msg-meta .copybtn {
   display: inline-flex;
@@ -4483,7 +4495,7 @@ a[href] {
   transition: opacity 0.12s;
 }
 .code-block__copy:hover,
-.code:hover .code-block__copy {
+.code-block__wrap:hover .code-block__copy {
   opacity: 1;
 }
 .code-block__wrap {
@@ -8279,7 +8291,7 @@ a[href] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--mono);
+  font-family: var(--font-content-family);
   font-size: 11.5px;
   line-height: 1.35;
   color: var(--fg-faint);
@@ -9514,8 +9526,8 @@ a[href] {
 }
 .cap-tool-list {
   display: grid;
-  grid-template-columns: minmax(82px, max-content) minmax(0, 1fr);
-  column-gap: 14px;
+  grid-template-columns: minmax(82px, max-content) minmax(0, 1fr) minmax(58px, max-content);
+  column-gap: 12px;
   row-gap: 5px;
   margin: 0 0 9px 31px;
   padding: 7px 0 2px 12px;
@@ -9543,13 +9555,79 @@ a[href] {
 }
 .cap-tool__desc {
   min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
   color: var(--fg-dim);
   font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
+.cap-tool__action {
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
+  min-width: 0;
+}
+.cap-tool-trust,
+.cap-tool-trust-btn,
+.cap-tool-untrust-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 58px;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.cap-trust-bulk {
+  gap: 5px;
+}
+.cap-tool-trust {
+  border: 1px solid color-mix(in srgb, var(--ok) 34%, transparent);
+  border-radius: 999px;
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 9%, transparent);
+}
+.cap-tool-hint {
+  display: inline-flex;
+  align-items: center;
+  min-height: 17px;
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  border-radius: 999px;
+  color: var(--fg-dim);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.cap-tool-trust-stack {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+}
+.cap-tool-trust-btn,
+.cap-tool-untrust-btn {
+  border-color: var(--border-soft);
+  color: var(--fg-dim);
+}
+.cap-tool-trust-btn:hover:not(:disabled),
+.cap-tool-untrust-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--ok) 42%, var(--border));
+  color: var(--fg);
+}
+.cap-tool-untrust-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--warn) 42%, var(--border));
+}
 .cap-server-entry--disabled .cap-tool__name,
-.cap-server-entry--disabled .cap-tool__desc {
+.cap-server-entry--disabled .cap-tool__desc,
+.cap-server-entry--disabled .cap-tool__action {
   color: var(--fg-faint);
 }
 .cap-server-details {
@@ -22825,7 +22903,7 @@ a[href] {
 .toast {
   pointer-events: auto;
   cursor: pointer;
-  background: var(--bg);
+  background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px 20px;
@@ -22840,26 +22918,14 @@ a[href] {
   user-select: none;
 }
 .toast--warn {
-  border-color: #eab308;
-  background: #fefce8;
-  color: #713f12;
+  border-color: color-mix(in srgb, var(--warn) 38%, var(--border));
+  background: color-mix(in srgb, var(--warn) 12%, var(--bg-elev));
+  color: color-mix(in srgb, var(--warn) 78%, var(--fg));
 }
 .toast--error {
-  border-color: #ef4444;
-  background: #fef2f2;
-  color: #991b1b;
-}
-@media (prefers-color-scheme: dark) {
-  .toast--warn {
-    background: #422006;
-    border-color: #a16207;
-    color: #fde68a;
-  }
-  .toast--error {
-    background: #450a0a;
-    border-color: #dc2626;
-    color: #fca5a5;
-  }
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg-elev));
+  color: color-mix(in srgb, var(--danger) 78%, var(--fg));
 }
 .toast__icon {
   flex: 0 0 auto;
@@ -24810,8 +24876,8 @@ a[href] {
   word-break: break-word;
 }
 
-.app--creation .msg--assistant .md .code:not([data-lang]) .code-block__copy,
-:root[data-theme-style] .app--creation .msg--assistant .md .code:not([data-lang]) .code-block__copy {
+.app--creation .msg--assistant .md .code:not([data-lang]) + .code-block__copy,
+:root[data-theme-style] .app--creation .msg--assistant .md .code:not([data-lang]) + .code-block__copy {
   top: 2px;
   right: 2px;
   color: color-mix(in srgb, var(--fg-faint) 58%, var(--bg));
@@ -24879,16 +24945,16 @@ a[href] {
   content: ">";
 }
 
-.app--creation .msg--assistant .md .code[data-lang="bash"] .code-block__copy,
-.app--creation .msg--assistant .md .code[data-lang="shell"] .code-block__copy,
-.app--creation .msg--assistant .md .code[data-lang="sh"] .code-block__copy,
-.app--creation .msg--assistant .md .code[data-lang="powershell"] .code-block__copy,
-.app--creation .msg--assistant .md .code[data-lang="pwsh"] .code-block__copy,
-:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="bash"] .code-block__copy,
-:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="shell"] .code-block__copy,
-:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="sh"] .code-block__copy,
-:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="powershell"] .code-block__copy,
-:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="pwsh"] .code-block__copy {
+.app--creation .msg--assistant .md .code[data-lang="bash"] + .code-block__copy,
+.app--creation .msg--assistant .md .code[data-lang="shell"] + .code-block__copy,
+.app--creation .msg--assistant .md .code[data-lang="sh"] + .code-block__copy,
+.app--creation .msg--assistant .md .code[data-lang="powershell"] + .code-block__copy,
+.app--creation .msg--assistant .md .code[data-lang="pwsh"] + .code-block__copy,
+:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="bash"] + .code-block__copy,
+:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="shell"] + .code-block__copy,
+:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="sh"] + .code-block__copy,
+:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="powershell"] + .code-block__copy,
+:root[data-theme-style] .app--creation .msg--assistant .md .code[data-lang="pwsh"] + .code-block__copy {
   top: 5px;
   right: 5px;
   color: color-mix(in srgb, var(--fg-faint) 58%, var(--bg));
