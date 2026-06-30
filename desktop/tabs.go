@@ -52,6 +52,7 @@ type WorkspaceTab struct {
 	buildCancel     context.CancelFunc // cancels in-flight boot for tabs removed before Ready
 	buildGeneration uint64             // identifies the current in-flight build
 	removed         bool               // set when the visible tab is pruned/closed before build completes
+	reconcileMu     sync.Mutex         // serializes stale controller workspace repair for this tab
 
 	ActivityStatus string // transient project-tree status for the in-flight turn
 
@@ -123,9 +124,8 @@ type sessionUsageStats struct {
 	SessionCostUsd   float64                     `json:"sessionCostUsd,omitempty"`
 	Sources          map[string]usageSourceStats `json:"sources,omitempty"`
 
-	activeTurnStartedAt            int64
-	executorSessionCacheHitTokens  int
-	executorSessionCacheMissTokens int
+	activeTurnStartedAt int64
+	sourceSessionCache  map[string]sourceSessionCacheCounters
 }
 
 type usageSourceStats struct {
@@ -139,6 +139,56 @@ type usageSourceStats struct {
 	SessionCost      float64 `json:"sessionCost,omitempty"`
 	SessionCurrency  string  `json:"sessionCurrency,omitempty"`
 	SessionCostUsd   float64 `json:"sessionCostUsd,omitempty"`
+}
+
+type sourceSessionCacheCounters struct {
+	Hit  int
+	Miss int
+}
+
+func cloneSessionUsageStats(in sessionUsageStats) sessionUsageStats {
+	out := in
+	if len(in.Sources) > 0 {
+		out.Sources = make(map[string]usageSourceStats, len(in.Sources))
+		for source, stats := range in.Sources {
+			out.Sources[source] = stats
+		}
+	}
+	if len(in.sourceSessionCache) > 0 {
+		out.sourceSessionCache = make(map[string]sourceSessionCacheCounters, len(in.sourceSessionCache))
+		for source, counters := range in.sourceSessionCache {
+			out.sourceSessionCache[source] = counters
+		}
+	}
+	return out
+}
+
+func (s *sessionUsageStats) cacheTokenDelta(source string, u *provider.Usage, sessionHit, sessionMiss int) (hit, miss int) {
+	if u != nil {
+		hit = u.CacheHitTokens
+		miss = u.CacheMissTokens
+	}
+	if source != event.UsageSourceExecutor && source != event.UsageSourcePlanner {
+		return hit, miss
+	}
+	if sessionHit+sessionMiss <= 0 {
+		return hit, miss
+	}
+	if s.sourceSessionCache == nil {
+		s.sourceSessionCache = map[string]sourceSessionCacheCounters{}
+	}
+	prev, ok := s.sourceSessionCache[source]
+	s.sourceSessionCache[source] = sourceSessionCacheCounters{Hit: sessionHit, Miss: sessionMiss}
+	if !ok {
+		return sessionHit, sessionMiss
+	}
+	if sessionHit < prev.Hit || sessionMiss < prev.Miss {
+		if hit+miss > 0 {
+			return hit, miss
+		}
+		return sessionHit, sessionMiss
+	}
+	return sessionHit - prev.Hit, sessionMiss - prev.Miss
 }
 
 type tabTelemetrySnapshot struct {
@@ -255,7 +305,7 @@ func cloneDetachedRuntimeTab(tab *WorkspaceTab, key string) *WorkspaceTab {
 	}
 	tab.telemMu.Lock()
 	readTelemetry := append([]readFileRecord(nil), tab.readTelemetry...)
-	usageTelemetry := tab.usageTelemetry
+	usageTelemetry := cloneSessionUsageStats(tab.usageTelemetry)
 	tab.telemMu.Unlock()
 
 	return &WorkspaceTab{
@@ -319,7 +369,7 @@ func applyRuntimeTab(target, source *WorkspaceTab, key string, wailsCtx context.
 	}
 	source.telemMu.Lock()
 	readTelemetry := append([]readFileRecord(nil), source.readTelemetry...)
-	usageTelemetry := source.usageTelemetry
+	usageTelemetry := cloneSessionUsageStats(source.usageTelemetry)
 	source.telemMu.Unlock()
 
 	if source.sink != nil {
@@ -439,20 +489,9 @@ func (t *WorkspaceTab) recordUsage(e event.Event) {
 	t.usageTelemetry.CompletionTokens += u.CompletionTokens
 	t.usageTelemetry.TotalTokens += u.TotalTokens
 	t.usageTelemetry.ReasoningTokens += u.ReasoningTokens
-	if source == event.UsageSourceExecutor && e.SessionHit+e.SessionMiss > 0 {
-		if e.SessionHit < t.usageTelemetry.executorSessionCacheHitTokens || e.SessionMiss < t.usageTelemetry.executorSessionCacheMissTokens {
-			t.usageTelemetry.CacheHitTokens += u.CacheHitTokens
-			t.usageTelemetry.CacheMissTokens += u.CacheMissTokens
-		} else {
-			t.usageTelemetry.CacheHitTokens += e.SessionHit - t.usageTelemetry.executorSessionCacheHitTokens
-			t.usageTelemetry.CacheMissTokens += e.SessionMiss - t.usageTelemetry.executorSessionCacheMissTokens
-		}
-		t.usageTelemetry.executorSessionCacheHitTokens = e.SessionHit
-		t.usageTelemetry.executorSessionCacheMissTokens = e.SessionMiss
-	} else {
-		t.usageTelemetry.CacheHitTokens += u.CacheHitTokens
-		t.usageTelemetry.CacheMissTokens += u.CacheMissTokens
-	}
+	cacheHitTokens, cacheMissTokens := t.usageTelemetry.cacheTokenDelta(source, u, e.SessionHit, e.SessionMiss)
+	t.usageTelemetry.CacheHitTokens += cacheHitTokens
+	t.usageTelemetry.CacheMissTokens += cacheMissTokens
 	t.usageTelemetry.RequestCount++
 	if t.usageTelemetry.Sources == nil {
 		t.usageTelemetry.Sources = map[string]usageSourceStats{}
@@ -462,8 +501,8 @@ func (t *WorkspaceTab) recordUsage(e event.Event) {
 	src.CompletionTokens += u.CompletionTokens
 	src.TotalTokens += u.TotalTokens
 	src.ReasoningTokens += u.ReasoningTokens
-	src.CacheHitTokens += u.CacheHitTokens
-	src.CacheMissTokens += u.CacheMissTokens
+	src.CacheHitTokens += cacheHitTokens
+	src.CacheMissTokens += cacheMissTokens
 	src.RequestCount++
 	if e.Pricing != nil {
 		cost := e.Pricing.Cost(u)
@@ -497,8 +536,7 @@ func (t *WorkspaceTab) telemetrySnapshot() tabTelemetrySnapshot {
 		}
 	}
 	usage.activeTurnStartedAt = 0
-	usage.executorSessionCacheHitTokens = 0
-	usage.executorSessionCacheMissTokens = 0
+	usage.sourceSessionCache = nil
 	return tabTelemetrySnapshot{Version: 2, ReadFiles: records, Usage: usage}
 }
 
@@ -841,7 +879,7 @@ func isBackgroundJobLifecycleNotice(e event.Event) bool {
 			strings.Contains(text, " killed: "))
 }
 
-func (a *App) emitReady(ctx context.Context) {
+func (a *App) emitReady(ctx context.Context, tabID ...string) {
 	a.mu.RLock()
 	hook := a.readyHook
 	a.mu.RUnlock()
@@ -850,6 +888,10 @@ func (a *App) emitReady(ctx context.Context) {
 		return
 	}
 	if ctx != nil {
+		if len(tabID) > 0 && strings.TrimSpace(tabID[0]) != "" {
+			runtime.EventsEmit(ctx, "agent:ready", strings.TrimSpace(tabID[0]))
+			return
+		}
 		runtime.EventsEmit(ctx, "agent:ready")
 	}
 }
@@ -1260,6 +1302,11 @@ func (a *App) openTopicTabWithActivation(scope, workspaceRoot, topicID, sessionP
 
 	tabID := a.newUniqueTabIDLocked()
 	topicTitle := topicTitleForTab(scope, workspaceRoot, topicID)
+	if t, source, ok := topicTitleFallbackForOpen(workspaceRoot, topicID, sessionPath); ok {
+		topicTitle = t
+		_ = setTopicTitleWithSource(workspaceRoot, topicID, t, source)
+	}
+
 	if sessionPath == "" {
 		var err error
 		sessionPath, err = createEmptySessionFile(desktopSessionDir(actualRoot), "")
@@ -2048,7 +2095,7 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 		tab.StartupErr = err.Error()
 		tab.Ready = true
 		a.mu.Unlock()
-		a.emitReady(wailsCtx)
+		a.emitReady(wailsCtx, tab.ID)
 		return
 	}
 
@@ -2156,7 +2203,7 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 		tab.Ready = true
 		a.releaseTabSharedHost(tab)
 		a.mu.Unlock()
-		a.emitReady(wailsCtx)
+		a.emitReady(wailsCtx, tab.ID)
 		return
 	}
 	if a.tabRemovedForBuild(tab) {
@@ -2191,7 +2238,7 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 		// topicId and could pick the wrong session when one topic had multiple files.
 		if loaded, pinnedPath, ok := loadPinnedTabSessionWithPreload(dir, tab.SessionPath, loadedSession); ok {
 			if loaded != nil {
-				ctrl.Resume(loaded, pinnedPath)
+				ctrl.Resume(sessionWithFreshSystemPrompt(loaded, systemPromptFrom(ctrl.History())), pinnedPath)
 			} else {
 				ctrl.SetSessionPath(pinnedPath)
 			}
@@ -2201,7 +2248,7 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 			existingPath := findTopicSession(dir, tab.TopicID)
 			if existingPath != "" {
 				if loaded, err := loadResumableSession(existingPath); err == nil {
-					ctrl.Resume(loaded, existingPath)
+					ctrl.Resume(sessionWithFreshSystemPrompt(loaded, systemPromptFrom(ctrl.History())), existingPath)
 					path = existingPath
 				}
 			}
@@ -2229,7 +2276,7 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 			if a.attachExistingSessionRuntime(tab, path, wailsCtx) {
 				ctrl.Close()
 				a.releaseSharedHost(rootKey)
-				a.emitReady(wailsCtx)
+				a.emitReady(wailsCtx, tab.ID)
 				return
 			}
 		}
@@ -2248,32 +2295,82 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 	tab.StartupErr = ""
 	keepBuildContext = true
 	a.mu.Unlock()
-	a.emitReady(wailsCtx)
+	a.emitReady(wailsCtx, tab.ID)
 }
 
-func (a *App) reconcileTabWithPinnedSessionMeta(tab *WorkspaceTab) {
-	if tab == nil || strings.TrimSpace(tab.SessionPath) == "" {
-		return
-	}
-	path, meta, ok := a.pinnedSessionMeta(tab.SessionPath)
-	if !ok {
-		return
-	}
+type sessionBinding struct {
+	path          string
+	scope         string
+	workspaceRoot string
+	topicID       string
+	topicTitle    string
+	hasMeta       bool
+	meta          agent.BranchMeta
+}
 
-	scope := meta.DefaultScope()
-	workspaceRoot := ""
+func (a *App) reconcileTabWithPinnedSessionMeta(tab *WorkspaceTab) (string, bool) {
+	if tab == nil {
+		return "", false
+	}
+	path := strings.TrimSpace(tab.SessionPath)
+	if path != "" {
+		if resolved, ok := a.reconcileTabWithSessionPath(tab, path); ok {
+			return resolved, true
+		}
+	}
+	if tab.Ctrl == nil {
+		return "", false
+	}
+	path = strings.TrimSpace(tab.Ctrl.SessionPath())
+	if path == "" {
+		return "", false
+	}
+	binding, ok := a.resolveSessionBinding(path)
+	if !ok {
+		return "", false
+	}
+	if tab.Scope == "project" && binding.scope != "project" && normalizeProjectRoot(tab.WorkspaceRoot) != "" {
+		if root, ok := safeControllerWorkspaceRoot(tab.Ctrl); ok && normalizeProjectRoot(root) == normalizeProjectRoot(tab.WorkspaceRoot) {
+			return "", false
+		}
+	}
+	a.applySessionBindingToTab(tab, binding)
+	return binding.path, true
+}
+
+func (a *App) reconcileTabWithSessionPath(tab *WorkspaceTab, sessionPath string) (string, bool) {
+	if tab == nil || strings.TrimSpace(sessionPath) == "" {
+		return "", false
+	}
+	binding, ok := a.resolveSessionBinding(sessionPath)
+	if !ok {
+		return "", false
+	}
+	a.applySessionBindingToTab(tab, binding)
+	return binding.path, true
+}
+
+func (a *App) applySessionBindingToTab(tab *WorkspaceTab, binding sessionBinding) {
+	if tab == nil || binding.path == "" {
+		return
+	}
+	scope := binding.scope
+	workspaceRoot := binding.workspaceRoot
+	if scope == "" {
+		scope = "global"
+	}
 	if scope == "project" {
-		workspaceRoot = normalizeProjectRoot(meta.WorkspaceRoot)
+		workspaceRoot = normalizeProjectRoot(workspaceRoot)
 		if workspaceRoot == "" {
 			return
 		}
 		_ = addProject(workspaceRoot, "")
 	} else {
+		scope = "global"
 		workspaceRoot = globalTabWorkspaceRoot()
 	}
-
-	topicID := strings.TrimSpace(meta.TopicID)
-	topicTitle := strings.TrimSpace(meta.TopicTitle)
+	topicID := strings.TrimSpace(binding.topicID)
+	topicTitle := strings.TrimSpace(binding.topicTitle)
 	if topicTitle == "" && topicID != "" {
 		topicTitle = topicTitleForTab(scope, workspaceRoot, topicID)
 	}
@@ -2286,10 +2383,10 @@ func (a *App) reconcileTabWithPinnedSessionMeta(tab *WorkspaceTab) {
 	}
 	changed := tab.Scope != scope ||
 		tab.WorkspaceRoot != workspaceRoot ||
-		canonicalTabSessionPath(tab.SessionPath) != canonicalTabSessionPath(path)
+		canonicalTabSessionPath(tab.SessionPath) != canonicalTabSessionPath(binding.path)
 	tab.Scope = scope
 	tab.WorkspaceRoot = workspaceRoot
-	tab.SessionPath = canonicalTabSessionPath(path)
+	tab.SessionPath = canonicalTabSessionPath(binding.path)
 	if topicID != "" {
 		changed = changed || tab.TopicID != topicID
 		tab.TopicID = topicID
@@ -2304,48 +2401,105 @@ func (a *App) reconcileTabWithPinnedSessionMeta(tab *WorkspaceTab) {
 	a.mu.Unlock()
 }
 
-func (a *App) pinnedSessionMeta(sessionPath string) (string, agent.BranchMeta, bool) {
+func (a *App) resolveSessionBinding(sessionPath string) (sessionBinding, bool) {
 	sessionPath = strings.TrimSpace(sessionPath)
 	if sessionPath == "" {
-		return "", agent.BranchMeta{}, false
+		return sessionBinding{}, false
 	}
 	for _, dir := range a.knownSessionDirs() {
-		path, _, err := validateSessionPath(dir, sessionPath)
-		if err != nil {
-			continue
-		}
-		if meta, ok, err := agent.LoadBranchMeta(path); err == nil && ok {
-			return path, meta, true
+		if binding, ok := sessionBindingInDir(dir, sessionPath); ok {
+			return binding, true
 		}
 	}
-
 	if !filepath.IsAbs(sessionPath) {
-		return "", agent.BranchMeta{}, false
+		return sessionBinding{}, false
 	}
 	path, err := filepath.Abs(sessionPath)
 	if err != nil {
-		return "", agent.BranchMeta{}, false
+		return sessionBinding{}, false
 	}
 	meta, ok, err := agent.LoadBranchMeta(path)
 	if err != nil || !ok {
-		return "", agent.BranchMeta{}, false
+		return sessionBinding{}, false
 	}
+	for _, dir := range sessionBindingCandidateDirs(meta) {
+		if binding, ok := sessionBindingInDir(dir, path); ok {
+			return binding, true
+		}
+	}
+	return sessionBindingFromMeta(path, meta)
+}
 
-	var candidateDirs []string
+func sessionBindingCandidateDirs(meta agent.BranchMeta) []string {
 	if meta.DefaultScope() == "project" {
 		if root := normalizeProjectRoot(meta.WorkspaceRoot); root != "" {
-			candidateDirs = append(candidateDirs, desktopSessionDir(root))
+			return []string{desktopSessionDir(root)}
+		}
+		return nil
+	}
+	return []string{desktopSessionDir(globalWorkspaceRoot()), config.SessionDir()}
+}
+
+func sessionBindingInDir(dir, sessionPath string) (sessionBinding, bool) {
+	path, ok := pinnedTabSessionPath(dir, sessionPath)
+	if !ok {
+		return sessionBinding{}, false
+	}
+	meta, hasMeta, err := agent.LoadBranchMeta(path)
+	if err != nil {
+		return sessionBinding{}, false
+	}
+	scope, workspaceRoot, _, ownerOK := legacyMigrationTargetForDir(dir)
+	if !ownerOK {
+		if !hasMeta {
+			return sessionBinding{}, false
+		}
+		return sessionBindingFromMeta(path, meta)
+	}
+	if scope == "global" {
+		if !hasMeta {
+			return sessionBinding{}, false
+		}
+		return sessionBindingFromMeta(path, meta)
+	}
+	binding := sessionBinding{
+		path:          path,
+		scope:         scope,
+		workspaceRoot: workspaceRoot,
+		hasMeta:       hasMeta,
+		meta:          meta,
+	}
+	if hasMeta {
+		binding.topicID = strings.TrimSpace(meta.TopicID)
+		binding.topicTitle = strings.TrimSpace(meta.TopicTitle)
+	}
+	if binding.scope == "project" {
+		binding.workspaceRoot = normalizeProjectRoot(binding.workspaceRoot)
+	}
+	return binding, true
+}
+
+func sessionBindingFromMeta(path string, meta agent.BranchMeta) (sessionBinding, bool) {
+	scope := meta.DefaultScope()
+	workspaceRoot := ""
+	if scope == "project" {
+		workspaceRoot = normalizeProjectRoot(meta.WorkspaceRoot)
+		if workspaceRoot == "" {
+			return sessionBinding{}, false
 		}
 	} else {
-		candidateDirs = append(candidateDirs, desktopSessionDir(globalWorkspaceRoot()), config.SessionDir())
+		scope = "global"
+		workspaceRoot = globalTabWorkspaceRoot()
 	}
-	for _, dir := range candidateDirs {
-		validPath, _, err := validateSessionPath(dir, path)
-		if err == nil {
-			return validPath, meta, true
-		}
-	}
-	return "", agent.BranchMeta{}, false
+	return sessionBinding{
+		path:          path,
+		scope:         scope,
+		workspaceRoot: workspaceRoot,
+		topicID:       strings.TrimSpace(meta.TopicID),
+		topicTitle:    strings.TrimSpace(meta.TopicTitle),
+		hasMeta:       true,
+		meta:          meta,
+	}, true
 }
 
 // --- active tab helpers -----------------------------------------------------
@@ -2533,6 +2687,42 @@ func autoTitleTopicFromSession(workspaceRoot, topicID, sessionPath string) (stri
 		return "", false
 	}
 	return nextTitle, true
+}
+
+func topicTitleFallbackForOpen(workspaceRoot, topicID, sessionPath string) (string, string, bool) {
+	topicID = strings.TrimSpace(topicID)
+	sessionPath = strings.TrimSpace(sessionPath)
+	if topicID == "" || sessionPath == "" {
+		return "", "", false
+	}
+	storedTitle := strings.TrimSpace(loadTopicTitle(workspaceRoot, topicID))
+	storedSource := strings.TrimSpace(loadTopicTitleSource(workspaceRoot, topicID))
+	if storedTitle != "" {
+		if storedSource == topicTitleSourceManual || storedTitle != defaultTopicTitle {
+			return "", "", false
+		}
+	}
+
+	if storedTitle == "" {
+		dir := filepath.Dir(sessionPath)
+		if meta, ok, err := agent.LoadBranchMeta(sessionPath); err == nil && ok {
+			if title := storedSessionTopicTitle(dir, sessionPath, meta); title != "" {
+				return title, topicTitleSourceManual, true
+			}
+		} else if title := topicTitleFromText(loadSessionTitles(dir)[filepath.Base(sessionPath)]); title != "" {
+			return title, topicTitleSourceManual, true
+		}
+	}
+
+	if storedSource == topicTitleSourceManual {
+		return "", "", false
+	}
+	if storedSource == "" || storedSource == topicTitleSourceAuto {
+		if title := topicTitleFromSession(sessionPath); title != "" {
+			return title, topicTitleSourceAuto, true
+		}
+	}
+	return "", "", false
 }
 
 func topicTitleFromSession(path string) string {
@@ -3953,10 +4143,7 @@ func restoreSessionTopicIndex(dir, sessionPath string) error {
 }
 
 func restoredSessionTopicTitle(dir, sessionPath string, meta agent.BranchMeta) string {
-	if title := topicTitleFromText(meta.TopicTitle); title != "" {
-		return title
-	}
-	if title := topicTitleFromText(loadSessionTitles(dir)[filepath.Base(sessionPath)]); title != "" {
+	if title := storedSessionTopicTitle(dir, sessionPath, meta); title != "" {
 		return title
 	}
 	if s, err := agent.LoadSession(sessionPath); err == nil {
@@ -3969,6 +4156,13 @@ func restoredSessionTopicTitle(dir, sessionPath string, meta agent.BranchMeta) s
 		}
 	}
 	return ""
+}
+
+func storedSessionTopicTitle(dir, sessionPath string, meta agent.BranchMeta) string {
+	if title := topicTitleFromText(meta.TopicTitle); title != "" {
+		return title
+	}
+	return topicTitleFromText(loadSessionTitles(dir)[filepath.Base(sessionPath)])
 }
 
 func legacySessionTopicID(path string) string {
@@ -5152,7 +5346,10 @@ func newTabID() string {
 
 func newTopicID() string {
 	var b [8]byte
-	rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		now := time.Now().UTC()
+		return "topic_" + now.Format("20060102-150405") + "_" + fmt.Sprintf("%09d", now.Nanosecond())
+	}
 	return "topic_" + time.Now().UTC().Format("20060102-150405") + "_" + hex.EncodeToString(b[:])
 }
 
@@ -5182,11 +5379,18 @@ func globalTabWorkspaceRoot() string {
 }
 
 func loadPinnedTabSession(dir, sessionPath string) (*agent.Session, string, bool) {
-	return loadPinnedTabSessionWithPreload(dir, sessionPath, loadedTabSession{})
+	return loadPinnedTabSessionWithPreloadAndMigrationFallback(dir, sessionPath, loadedTabSession{}, true)
 }
 
 func loadPinnedTabSessionWithPreload(dir, sessionPath string, preloaded loadedTabSession) (*agent.Session, string, bool) {
+	return loadPinnedTabSessionWithPreloadAndMigrationFallback(dir, sessionPath, preloaded, false)
+}
+
+func loadPinnedTabSessionWithPreloadAndMigrationFallback(dir, sessionPath string, preloaded loadedTabSession, allowMigrationFallback bool) (*agent.Session, string, bool) {
 	path, ok := pinnedTabSessionPath(dir, sessionPath)
+	if !ok && allowMigrationFallback {
+		path, ok = migratedPinnedTabSessionPath(dir, sessionPath)
+	}
 	if !ok {
 		return nil, "", false
 	}
@@ -5194,6 +5398,9 @@ func loadPinnedTabSessionWithPreload(dir, sessionPath string, preloaded loadedTa
 		return nil, "", false
 	}
 	if preloaded.matches(path) {
+		if preloaded.Session != nil && len(preloaded.Session.Snapshot()) == 0 {
+			return nil, path, true
+		}
 		return preloaded.Session, path, true
 	}
 	loaded, err := agent.LoadSession(path)
@@ -5203,7 +5410,33 @@ func loadPinnedTabSessionWithPreload(dir, sessionPath string, preloaded loadedTa
 		}
 		return nil, "", false
 	}
+	// An empty file (0 messages) is a pre-created placeholder, not a real
+	// session to resume.  Treating it as valid would make ctrl.Resume replace
+	// the executor's live session (with system prompt) with the empty one,
+	// causing the saved transcript to lack the agent identity contract.
+	if len(loaded.Snapshot()) == 0 {
+		return nil, path, true
+	}
 	return loaded, path, true
+}
+
+func migratedPinnedTabSessionPath(dir, sessionPath string) (string, bool) {
+	sessionPath = strings.TrimSpace(sessionPath)
+	if sessionPath == "" || dir == "" || !filepath.IsAbs(sessionPath) {
+		return "", false
+	}
+	if _, err := os.Stat(sessionPath); err == nil || !os.IsNotExist(err) {
+		return "", false
+	}
+	base := filepath.Base(sessionPath)
+	if base == "." || base == string(filepath.Separator) || !strings.HasSuffix(base, ".jsonl") {
+		return "", false
+	}
+	path, _, err := validateSessionPath(dir, filepath.Join(dir, base))
+	if err != nil {
+		return "", false
+	}
+	return path, true
 }
 
 func pinnedTabSessionPath(dir, sessionPath string) (string, bool) {
@@ -5213,6 +5446,9 @@ func pinnedTabSessionPath(dir, sessionPath string) (string, bool) {
 	}
 	path, _, err := validateSessionPath(dir, sessionPath)
 	if err != nil {
+		if filepath.IsAbs(sessionPath) {
+			return "", false
+		}
 		base := filepath.Base(sessionPath)
 		if base == "." || base == string(filepath.Separator) || !strings.HasSuffix(base, ".jsonl") {
 			return "", false
@@ -5233,8 +5469,22 @@ func saveTabSessionMeta(tab *WorkspaceTab, path string) error {
 	if err != nil {
 		return err
 	}
-	m.Scope = tab.Scope
-	m.WorkspaceRoot = tab.WorkspaceRoot
+	scope := tab.Scope
+	workspaceRoot := tab.WorkspaceRoot
+	if ownerScope, ownerRoot, _, ok := legacyMigrationTargetForDir(filepath.Dir(path)); ok {
+		if ownerScope == "project" {
+			scope = ownerScope
+			workspaceRoot = ownerRoot
+		}
+	}
+	if scope == "project" {
+		workspaceRoot = normalizeProjectRoot(workspaceRoot)
+	} else {
+		scope = "global"
+		workspaceRoot = ""
+	}
+	m.Scope = scope
+	m.WorkspaceRoot = workspaceRoot
 	m.TopicID = tab.TopicID
 	m.TopicTitle = tab.TopicTitle
 	if err := agent.SaveBranchMetaPreserveUpdated(path, m); err != nil {
@@ -5274,6 +5524,9 @@ func (a *App) persistTabSessionPath(tab *WorkspaceTab, path string) {
 	path = canonicalTabSessionPath(path)
 	if tab == nil || path == "" {
 		return
+	}
+	if reconciled, ok := a.reconcileTabWithSessionPath(tab, path); ok {
+		path = canonicalTabSessionPath(reconciled)
 	}
 	_ = saveTabSessionMeta(tab, path)
 	a.rememberTabSessionPath(tab, path)
