@@ -3201,8 +3201,8 @@ func TestDeleteLastTopicSessionFallbackDoesNotReuseDeletedTopic(t *testing.T) {
 		if tab.TopicID == topicID {
 			t.Fatalf("fallback tab %q reused deleted topic %q", id, topicID)
 		}
-		if strings.TrimSpace(tab.TopicID) == "" {
-			t.Fatalf("fallback tab %q has empty topic ID", id)
+		if strings.TrimSpace(tab.TopicID) != "" {
+			t.Fatalf("fallback tab %q topic ID = %q, want transient unindexed blank", id, tab.TopicID)
 		}
 	}
 	trashPath := filepath.Join(dir, sessionTrashDir, "delete-last.jsonl", "delete-last.jsonl")
@@ -4481,6 +4481,45 @@ args = ["serve"]
 	}
 	if _, ok := findPluginEntry(cfg.Plugins, "time"); ok {
 		t.Fatalf("time plugin still configured after remove: %+v", cfg.Plugins)
+	}
+}
+
+func TestRemoveMCPServerClearsRecordedStartupFailure(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	dir := robustTempDir(t)
+	t.Chdir(dir)
+	if err := os.WriteFile(filepath.Join(dir, "reasonix.toml"), []byte(`
+[[plugins]]
+name = "broken"
+command = "reasonix-missing-mcp-binary"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	app.setTestCtrl(control.New(control.Options{Host: plugin.NewHost()}), "")
+	defer app.activeCtrl().Close()
+	recordMCPFailure(app.activeCtrl(), config.PluginEntry{
+		Name:    "broken",
+		Command: "reasonix-missing-mcp-binary",
+	}, errors.New("connect: missing binary"))
+
+	view := app.Capabilities()
+	if len(view.Servers) != 1 || view.Servers[0].Name != "broken" || view.Servers[0].Status != "failed" {
+		t.Fatalf("Capabilities before remove = %+v, want broken failed", view.Servers)
+	}
+
+	if err := app.RemoveMCPServer("broken"); err != nil {
+		t.Fatalf("RemoveMCPServer(broken): %v", err)
+	}
+	if mcpFailed(app.activeCtrl(), "broken") {
+		t.Fatalf("Host.Failures() still contains broken after remove: %+v", app.activeCtrl().Host().Failures())
+	}
+	view = app.Capabilities()
+	for _, s := range view.Servers {
+		if s.Name == "broken" {
+			t.Fatalf("Capabilities after remove still contains broken: %+v", view.Servers)
+		}
 	}
 }
 

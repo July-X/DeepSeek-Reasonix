@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,6 +28,7 @@ import (
 	"reasonix/internal/eventwire"
 	"reasonix/internal/fileutil"
 	"reasonix/internal/provider"
+	"reasonix/internal/store"
 )
 
 // --- WorkspaceTab -----------------------------------------------------------
@@ -57,9 +59,10 @@ type WorkspaceTab struct {
 	ActivityStatus string // transient project-tree status for the in-flight turn
 
 	// Per-turn autosave per tab.
-	saveMu    sync.Mutex
-	saving    bool
-	saveAgain bool
+	saveMu       sync.Mutex
+	saving       bool
+	saveAgain    bool
+	saveFailures int
 
 	// closing is set under saveMu when the tab is being torn down. Once set,
 	// tabSnapshotLoop stops taking new snapshot work and CloseTab waits on
@@ -694,6 +697,11 @@ type tabEventSink struct {
 	mu            sync.RWMutex
 	ctx           context.Context
 	runtimeEvents asyncRuntimeEmitter
+	botSink       event.Sink // optional: when set, events are also forwarded here
+}
+
+type closeableEventSink interface {
+	Close()
 }
 
 func (s *tabEventSink) Emit(e event.Event) {
@@ -736,6 +744,34 @@ func (s *tabEventSink) Emit(e event.Event) {
 	// Persist after each turn so a force-kill loses at most the in-flight prompt.
 	if e.Kind == event.TurnDone && s.app != nil {
 		s.app.scheduleTabSnapshot(s.tabID)
+	}
+	// Forward event to bot channels when a bot forwarder is attached.
+	// Read the sink under the read lock so SetBotSink can safely swap it
+	// from another goroutine.
+	s.mu.RLock()
+	bs := s.botSink
+	s.mu.RUnlock()
+	if bs != nil {
+		bs.Emit(e)
+		// Detach the forwarder after TurnDone so subsequent turns on the
+		// same tab do not keep pushing to bot channels.
+		if e.Kind == event.TurnDone {
+			s.SetBotSink(nil)
+		}
+	}
+}
+
+// SetBotSink atomically sets or clears the bot event forwarder on this sink.
+// It is safe to call concurrently with Emit.
+func (s *tabEventSink) SetBotSink(sink event.Sink) {
+	s.mu.Lock()
+	old := s.botSink
+	s.botSink = sink
+	s.mu.Unlock()
+	if old != nil && old != sink {
+		if closer, ok := old.(closeableEventSink); ok {
+			closer.Close()
+		}
 	}
 }
 
@@ -1097,33 +1133,34 @@ type wireEventTab struct {
 
 // TabMeta is the frontend-facing shape of one tab.
 type TabMeta struct {
-	ID                string `json:"id"`
-	Scope             string `json:"scope"`
-	WorkspaceRoot     string `json:"workspaceRoot"`
-	WorkspaceName     string `json:"workspaceName"`
-	WorkspacePath     string `json:"workspacePath,omitempty"`
-	GitBranch         string `json:"gitBranch,omitempty"`
-	TopicID           string `json:"topicId"`
-	TopicTitle        string `json:"topicTitle"`
-	SessionPath       string `json:"sessionPath,omitempty"`
-	ReadOnly          bool   `json:"readOnly,omitempty"`
-	ProjectColor      string `json:"projectColor,omitempty"`
-	Label             string `json:"label"`
-	Ready             bool   `json:"ready"`
-	Running           bool   `json:"running"`
-	PendingPrompt     bool   `json:"pendingPrompt,omitempty"`
-	BackgroundJobs    int    `json:"backgroundJobs,omitempty"`
-	CancelRequested   bool   `json:"cancelRequested,omitempty"`
-	Cancellable       bool   `json:"cancellable"`
-	Mode              string `json:"mode"`
-	CollaborationMode string `json:"collaborationMode"`
-	ToolApprovalMode  string `json:"toolApprovalMode"`
-	TokenMode         string `json:"tokenMode"`
-	Goal              string `json:"goal,omitempty"`
-	GoalStatus        string `json:"goalStatus,omitempty"`
-	StartupErr        string `json:"startupErr,omitempty"`
-	Active            bool   `json:"active"`
-	Cwd               string `json:"cwd"`
+	ID                string                   `json:"id"`
+	Scope             string                   `json:"scope"`
+	WorkspaceRoot     string                   `json:"workspaceRoot"`
+	WorkspaceName     string                   `json:"workspaceName"`
+	WorkspacePath     string                   `json:"workspacePath,omitempty"`
+	GitBranch         string                   `json:"gitBranch,omitempty"`
+	TopicID           string                   `json:"topicId"`
+	TopicTitle        string                   `json:"topicTitle"`
+	SessionPath       string                   `json:"sessionPath,omitempty"`
+	ReadOnly          bool                     `json:"readOnly,omitempty"`
+	ProjectColor      string                   `json:"projectColor,omitempty"`
+	Label             string                   `json:"label"`
+	Ready             bool                     `json:"ready"`
+	Running           bool                     `json:"running"`
+	PendingPrompt     bool                     `json:"pendingPrompt,omitempty"`
+	BackgroundJobs    int                      `json:"backgroundJobs,omitempty"`
+	CancelRequested   bool                     `json:"cancelRequested,omitempty"`
+	Cancellable       bool                     `json:"cancellable"`
+	Mode              string                   `json:"mode"`
+	CollaborationMode string                   `json:"collaborationMode"`
+	ToolApprovalMode  string                   `json:"toolApprovalMode"`
+	TokenMode         string                   `json:"tokenMode"`
+	Goal              string                   `json:"goal,omitempty"`
+	GoalStatus        string                   `json:"goalStatus,omitempty"`
+	AutoResearch      *AutoResearchCompactView `json:"autoResearch,omitempty"`
+	StartupErr        string                   `json:"startupErr,omitempty"`
+	Active            bool                     `json:"active"`
+	Cwd               string                   `json:"cwd"`
 }
 
 func enrichTabMeta(meta TabMeta) TabMeta {
@@ -1161,6 +1198,7 @@ func (a *App) tabMeta(tab *WorkspaceTab, active bool) TabMeta {
 		TokenMode:         currentTabTokenMode(tab),
 		Goal:              currentTabGoal(tab),
 		GoalStatus:        currentTabGoalStatus(tab),
+		AutoResearch:      compactAutoResearch(tab),
 		StartupErr:        tab.StartupErr,
 		Active:            active,
 		Cwd:               tab.WorkspaceRoot,
@@ -1315,18 +1353,17 @@ func (a *App) openTopicTabWithActivation(scope, workspaceRoot, topicID, sessionP
 			return TabMeta{}, err
 		}
 	}
+	profile := loadTabSessionProfile(sessionPath)
 	tab := &WorkspaceTab{
-		ID:               tabID,
-		Scope:            scope,
-		WorkspaceRoot:    actualRoot,
-		TopicID:          topicID,
-		TopicTitle:       topicTitle,
-		SessionPath:      sessionPath,
-		tokenMode:        boot.TokenModeFull,
-		mode:             "normal",
-		toolApprovalMode: control.ToolApprovalAsk,
-		disabledMCP:      map[string]ServerView{},
+		ID:            tabID,
+		Scope:         scope,
+		WorkspaceRoot: actualRoot,
+		TopicID:       topicID,
+		TopicTitle:    topicTitle,
+		SessionPath:   sessionPath,
+		disabledMCP:   map[string]ServerView{},
 	}
+	applyTabSessionProfile(tab, profile)
 	tab.sink = &tabEventSink{tabID: tabID, app: a}
 
 	a.tabs[tabID] = tab
@@ -1552,19 +1589,7 @@ func (a *App) EnsureBlankTab(scope, workspaceRoot string) (TabMeta, error) {
 		a.mu.Unlock()
 		return TabMeta{}, err
 	}
-	f := loadProjectsFile()
-	if workspaceRoot == "" {
-		f.GlobalTopics = prependUniqueString(f.GlobalTopics, topicID)
-		_ = saveProjectsFile(f)
-	} else {
-		for i, p := range f.Projects {
-			if p.Root == workspaceRoot {
-				f.Projects[i].Topics = prependUniqueString(p.Topics, topicID)
-				_ = saveProjectsFile(f)
-				break
-			}
-		}
-	}
+	_ = prependTopicInProjectsFile(workspaceRoot, topicID, false)
 
 	tabID := a.newUniqueTabIDLocked()
 	created = &WorkspaceTab{
@@ -1770,6 +1795,21 @@ func (a *App) indexedBlankTopicIDLocked(scope, workspaceRoot string) string {
 // SetActiveTab switches the frontend's active tab. A no-op when tabID is
 // already active or unknown.
 func (a *App) SetActiveTab(tabID string) error {
+	a.mu.RLock()
+	_, ok := a.tabs[tabID]
+	active := a.tabs[a.activeTabID]
+	alreadyActive := a.activeTabID == tabID
+	a.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("tab %q not found", tabID)
+	}
+	if alreadyActive {
+		return nil
+	}
+	if err := a.snapshotTabForAction(active, "switching tabs"); err != nil {
+		return err
+	}
+
 	a.mu.Lock()
 	if _, ok := a.tabs[tabID]; !ok {
 		a.mu.Unlock()
@@ -1832,8 +1872,15 @@ func (a *App) CloseTab(tabID string) error {
 	// This closes a race window with DeleteSession: if Snapshot runs
 	// after delete(a.tabs, tabID), a concurrent DeleteSession can delete
 	// the session files, and the deferred Snapshot recreates them.
-	if tab.Ctrl != nil && !tab.ReadOnly {
-		_ = tab.Ctrl.Snapshot()
+	if err := snapshotTabDirect(tab); err != nil {
+		a.mu.Unlock()
+		slog.Warn("desktop: snapshot before closing tab failed", "tab", tabID, "err", err)
+		return fmt.Errorf("save current session before closing tab: %w", err)
+	}
+	if err := saveTabSessionMetaForCurrentSession(tab); err != nil {
+		a.mu.Unlock()
+		slog.Warn("desktop: session metadata before closing tab failed", "tab", tabID, "err", err)
+		return fmt.Errorf("save current session metadata before closing tab: %w", err)
 	}
 	if tab.Ctrl == nil || !tab.hasActiveRuntimeWork() {
 		a.markTabRemovedLocked(tab)
@@ -1867,6 +1914,7 @@ func (a *App) CloseTab(tabID string) error {
 	a.mu.Unlock()
 
 	// Tear down outside the lock.
+	discardPath, discardTransientBlank := transientBlankSessionArtifactPath(tab)
 	if tab.Ctrl != nil {
 		if tab.hasActiveRuntimeWork() && a.detachSessionRuntime(tab) {
 			// Detached runtimes keep running and must keep saving: do not
@@ -1885,6 +1933,9 @@ func (a *App) CloseTab(tabID string) error {
 	if tab.sink != nil {
 		tab.sink.clearContext() // stop further emissions (nil ctx -> Emit becomes no-op)
 	}
+	if discardTransientBlank {
+		discardTransientBlankSessionArtifacts(discardPath)
+	}
 	return nil
 }
 
@@ -1901,8 +1952,15 @@ func (a *App) keepOnlyVisibleTab(tabID string) (TabMeta, error) {
 		if id == tabID {
 			continue
 		}
-		if tab.Ctrl != nil && !tab.ReadOnly {
-			_ = tab.Ctrl.Snapshot()
+		if err := snapshotTabDirect(tab); err != nil {
+			a.mu.Unlock()
+			slog.Warn("desktop: snapshot before pruning hidden tab failed", "tab", id, "err", err)
+			return TabMeta{}, fmt.Errorf("save current session before switching tabs: %w", err)
+		}
+		if err := saveTabSessionMetaForCurrentSession(tab); err != nil {
+			a.mu.Unlock()
+			slog.Warn("desktop: session metadata before pruning hidden tab failed", "tab", id, "err", err)
+			return TabMeta{}, fmt.Errorf("save current session metadata before switching tabs: %w", err)
 		}
 		if tab.Ctrl == nil || !tab.hasActiveRuntimeWork() {
 			a.markTabRemovedLocked(tab)
@@ -1955,14 +2013,41 @@ func (a *App) removeVisibleTabRuntime(tab *WorkspaceTab) {
 	if tab == nil {
 		return
 	}
-	if tab.Ctrl != nil && !tab.ReadOnly {
-		_ = tab.Ctrl.Snapshot()
+	if err := a.snapshotTab(tab); err != nil {
+		slog.Warn("desktop: snapshot before removing visible tab runtime failed", "tab", tab.ID, "err", err)
 	}
+	discardPath, discardTransientBlank := transientBlankSessionArtifactPath(tab)
 	if tab.Ctrl != nil && tab.hasActiveRuntimeWork() && a.detachSessionRuntime(tab) {
 		return
 	}
 	a.markTabRemoved(tab)
 	a.closeTabRuntime(tab)
+	if discardTransientBlank {
+		discardTransientBlankSessionArtifacts(discardPath)
+	}
+}
+
+func transientBlankSessionArtifactPath(tab *WorkspaceTab) (string, bool) {
+	if tab == nil || tab.ReadOnly || strings.TrimSpace(tab.TopicID) != "" || tab.hasActiveRuntimeWork() {
+		return "", false
+	}
+	if strings.TrimSpace(tab.SessionPath) == "" || !blankTabSessionPathHasNoContent(tab) {
+		return "", false
+	}
+	path, ok := pinnedTabSessionPath(tabSessionDir(tab), tab.SessionPath)
+	if !ok {
+		return "", false
+	}
+	return path, true
+}
+
+func discardTransientBlankSessionArtifacts(path string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	if err := removeDesktopSessionArtifacts(path); err != nil {
+		slog.Warn("desktop: discard transient blank session artifacts failed", "path", path, "err", err)
+	}
 }
 
 func (a *App) markTabRemoved(tab *WorkspaceTab) {
@@ -2567,6 +2652,19 @@ func (a *App) ctrlByTabID(tabID string) control.SessionAPI {
 
 // --- autosave per tab -------------------------------------------------------
 
+const maxTabSnapshotFailureRetries = 2
+
+func tabSnapshotRetryDelay(failures int) time.Duration {
+	switch {
+	case failures <= 1:
+		return 100 * time.Millisecond
+	case failures == 2:
+		return 250 * time.Millisecond
+	default:
+		return 500 * time.Millisecond
+	}
+}
+
 func (a *App) scheduleTabSnapshot(tabID string) {
 	a.mu.RLock()
 	tab := a.tabByEventSinkIDLocked(tabID)
@@ -2586,6 +2684,7 @@ func (a *App) scheduleTabSnapshot(tabID string) {
 		return
 	}
 	tab.saving = true
+	tab.saveFailures = 0
 	go a.tabSnapshotLoop(tab)
 }
 
@@ -2617,6 +2716,7 @@ func (a *App) quiesceTabAutosave(tab *WorkspaceTab) {
 func (a *App) tabSnapshotLoop(tab *WorkspaceTab) {
 	defer a.recoverToPending("tabSnapshotLoop")
 	for {
+		var snapshotErr error
 		a.mu.RLock()
 		ctrl := tab.Ctrl
 		a.mu.RUnlock()
@@ -2625,11 +2725,19 @@ func (a *App) tabSnapshotLoop(tab *WorkspaceTab) {
 				if !a.maybeAutoTitleTopic(tab) {
 					a.emitProjectTreeChanged()
 				}
+			} else {
+				snapshotErr = err
+				a.reportTabSnapshotError(tab, "autosave", err)
 			}
 		}
 		tab.saveMu.Lock()
 		if tab.saveCond == nil {
 			tab.saveCond = sync.NewCond(&tab.saveMu)
+		}
+		if snapshotErr == nil {
+			tab.saveFailures = 0
+		} else {
+			tab.saveFailures++
 		}
 		if tab.closing {
 			// Tab is being torn down: stop without picking up saveAgain work.
@@ -2641,6 +2749,12 @@ func (a *App) tabSnapshotLoop(tab *WorkspaceTab) {
 		if tab.saveAgain {
 			tab.saveAgain = false
 			tab.saveMu.Unlock()
+			continue
+		}
+		if snapshotErr != nil && tab.saveFailures <= maxTabSnapshotFailureRetries {
+			delay := tabSnapshotRetryDelay(tab.saveFailures)
+			tab.saveMu.Unlock()
+			time.Sleep(delay)
 			continue
 		}
 		tab.saving = false
@@ -2774,6 +2888,9 @@ func topicTitleFromText(text string) string {
 const desktopProjectsFile = "desktop-projects.json"
 const tabsFileName = "desktop-tabs.json"
 const desktopGlobalOrderToken = "__global__"
+const legacyProjectSidebarRecoveryMarker = "desktop-projects-legacy-recovered"
+
+var desktopProjectsFileMu sync.Mutex
 
 type desktopProject struct {
 	Root         string   `json:"root"`
@@ -2872,7 +2989,7 @@ func (a *App) saveTabsCollectLocked() (string, []desktopTabEntry, string, uint64
 				Effort:           cloneStringPtr(tab.effort),
 				TokenMode:        persistedTabTokenMode(currentTabTokenMode(tab)),
 				Mode:             persistedTabMode(currentTabMode(tab)),
-				Goal:             strings.TrimSpace(currentTabGoal(tab)),
+				Goal:             persistedTabGoal(tab),
 				ToolApprovalMode: persistedToolApprovalMode(currentTabToolApprovalMode(tab)),
 			})
 		}
@@ -2987,6 +3104,62 @@ func desktopMCPMigrationRoots(tabs desktopTabsFile) []string {
 	return roots
 }
 
+func recoverLegacyProjectSidebarRoots(tabs desktopTabsFile) (bool, error) {
+	markerPath := filepath.Join(desktopConfigDir(), legacyProjectSidebarRecoveryMarker)
+	if _, err := os.Stat(markerPath); err == nil {
+		return false, nil
+	}
+
+	changed := false
+	err := updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		seen := map[string]bool{}
+		for _, project := range f.Projects {
+			root := normalizeProjectRoot(project.Root)
+			if root != "" {
+				seen[root] = true
+			}
+		}
+
+		add := func(root string) {
+			root = normalizeProjectRoot(root)
+			if root == "" || seen[root] || !existingDirectory(root) {
+				return
+			}
+			seen[root] = true
+			f.Projects = append(f.Projects, desktopProject{Root: root})
+			changed = true
+		}
+		if cur := loadWorkspace(); cur != "" {
+			add(cur)
+		}
+		for _, root := range loadWorkspaces() {
+			add(root)
+		}
+		for _, entry := range tabs.Tabs {
+			if entry.Scope == "project" {
+				add(entry.WorkspaceRoot)
+			}
+		}
+		return changed, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return changed, writeLegacyProjectSidebarRecoveryMarker(markerPath)
+}
+
+func existingDirectory(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func writeLegacyProjectSidebarRecoveryMarker(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte("ok\n"), 0o644)
+}
+
 func loadProjectsFile() desktopProjectFile {
 	path := filepath.Join(desktopConfigDir(), desktopProjectsFile)
 	b, err := os.ReadFile(path)
@@ -3014,6 +3187,88 @@ func saveProjectsFile(f desktopProjectFile) error {
 		return err
 	}
 	return fileutil.ReplaceFile(tmp, path)
+}
+
+func updateProjectsFile(mutator func(*desktopProjectFile) (bool, error)) error {
+	desktopProjectsFileMu.Lock()
+	defer desktopProjectsFileMu.Unlock()
+
+	f := loadProjectsFile()
+	changed, err := mutator(&f)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	return saveProjectsFile(f)
+}
+
+func prependTopicInProjectsFile(workspaceRoot, topicID string, ensureProject bool) error {
+	return prependTopicsInProjectsFile(workspaceRoot, []string{topicID}, ensureProject)
+}
+
+func prependTopicsInProjectsFile(workspaceRoot string, topicIDs []string, ensureProject bool) error {
+	workspaceRoot = normalizeProjectRoot(workspaceRoot)
+	topicIDs = uniqueStrings(topicIDs)
+	if len(topicIDs) == 0 {
+		return nil
+	}
+	return updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		if workspaceRoot == "" {
+			next := uniqueStrings(append(append([]string(nil), topicIDs...), f.GlobalTopics...))
+			if sameStringList(next, f.GlobalTopics) {
+				return false, nil
+			}
+			f.GlobalTopics = next
+			return true, nil
+		}
+		for i, p := range f.Projects {
+			if p.Root != workspaceRoot {
+				continue
+			}
+			next := uniqueStrings(append(append([]string(nil), topicIDs...), p.Topics...))
+			if sameStringList(next, p.Topics) {
+				return false, nil
+			}
+			f.Projects[i].Topics = next
+			return true, nil
+		}
+		if !ensureProject {
+			return false, nil
+		}
+		f.Projects = append(f.Projects, desktopProject{Root: workspaceRoot, Topics: topicIDs})
+		return true, nil
+	})
+}
+
+func removeTopicFromProjectsFile(topicID string) error {
+	topicID = strings.TrimSpace(topicID)
+	if topicID == "" {
+		return nil
+	}
+	return updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		changed := false
+		if next := removeString(f.GlobalTopics, topicID); !sameStringList(next, f.GlobalTopics) {
+			f.GlobalTopics = next
+			changed = true
+		}
+		if next := removeString(f.GlobalPinnedTopics, topicID); !sameStringList(next, f.GlobalPinnedTopics) {
+			f.GlobalPinnedTopics = next
+			changed = true
+		}
+		for i, p := range f.Projects {
+			if next := removeString(p.Topics, topicID); !sameStringList(next, p.Topics) {
+				f.Projects[i].Topics = next
+				changed = true
+			}
+			if next := removeString(p.PinnedTopics, topicID); !sameStringList(next, p.PinnedTopics) {
+				f.Projects[i].PinnedTopics = next
+				changed = true
+			}
+		}
+		return changed, nil
+	})
 }
 
 func normalizeProjectRoot(root string) string {
@@ -3099,6 +3354,18 @@ func normalizeSidebarOrder(order []string, projects []desktopProject) []string {
 		out = append(out, root)
 	}
 	return out
+}
+
+func sameProjectOrder(a, b []desktopProject) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Root != b[i].Root {
+			return false
+		}
+	}
+	return true
 }
 
 func uniqueStrings(values []string) []string {
@@ -3324,67 +3591,86 @@ func addProject(root, title string) error {
 		return fmt.Errorf("project root is required")
 	}
 	title = strings.TrimSpace(title)
-	f := loadProjectsFile()
-	for i, p := range f.Projects {
-		if p.Root == root {
-			if title != "" {
+	return updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		for i, p := range f.Projects {
+			if p.Root == root {
+				if title == "" || f.Projects[i].Title == title {
+					return false, nil
+				}
 				f.Projects[i].Title = title
+				return true, nil
 			}
-			return saveProjectsFile(f)
 		}
-	}
-	f.Projects = append(f.Projects, desktopProject{Root: root, Title: title})
-	return saveProjectsFile(f)
+		f.Projects = append(f.Projects, desktopProject{Root: root, Title: title})
+		return true, nil
+	})
 }
 
 func renameProject(root, title string) error {
 	title = strings.TrimSpace(title)
-	f := loadProjectsFile()
-	if strings.TrimSpace(root) == "" {
-		f.GlobalTitle = title
-		return saveProjectsFile(f)
-	}
 	root = normalizeProjectRoot(root)
-	for i, p := range f.Projects {
-		if p.Root == root {
-			f.Projects[i].Title = title
-			return saveProjectsFile(f)
+	return updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		if root == "" {
+			if f.GlobalTitle == title {
+				return false, nil
+			}
+			f.GlobalTitle = title
+			return true, nil
 		}
-	}
-	f.Projects = append(f.Projects, desktopProject{Root: root, Title: title})
-	return saveProjectsFile(f)
+		for i, p := range f.Projects {
+			if p.Root == root {
+				if f.Projects[i].Title == title {
+					return false, nil
+				}
+				f.Projects[i].Title = title
+				return true, nil
+			}
+		}
+		f.Projects = append(f.Projects, desktopProject{Root: root, Title: title})
+		return true, nil
+	})
 }
 
 func setProjectColor(root, color string) error {
 	root = normalizeProjectRoot(root)
 	color = normalizeProjectColor(color)
-	if root == "" {
-		f := loadProjectsFile()
-		f.GlobalColor = color
-		return saveProjectsFile(f)
-	}
-	f := loadProjectsFile()
-	for i, p := range f.Projects {
-		if p.Root == root {
-			f.Projects[i].Color = color
-			return saveProjectsFile(f)
+	return updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		if root == "" {
+			if f.GlobalColor == color {
+				return false, nil
+			}
+			f.GlobalColor = color
+			return true, nil
 		}
-	}
-	f.Projects = append(f.Projects, desktopProject{Root: root, Color: color})
-	return saveProjectsFile(f)
+		for i, p := range f.Projects {
+			if p.Root == root {
+				if f.Projects[i].Color == color {
+					return false, nil
+				}
+				f.Projects[i].Color = color
+				return true, nil
+			}
+		}
+		f.Projects = append(f.Projects, desktopProject{Root: root, Color: color})
+		return true, nil
+	})
 }
 
 func removeProject(root string) error {
 	root = normalizeProjectRoot(root)
-	f := loadProjectsFile()
-	projects := make([]desktopProject, 0, len(f.Projects))
-	for _, p := range f.Projects {
-		if p.Root != root {
-			projects = append(projects, p)
+	return updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		projects := make([]desktopProject, 0, len(f.Projects))
+		for _, p := range f.Projects {
+			if p.Root != root {
+				projects = append(projects, p)
+			}
 		}
-	}
-	f.Projects = projects
-	return saveProjectsFile(f)
+		if len(projects) == len(f.Projects) {
+			return false, nil
+		}
+		f.Projects = projects
+		return true, nil
+	})
 }
 
 // --- topic helpers ----------------------------------------------------------
@@ -3694,19 +3980,7 @@ func ensureTopicIndexed(scope, workspaceRoot, topicID, title, source string) err
 	if err := setTopicTitleWithSource(workspaceRoot, topicID, title, source); err != nil {
 		return err
 	}
-	f := loadProjectsFile()
-	if workspaceRoot == "" {
-		f.GlobalTopics = prependUniqueString(f.GlobalTopics, topicID)
-		return saveProjectsFile(f)
-	}
-	for i, p := range f.Projects {
-		if p.Root == workspaceRoot {
-			f.Projects[i].Topics = prependUniqueString(p.Topics, topicID)
-			return saveProjectsFile(f)
-		}
-	}
-	f.Projects = append(f.Projects, desktopProject{Root: workspaceRoot, Topics: []string{topicID}})
-	return saveProjectsFile(f)
+	return prependTopicInProjectsFile(workspaceRoot, topicID, true)
 }
 
 // --- telemetry --------------------------------------------------------------
@@ -3984,19 +4258,7 @@ func migrateLegacySessionsIntoGlobalTopics(dir string) []string {
 		}
 		return nil
 	}
-	f := loadProjectsFile()
-	if scope == "global" {
-		f.GlobalTopics = uniqueStrings(append(migratedTopicIDs, f.GlobalTopics...))
-	} else {
-		// Find the project entry and add topics.
-		for i, p := range f.Projects {
-			if p.Root == workspaceRoot {
-				f.Projects[i].Topics = uniqueStrings(append(migratedTopicIDs, f.Projects[i].Topics...))
-				break
-			}
-		}
-	}
-	_ = saveProjectsFile(f)
+	_ = prependTopicsInProjectsFile(workspaceRoot, migratedTopicIDs, false)
 	if topicTitles != nil {
 		_ = saveTopicTitles(topicTitleRoot, topicTitles)
 	}
@@ -4106,33 +4368,16 @@ func restoreSessionTopicIndex(dir, sessionPath string) error {
 		return err
 	}
 
-	f := loadProjectsFile()
 	if scope == "global" {
-		f.GlobalTopics = prependUniqueString(f.GlobalTopics, topicID)
 		meta.Scope = "global"
 		meta.WorkspaceRoot = ""
 	} else {
-		found := false
-		for i, p := range f.Projects {
-			if p.Root != workspaceRoot {
-				continue
-			}
-			f.Projects[i].Topics = prependUniqueString(p.Topics, topicID)
-			found = true
-			break
-		}
-		if !found {
-			f.Projects = append(f.Projects, desktopProject{
-				Root:   workspaceRoot,
-				Topics: []string{topicID},
-			})
-		}
 		meta.Scope = "project"
 		meta.WorkspaceRoot = workspaceRoot
 	}
 	meta.TopicID = topicID
 	meta.TopicTitle = title
-	if err := saveProjectsFile(f); err != nil {
+	if err := prependTopicInProjectsFile(workspaceRoot, topicID, scope == "project"); err != nil {
 		return err
 	}
 	if err := agent.SaveBranchMetaPreserveUpdated(sessionPath, meta); err != nil {
@@ -4215,7 +4460,6 @@ func (a *App) CreateTopic(scope, workspaceRoot, title string) (TopicMeta, error)
 		if abs, err := filepath.Abs(workspaceRoot); err == nil {
 			workspaceRoot = abs
 		}
-		_ = addProject(workspaceRoot, "")
 	}
 	if err := setTopicTitleWithSource(workspaceRoot, topicID, trimmedTitle, titleSource); err != nil {
 		return TopicMeta{}, err
@@ -4225,19 +4469,7 @@ func (a *App) CreateTopic(scope, workspaceRoot, title string) (TopicMeta, error)
 	}
 	// New topics should appear first in their project/global group so the item
 	// just created is immediately visible and selected in the sidebar.
-	f := loadProjectsFile()
-	if workspaceRoot == "" {
-		f.GlobalTopics = prependUniqueString(f.GlobalTopics, topicID)
-		_ = saveProjectsFile(f)
-	} else {
-		for i, p := range f.Projects {
-			if p.Root == workspaceRoot {
-				f.Projects[i].Topics = prependUniqueString(p.Topics, topicID)
-				_ = saveProjectsFile(f)
-				break
-			}
-		}
-	}
+	_ = prependTopicInProjectsFile(workspaceRoot, topicID, workspaceRoot != "")
 	a.emitProjectTreeChanged()
 	return TopicMeta{ID: topicID, Title: trimmedTitle, CreatedAt: createdAt}, nil
 }
@@ -4269,23 +4501,27 @@ func (a *App) SetProjectPinned(workspaceRoot string, pinned bool) error {
 	if root == "" {
 		return fmt.Errorf("workspaceRoot is required")
 	}
-	f := loadProjectsFile()
-	found := false
-	for _, project := range f.Projects {
-		if project.Root == root {
-			found = true
-			break
+	if err := updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		found := false
+		for _, project := range f.Projects {
+			if project.Root == root {
+				found = true
+				break
+			}
 		}
-	}
-	if !found {
-		return fmt.Errorf("project %q not found", root)
-	}
-	if pinned {
-		f.PinnedProjects = prependUniqueString(f.PinnedProjects, root)
-	} else {
-		f.PinnedProjects = removeString(f.PinnedProjects, root)
-	}
-	if err := saveProjectsFile(f); err != nil {
+		if !found {
+			return false, fmt.Errorf("project %q not found", root)
+		}
+		next := removeString(f.PinnedProjects, root)
+		if pinned {
+			next = prependUniqueString(f.PinnedProjects, root)
+		}
+		if sameStringList(next, f.PinnedProjects) {
+			return false, nil
+		}
+		f.PinnedProjects = next
+		return true, nil
+	}); err != nil {
 		return err
 	}
 	a.emitProjectTreeChanged()
@@ -4295,48 +4531,56 @@ func (a *App) SetProjectPinned(workspaceRoot string, pinned bool) error {
 // ReorderProjects persists the user-defined order of project folders and,
 // when present, the virtual Global sidebar section.
 func (a *App) ReorderProjects(workspaceRoots []string) error {
-	f := loadProjectsFile()
-	byRoot := make(map[string]desktopProject, len(f.Projects))
-	for _, project := range f.Projects {
-		byRoot[project.Root] = project
-	}
-	seen := make(map[string]bool, len(workspaceRoots))
-	next := make([]desktopProject, 0, len(workspaceRoots))
-	sidebarOrder := make([]string, 0, len(workspaceRoots))
-	hasGlobalOrder := false
-	for _, root := range workspaceRoots {
-		root = strings.TrimSpace(root)
-		if root == desktopGlobalOrderToken {
+	if err := updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		byRoot := make(map[string]desktopProject, len(f.Projects))
+		for _, project := range f.Projects {
+			byRoot[project.Root] = project
+		}
+		seen := make(map[string]bool, len(workspaceRoots))
+		next := make([]desktopProject, 0, len(workspaceRoots))
+		sidebarOrder := make([]string, 0, len(workspaceRoots))
+		hasGlobalOrder := false
+		for _, root := range workspaceRoots {
+			root = strings.TrimSpace(root)
+			if root == desktopGlobalOrderToken {
+				if seen[root] {
+					return false, fmt.Errorf("duplicate global section")
+				}
+				seen[root] = true
+				hasGlobalOrder = true
+				sidebarOrder = append(sidebarOrder, root)
+				continue
+			}
+			root = normalizeProjectRoot(root)
+			project, ok := byRoot[root]
+			if !ok {
+				return false, fmt.Errorf("project %q not found", root)
+			}
 			if seen[root] {
-				return fmt.Errorf("duplicate global section")
+				return false, fmt.Errorf("duplicate project %q", root)
 			}
 			seen[root] = true
-			hasGlobalOrder = true
+			next = append(next, project)
 			sidebarOrder = append(sidebarOrder, root)
-			continue
 		}
-		root = normalizeProjectRoot(root)
-		project, ok := byRoot[root]
-		if !ok {
-			return fmt.Errorf("project %q not found", root)
+		if len(next) != len(f.Projects) {
+			return false, fmt.Errorf("project order length mismatch")
 		}
-		if seen[root] {
-			return fmt.Errorf("duplicate project %q", root)
+		changed := !sameProjectOrder(next, f.Projects)
+		f.Projects = next
+		if hasGlobalOrder {
+			if !sameStringList(sidebarOrder, f.SidebarOrder) {
+				changed = true
+			}
+			f.SidebarOrder = sidebarOrder
+		} else {
+			if len(f.SidebarOrder) > 0 {
+				changed = true
+			}
+			f.SidebarOrder = nil
 		}
-		seen[root] = true
-		next = append(next, project)
-		sidebarOrder = append(sidebarOrder, root)
-	}
-	if len(next) != len(f.Projects) {
-		return fmt.Errorf("project order length mismatch")
-	}
-	f.Projects = next
-	if hasGlobalOrder {
-		f.SidebarOrder = sidebarOrder
-	} else {
-		f.SidebarOrder = nil
-	}
-	if err := saveProjectsFile(f); err != nil {
+		return changed, nil
+	}); err != nil {
 		return err
 	}
 	a.emitProjectTreeChanged()
@@ -4531,26 +4775,15 @@ func (a *App) DeleteTopic(topicID string) error {
 				return err
 			}
 			deleteTopicCreatedAt("", topicID)
-			f.GlobalTopics = removeString(f.GlobalTopics, topicID)
-			f.GlobalPinnedTopics = removeString(f.GlobalPinnedTopics, topicID)
 			found = true
 		}
 	}
 	if !found {
 		return fmt.Errorf("topic %q not found", topicID)
 	}
-	// Remove from project topic list.
-	f.GlobalPinnedTopics = removeString(f.GlobalPinnedTopics, topicID)
-	for i, p := range f.Projects {
-		for j, tid := range p.Topics {
-			if tid == topicID {
-				f.Projects[i].Topics = append(f.Projects[i].Topics[:j], f.Projects[i].Topics[j+1:]...)
-				break
-			}
-		}
-		f.Projects[i].PinnedTopics = removeString(f.Projects[i].PinnedTopics, topicID)
+	if err := removeTopicFromProjectsFile(topicID); err != nil {
+		return err
 	}
-	_ = saveProjectsFile(f)
 	a.emitProjectTreeChanged()
 	return nil
 }
@@ -4562,33 +4795,36 @@ func (a *App) SetTopicPinned(topicID string, pinned bool) error {
 	if topicID == "" {
 		return fmt.Errorf("topicID is required")
 	}
-	f := loadProjectsFile()
-	for i, p := range f.Projects {
-		m := loadTopicTitles(p.Root)
-		if _, ok := m[topicID]; !ok && !containsDesktopString(p.Topics, topicID) {
-			continue
+	if err := updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		for i, p := range f.Projects {
+			m := loadTopicTitles(p.Root)
+			if _, ok := m[topicID]; !ok && !containsDesktopString(p.Topics, topicID) {
+				continue
+			}
+			next := removeString(f.Projects[i].PinnedTopics, topicID)
+			if pinned {
+				next = prependUniqueString(f.Projects[i].PinnedTopics, topicID)
+			}
+			if sameStringList(next, f.Projects[i].PinnedTopics) {
+				return false, nil
+			}
+			f.Projects[i].PinnedTopics = next
+			return true, nil
 		}
+		globalTitles := loadTopicTitles("")
+		if _, ok := globalTitles[topicID]; !ok && !containsDesktopString(f.GlobalTopics, topicID) {
+			return false, fmt.Errorf("topic %q not found", topicID)
+		}
+		next := removeString(f.GlobalPinnedTopics, topicID)
 		if pinned {
-			f.Projects[i].PinnedTopics = prependUniqueString(f.Projects[i].PinnedTopics, topicID)
-		} else {
-			f.Projects[i].PinnedTopics = removeString(f.Projects[i].PinnedTopics, topicID)
+			next = prependUniqueString(f.GlobalPinnedTopics, topicID)
 		}
-		if err := saveProjectsFile(f); err != nil {
-			return err
+		if sameStringList(next, f.GlobalPinnedTopics) {
+			return false, nil
 		}
-		a.emitProjectTreeChanged()
-		return nil
-	}
-	globalTitles := loadTopicTitles("")
-	if _, ok := globalTitles[topicID]; !ok && !containsDesktopString(f.GlobalTopics, topicID) {
-		return fmt.Errorf("topic %q not found", topicID)
-	}
-	if pinned {
-		f.GlobalPinnedTopics = prependUniqueString(f.GlobalPinnedTopics, topicID)
-	} else {
-		f.GlobalPinnedTopics = removeString(f.GlobalPinnedTopics, topicID)
-	}
-	if err := saveProjectsFile(f); err != nil {
+		f.GlobalPinnedTopics = next
+		return true, nil
+	}); err != nil {
 		return err
 	}
 	a.emitProjectTreeChanged()
@@ -5487,11 +5723,137 @@ func saveTabSessionMeta(tab *WorkspaceTab, path string) error {
 	m.WorkspaceRoot = workspaceRoot
 	m.TopicID = tab.TopicID
 	m.TopicTitle = tab.TopicTitle
+	m.TokenMode = persistedTabTokenMode(currentTabTokenMode(tab))
+	m.Mode = persistedTabMode(currentTabMode(tab))
+	m.ToolApprovalMode = persistedToolApprovalMode(currentTabToolApprovalMode(tab))
+	m.Goal = persistedTabGoal(tab)
 	if err := agent.SaveBranchMetaPreserveUpdated(path, m); err != nil {
 		return err
 	}
 	invalidateTopicSessionIndexForPath(path)
 	return nil
+}
+
+func tabSessionMetaPathForCurrentSession(tab *WorkspaceTab) string {
+	if tab == nil {
+		return ""
+	}
+	path := strings.TrimSpace(tab.currentSessionPath())
+	if path == "" {
+		return ""
+	}
+	for _, dir := range []string{tabRuntimeSessionDir(tab), tabSessionDir(tab)} {
+		if resolved, ok := pinnedTabSessionPath(dir, path); ok {
+			return resolved
+		}
+	}
+	path = canonicalTabSessionPath(path)
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return ""
+}
+
+func saveTabSessionMetaForCurrentSession(tab *WorkspaceTab) error {
+	if tab == nil || tab.ReadOnly {
+		return nil
+	}
+	if _, discard := transientBlankSessionArtifactPath(tab); discard {
+		return nil
+	}
+	path := tabSessionMetaPathForCurrentSession(tab)
+	if path == "" {
+		return nil
+	}
+	return saveTabSessionMeta(tab, path)
+}
+
+type tabSessionProfile struct {
+	tokenMode        string
+	mode             string
+	toolApprovalMode string
+	goal             string
+}
+
+func defaultTabSessionProfile() tabSessionProfile {
+	return tabSessionProfile{
+		tokenMode:        boot.TokenModeFull,
+		mode:             "normal",
+		toolApprovalMode: control.ToolApprovalAsk,
+	}
+}
+
+func tabSessionProfileFromMeta(sessionPath string, meta agent.BranchMeta) tabSessionProfile {
+	profile := defaultTabSessionProfile()
+	profile.tokenMode = boot.NormalizeTokenMode(meta.TokenMode)
+	profile.mode = normalizeTabMode(meta.Mode)
+	profile.toolApprovalMode = normalizeToolApprovalMode(meta.ToolApprovalMode)
+	if profile.toolApprovalMode == control.ToolApprovalAsk && tabModeHasAutoApproveTools(meta.Mode) {
+		profile.toolApprovalMode = control.ToolApprovalYolo
+	}
+	profile.goal = runningTabSessionGoal(sessionPath, meta.Goal)
+	return profile
+}
+
+func loadTabSessionProfile(sessionPath string) tabSessionProfile {
+	meta, ok, err := agent.LoadBranchMeta(sessionPath)
+	if err != nil || !ok {
+		return defaultTabSessionProfile()
+	}
+	return tabSessionProfileFromMeta(sessionPath, meta)
+}
+
+func applyTabSessionProfile(tab *WorkspaceTab, profile tabSessionProfile) {
+	if tab == nil {
+		return
+	}
+	tab.tokenMode = boot.NormalizeTokenMode(profile.tokenMode)
+	tab.mode = normalizeTabMode(profile.mode)
+	tab.toolApprovalMode = normalizeToolApprovalMode(profile.toolApprovalMode)
+	if tab.toolApprovalMode == control.ToolApprovalAsk && tabModeHasAutoApproveTools(tab.mode) {
+		tab.toolApprovalMode = control.ToolApprovalYolo
+	}
+	tab.mode = tabModeFromAxes(tabModeHasPlan(tab.mode), tab.toolApprovalMode == control.ToolApprovalYolo)
+	tab.goal = strings.TrimSpace(profile.goal)
+}
+
+func persistedTabGoal(tab *WorkspaceTab) string {
+	goal := strings.TrimSpace(currentTabGoal(tab))
+	if goal == "" || currentTabGoalStatus(tab) != control.GoalStatusRunning {
+		return ""
+	}
+	return goal
+}
+
+type tabSessionGoalState struct {
+	Goal   string `json:"goal,omitempty"`
+	Status string `json:"status,omitempty"`
+}
+
+func runningTabSessionGoal(sessionPath, fallback string) string {
+	fallback = strings.TrimSpace(fallback)
+	if fallback == "" {
+		return ""
+	}
+	data, err := os.ReadFile(store.SessionGoalState(sessionPath))
+	if err != nil {
+		return fallback
+	}
+	var state tabSessionGoalState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fallback
+	}
+	switch state.Status {
+	case control.GoalStatusRunning:
+		if goal := strings.TrimSpace(state.Goal); goal != "" {
+			return goal
+		}
+		return fallback
+	case "", control.GoalStatusStopped:
+		return ""
+	default:
+		return ""
+	}
 }
 
 func canonicalTabSessionPath(path string) string {

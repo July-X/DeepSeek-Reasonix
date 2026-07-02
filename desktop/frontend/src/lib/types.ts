@@ -207,6 +207,7 @@ export interface TabMeta {
   tokenMode?: TokenMode;
   goal?: string;
   goalStatus?: GoalStatus;
+  autoResearch?: AutoResearchCompactView;
   startupErr?: string;
   active: boolean;
   cwd: string;
@@ -355,6 +356,8 @@ export interface CheckpointMeta {
   turn: number;
   prompt: string;
   files: string[];
+  fileCount?: number;
+  filesTruncated?: boolean;
   turnFileCount?: number;
   time: number; // unix ms
   canCode?: boolean;
@@ -434,12 +437,62 @@ export interface Meta {
   tokenMode?: TokenMode;
   goal?: string;
   goalStatus?: GoalStatus;
+  autoResearch?: AutoResearchCompactView;
 }
 
 export type CollaborationMode = "normal" | "plan" | "goal";
 export type ToolApprovalMode = "ask" | "auto" | "yolo";
 export type TokenMode = "full" | "economy";
 export type GoalStatus = "running" | "complete" | "blocked" | "stopped";
+
+export interface AutoResearchCompactView {
+  taskId: string;
+  status: "running" | "blocked" | "complete" | "stopped" | "invalid";
+  iteration: number;
+  pivotRequired: boolean;
+  staleCount: number;
+}
+
+export interface AutoResearchCriterionView {
+  id: string;
+  description: string;
+  required: boolean;
+  evidenceCount: number;
+  status: string;
+}
+
+export interface AutoResearchStatusView extends AutoResearchCompactView {
+  goal: string;
+  currentDirection: string;
+  pivotCount: number;
+  lastHeartbeatAt: string;
+  findingCount: number;
+  openCriteria: AutoResearchCriterionView[];
+  blocker: string;
+  taskPath: string;
+  nextRequiredAction: string;
+}
+
+export interface AutoResearchFindingView {
+  id: string;
+  kind: string;
+  summary: string;
+  source: string;
+  command?: string;
+  paths?: string[];
+  accepted: boolean;
+  createdAt: string;
+}
+
+export interface AutoResearchEvidenceView {
+  id: string;
+  kind: string;
+  summary: string;
+  source: string;
+  command?: string;
+  paths?: string[];
+  accepted: boolean;
+}
 
 export function normalizeCollaborationMode(mode?: string, goal?: string, legacyMode?: Mode): CollaborationMode {
   if (mode === "plan" || mode === "goal" || mode === "normal") return mode;
@@ -754,6 +807,7 @@ export interface ProviderView {
   modelsUrl: string; // optional override for model discovery; empty derives from baseUrl
   default: string;
   apiKeyEnv: string;
+  headers?: Record<string, string> | null; // optional extra request headers for compatible gateways
   keySet: boolean; // the env var currently resolves to a value
   requiresKey?: boolean; // false for explicit no-auth providers
   configured?: boolean; // selectable: key is set or no key is required
@@ -764,6 +818,15 @@ export interface ProviderView {
   reasoningProtocol: string; // auto|deepseek|openai|none; empty = auto/model registry
   supportedEfforts: string[]; // custom /effort levels; empty = use built-in Kind/BaseURL default
   defaultEffort: string; // /effort level when user picks "auto" or unset; "" = supportedEfforts[0]
+  modelOverrides?: ProviderModelOverrideView[] | null;
+}
+
+export interface ProviderModelOverrideView {
+  model: string;
+  reasoningProtocol: string;
+  supportedEfforts: string[];
+  defaultEffort: string;
+  vision?: boolean | null;
 }
 
 // BalanceInfo is the wallet-balance readout (desktop/app.go Balance). available
