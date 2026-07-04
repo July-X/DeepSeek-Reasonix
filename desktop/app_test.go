@@ -27,7 +27,9 @@ import (
 	"reasonix/internal/jobs"
 	"reasonix/internal/memory"
 	"reasonix/internal/plugin"
+	"reasonix/internal/pluginpkg"
 	"reasonix/internal/provider"
+	"reasonix/internal/sandbox"
 	"reasonix/internal/tool"
 )
 
@@ -955,20 +957,35 @@ api_key_env = "DEEPSEEK_API_KEY"
 	}
 
 	app := NewApp()
+	if got := app.Settings().Agent.MaxSubagentDepth; got != agent.DefaultMaxSubagentDepth {
+		t.Fatalf("default max subagent depth = %d, want %d", got, agent.DefaultMaxSubagentDepth)
+	}
 	if err := app.SetSubagentModel("deepseek/deepseek-v4-pro"); err != nil {
 		t.Fatalf("SetSubagentModel: %v", err)
 	}
 	if err := app.SetSubagentEffort("max"); err != nil {
 		t.Fatalf("SetSubagentEffort: %v", err)
 	}
+	if err := app.SetMaxSubagentDepth(1); err != nil {
+		t.Fatalf("SetMaxSubagentDepth(1): %v", err)
+	}
+	if err := app.SetMaxSubagentDepth(2); err != nil {
+		t.Fatalf("SetMaxSubagentDepth(2): %v", err)
+	}
 
 	got := app.Settings()
 	if got.SubagentModel != "deepseek/deepseek-v4-pro" || got.SubagentEffort != "max" {
 		t.Fatalf("subagent settings = model:%q effort:%q", got.SubagentModel, got.SubagentEffort)
 	}
+	if got.Agent.MaxSubagentDepth != 2 {
+		t.Fatalf("max subagent depth = %d, want 2", got.Agent.MaxSubagentDepth)
+	}
 	cfg := config.LoadForEdit(config.UserConfigPath())
 	if cfg.Agent.SubagentModel != "deepseek/deepseek-v4-pro" || cfg.Agent.SubagentEffort != "max" {
 		t.Fatalf("saved config = model:%q effort:%q", cfg.Agent.SubagentModel, cfg.Agent.SubagentEffort)
+	}
+	if cfg.Agent.MaxSubagentDepth != 2 {
+		t.Fatalf("saved max_subagent_depth = %d, want 2", cfg.Agent.MaxSubagentDepth)
 	}
 }
 
@@ -4209,6 +4226,51 @@ args = ["-y", "@playwright/mcp"]
 	t.Fatalf("playwright MCP missing from Capabilities: %+v", view.Servers)
 }
 
+func TestCapabilitiesIncludesInstalledPlugins(t *testing.T) {
+	home := isolateDesktopUserDirs(t)
+	reasonixHome := filepath.Join(home, ".reasonix")
+	root := filepath.Join(reasonixHome, "plugins", "superpowers")
+	if err := os.MkdirAll(filepath.Join(root, "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "skills", "plan"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "skills", "plan", "SKILL.md"), []byte("---\ndescription: Plan work\n---\nbody"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".codex-plugin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".codex-plugin", "plugin.json"), []byte(`{
+  "name": "superpowers",
+  "version": "6.1.0",
+  "description": "Planning workflows",
+  "skills": "./skills/"
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := pluginpkg.Upsert(reasonixHome, pluginpkg.InstalledPlugin{
+		Name:         "superpowers",
+		Root:         "plugins/superpowers",
+		Version:      "6.1.0",
+		Description:  "Planning workflows",
+		ManifestKind: "codex",
+		Enabled:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	plugins := app.Capabilities().Plugins
+	if len(plugins) != 1 || plugins[0].Name != "superpowers" || plugins[0].Skills != 1 {
+		t.Fatalf("Capabilities().Plugins = %+v", plugins)
+	}
+	if len(plugins[0].SkillDetails) != 1 || plugins[0].SkillDetails[0].Invocation != "/plan" {
+		t.Fatalf("Capabilities().Plugins skill details = %+v", plugins[0].SkillDetails)
+	}
+}
+
 func TestDesktopSharedHostBackgroundMCPAutoConnectsOnBoot(t *testing.T) {
 	isolateDesktopUserDirs(t)
 	dir := robustTempDir(t)
@@ -5301,6 +5363,129 @@ func TestRunShellForTabRoutesToRequestedTab(t *testing.T) {
 		case <-deadline:
 			t.Fatal("timed out waiting for inactive shell turn")
 		}
+	}
+}
+
+func TestRunShellForTabStaysBoundDuringRapidProjectTabSwitching(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectA := t.TempDir()
+	projectB := t.TempDir()
+	globalRoot := t.TempDir()
+	shellEvents := make(chan event.Event, 64)
+	projectEvents := make(chan event.Event, 64)
+	globalEvents := make(chan event.Event, 64)
+	shellCtrl := control.New(control.Options{
+		Sink:          event.FuncSink(func(e event.Event) { shellEvents <- e }),
+		WorkspaceRoot: projectA,
+	})
+	projectCtrl := control.New(control.Options{
+		Sink:          event.FuncSink(func(e event.Event) { projectEvents <- e }),
+		WorkspaceRoot: projectB,
+	})
+	globalCtrl := control.New(control.Options{
+		Sink:          event.FuncSink(func(e event.Event) { globalEvents <- e }),
+		WorkspaceRoot: globalRoot,
+	})
+	defer shellCtrl.Close()
+	defer projectCtrl.Close()
+	defer globalCtrl.Close()
+
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"shell":     {ID: "shell", Scope: "project", WorkspaceRoot: projectA, Ctrl: shellCtrl, Ready: true},
+			"project-b": {ID: "project-b", Scope: "project", WorkspaceRoot: projectB, Ctrl: projectCtrl, Ready: true},
+			"global":    {ID: "global", Scope: "global", WorkspaceRoot: globalRoot, Ctrl: globalCtrl, Ready: true},
+		},
+		tabOrder:    []string{"shell", "project-b", "global"},
+		activeTabID: "shell",
+	}
+
+	marker := "shell-route-marker.txt"
+	if err := app.RunShellForTab("shell", longRunningMarkerCommand(marker)); err != nil {
+		t.Fatalf("RunShellForTab: %v", err)
+	}
+	waitForShellDispatch(t, shellEvents, marker)
+	waitForFile(t, filepath.Join(projectA, marker), "shell")
+
+	for i := 0; i < 8; i++ {
+		if err := app.SetActiveTab("project-b"); err != nil {
+			t.Fatalf("SetActiveTab(project-b): %v", err)
+		}
+		if err := app.SetActiveTab("global"); err != nil {
+			t.Fatalf("SetActiveTab(global): %v", err)
+		}
+		if err := app.SetActiveTab("shell"); err != nil {
+			t.Fatalf("SetActiveTab(shell): %v", err)
+		}
+	}
+	if err := app.SetActiveTab("project-b"); err != nil {
+		t.Fatalf("SetActiveTab(project-b final): %v", err)
+	}
+	app.CancelTab("shell")
+
+	cancelled := false
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case e := <-shellEvents:
+			if e.Kind == event.ToolResult && e.Tool.Name == "bash" {
+				cancelled = e.Tool.Err != ""
+			}
+			if e.Kind == event.TurnDone {
+				if !cancelled {
+					t.Fatal("shell tab finished without a cancelled shell result")
+				}
+				if _, err := os.Stat(filepath.Join(projectB, marker)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("shell marker appeared in project-b workspace: %v", err)
+				}
+				if got := activeTabIDForTest(app); got != "project-b" {
+					t.Fatalf("active tab = %q, want project-b after background shell cancel", got)
+				}
+				assertNoEvents(t, projectEvents, "project-b")
+				assertNoEvents(t, globalEvents, "global")
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for shell tab cancellation")
+		}
+	}
+}
+
+func longRunningMarkerCommand(marker string) string {
+	if sandbox.ResolveShell("", "", nil).Kind == sandbox.ShellPowerShell {
+		return fmt.Sprintf("Set-Content -LiteralPath %s -Value shell; Start-Sleep -Seconds 30", marker)
+	}
+	return fmt.Sprintf("printf shell > %s; sleep 30", marker)
+}
+
+func waitForShellDispatch(t *testing.T, ch <-chan event.Event, marker string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case e := <-ch:
+			if e.Kind == event.ToolDispatch && strings.Contains(e.Tool.Args, marker) {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for shell dispatch")
+		}
+	}
+}
+
+func activeTabIDForTest(app *App) string {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.activeTabID
+}
+
+func assertNoEvents(t *testing.T, ch <-chan event.Event, name string) {
+	t.Helper()
+	select {
+	case e := <-ch:
+		t.Fatalf("%s received event while shell ran in another tab: %+v", name, e)
+	default:
 	}
 }
 

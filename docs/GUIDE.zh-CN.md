@@ -37,6 +37,8 @@ Reasonix 全局 `<Reasonix home>/.env`。项目 `.env`、home `.env`、继承的
 
 桌面端和 CLI 端的可见思考语言设置，见 [思考语言](./REASONING_LANGUAGE.zh-CN.md)。
 桌面端 Hooks 的 JSON 配置、事件 key 和 payload 字段，见 [桌面端 Hooks](./DESKTOP_HOOKS.zh-CN.md)。
+`SessionStart` hook 可通过 stdout 或 `hookSpecificOutput.additionalContext` 把插件/工作流 bootstrap 内容一次性注入下一轮真实用户输入上下文，而不是写入稳定 system prompt。
+插件包可通过 `hooks/session-start-codex` 或插件根目录 `CLAUDE.md` 提供该启动上下文；Claude 风格 `.claude/settings.json` command hooks 也会按同名事件映射到 Reasonix hooks。
 
 ```toml
 default_model = "deepseek-flash"   # 执行器；设 [agent].planner_model 可加规划器
@@ -55,6 +57,7 @@ reasoning_language = "auto"      # 可见思考过程语言：auto|zh|en
 # planner_model = "deepseek-pro"      # 可选的低频规划器
 # subagent_model = "deepseek-pro"     # runAs=subagent skill 的默认模型
 # subagent_models = { review = "deepseek-pro", security_review = "deepseek-pro" }
+# max_subagent_depth = 2              # 子代理嵌套委派深度；设为 1 可恢复旧的单层边界
 auto_plan = "off"                  # 仅用户级生效；off|on；off 表示计划模式仅手动开启
 # auto_plan_classifier = "deepseek-flash"   # 可选；只在边界任务上调用
 tool_result_snip_ratio = 0.6       # 在摘要 compaction 前先缩短旧工具输出
@@ -191,11 +194,46 @@ Goal、由 `todo_write` 工具驱动的实时 Todo 面板，以及已配置 prov
 输入框下方的预览就是最终请求地址。
 
 模型发现会基于 API 地址尝试 `/models`、`/v1/models` 等候选地址。如果网关要求单独的
-模型列表端点，在 **高级设置** 中填写 `models_url`，例如
+模型列表端点，在 **兼容设置** 中填写 `models_url`，例如
 `https://gateway.example.com/v1/models`。如果接口不支持模型发现，也可以手动填写模型列表。
 
 **完整 URL** 仍使用 OpenAI-compatible chat 请求体；它不会切换成 OpenAI Responses API
 的请求 schema。
+
+### 兼容设置
+
+**兼容设置（通常不用改）** 用于处理认证变量、模型发现地址、请求头、以及 reasoning/thinking
+请求格式和普通 OpenAI-compatible 默认行为不一致的网关。除非服务商文档明确要求，或代理报错说明
+不兼容，否则保持默认值即可。
+
+| 字段 | 作用 | 什么时候改 |
+| --- | --- | --- |
+| `api_key_env` | 该 provider 使用的 API key 环境变量名。桌面端保存的真实 key 会写入 Reasonix home `.env` 的同名变量；TOML 配置里只保存变量名。 | 多个 provider 需要不同 key 时改名；服务不需要 API key 时可以留空。 |
+| `models_url` | 只用于自动发现模型列表的 URL。聊天请求仍使用上方的 API 地址或完整 URL。 | `/models` 或 `/v1/models` 不是该网关模型列表地址时填写。 |
+| 额外请求头 | 静态 HTTP header，一行一个 `Header: value`。 | OpenRouter 等网关要求 `HTTP-Referer`、`X-Title` 或类似站点来源 header 时使用。API key 仍放在上方密钥字段，不要重复写到这里。 |
+| 额外请求体 | 合并到聊天请求体顶层的 JSON 对象。 | 仅用于服务商专用开关，例如 `{"enable_thinking": true}`。`model`、`messages`、`tools`、`stream`、`thinking` 等核心字段仍由 Reasonix 控制，且不接受 `null` 值。 |
+| 模型能力模式 | 指定 Reasonix 对该 provider 使用哪种 reasoning 请求协议。 | 默认用“自动识别”。只有网关被误判，或模型文档要求特定 reasoning 格式时再切换。 |
+| Thinking 覆盖 | provider 专用的 `thinking.type` 覆盖项。 | 默认用 Auto。只有后端文档明确支持 `enabled`、`disabled` 或 `adaptive` 时再手动指定；不支持的值可能让中转站拒绝请求。 |
+| 余额查询 URL | 可选的钱包余额查询接口。 | 服务商提供余额接口，且希望桌面端状态栏显示余额时填写。 |
+| 上下文窗口 | 该 provider 可保留的最大上下文 token 数。`0` 表示使用模型服务默认值。 | 模型实际上下文大小和 Reasonix 默认值或内置元数据不一致时填写。 |
+
+模型能力模式选项：
+
+| 选项 | 作用 |
+| --- | --- |
+| 自动识别（推荐） | Reasonix 根据模型能力元数据和端点自动选择请求格式。 |
+| DeepSeek 思考 | 使用 DeepSeek 风格的 thinking 控制，包括 `thinking.type` 和 DeepSeek 支持的推理深度。 |
+| OpenAI reasoning | 使用标准 OpenAI-compatible 的 `reasoning_effort` 档位。 |
+| 普通聊天（不发送思考参数） | 不发送 reasoning 或 thinking 控制字段。适合会拒绝 reasoning 参数的普通文本代理。 |
+
+Thinking 覆盖选项：
+
+| 选项 | 作用 |
+| --- | --- |
+| Auto（使用服务默认） | 不写 provider 级 `thinking` 覆盖，让 Reasonix 使用 provider/model 默认行为。 |
+| Enabled（开启） | 对兼容 provider 发送 `thinking.type = "enabled"`。 |
+| Disabled（关闭） | 对兼容 provider 发送 `thinking.type = "disabled"`。DeepSeek 风格 provider 下还会避免继续发送推理深度提示。 |
+| Adaptive（自适应） | 仅在服务文档明确支持 adaptive thinking 时使用，例如 MiniMax-M3 风格端点；语义是发送或保留 `thinking.type = "adaptive"`。 |
 
 ## 快捷键
 
@@ -409,7 +447,8 @@ headers = { Authorization = "Bearer ${STRIPE_KEY}" }
 compaction archive 和已保存事实；这些动态内容不会被塞进稳定的 system prompt 前缀。
 `/forget <name>` 会把已保存事实归档而不是永久删除；CLI/TUI 和桌面记忆面板能显示归档文件用于追溯，
 但它们不会作为 active memory 被检索。检索会保留 BM25 最强命中，同时裁掉弱的泛词命中；
-agent 发起的 `remember` 和 `forget` 每次都会要求新的人工确认，并在执行前展示将保存或归档的记忆摘要。
+agent 发起的 `remember` 和 `forget` 每次都会要求新的人工确认，并在执行前展示将保存或归档的记忆摘要；
+Guardian 审查不能代替用户批准，非交互运行会拒绝这类工具而不是自动批准。
 0 结果会提示 agent 改用更少、更有区分度的词继续查。
 Memory v5 在 CLI/TUI、`reasonix serve` 和桌面端默认开启，因为这些入口共用同一套本地
 controller。它会把本地、按项目隔离的执行轨迹和编译器状态写在 Reasonix home 下，并且只有
@@ -512,10 +551,17 @@ Planner 会看到已加载的 `REASONIX.md` / `AGENTS.md` 记忆，并拿到一�
 Subagent skills 默认继承执行器模型。设置 `subagent_model` 可让它们统一走另一个已配置
 模型；设置 `subagent_models` 则只覆盖 `review`、`security_review` 等指定 skill。
 
+Subagent 默认允许再委派一层：根会话是 depth 0，第一层 subagent 是 depth 1，
+`max_subagent_depth = 2` 表示 depth 1 的 workflow 可以再派 depth 2 的 reviewer
+或 implementer；depth 2 不再拿到递归 agent/skill 工具。设
+`agent.max_subagent_depth = 1` 可恢复旧的单层边界。这主要用于 Superpowers 这类
+workflow skill 派发 reviewer subagent 的场景，同时避免无限递归和后台 fanout。
+
 当计划阶段需要隔离上下文做更深的调研时，用 `read_only_task`，而不是放开可写的
 `task`。如果这类调研更适合复用已有 skill，用 `read_only_skill`。两者都会启动
 ephemeral 只读 subagent，只暴露只读研究工具和安全前台 bash，只返回最终答案，不创建
-可续接的 subagent transcript。在 token economy 模式下，只用
+可续接的 subagent transcript。只读嵌套委派会在 `max_subagent_depth` 内可用，但
+可写的 `task` / `run_skill` 仍不可用。在 token economy 模式下，只用
 `connect_tool_source(source="read_only_skill")` 连接这条窄入口；完整的 `skills`
 source 仍会启用可写 skill 工具，plan mode 下继续阻断。
 

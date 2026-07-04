@@ -121,6 +121,10 @@ type Options struct {
 	// terminal. Headless/bot frontends pass a positive value so an unanswered
 	// prompt can't wedge the session indefinitely (#4626, #4402).
 	ApprovalTimeout time.Duration
+	// SessionRecoveryMeta and OnSessionRecovered let richer frontends attach
+	// local UI metadata to automatic transcript recovery branches.
+	SessionRecoveryMeta func(control.SessionRecoveryRequest) agent.BranchMeta
+	OnSessionRecovered  func(control.SessionRecoveryInfo) error
 }
 
 // Build loads config, resolves the model(s), and returns a Controller wrapping a
@@ -509,13 +513,14 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 
 	// Permission policy gates every tool call. The headless gate (no Approver)
-	// resolves "ask" to allow — preserving `reasonix run` autonomy — while deny
-	// rules hard-block in every mode. Interactive frontends (chat, desktop) swap
-	// in an interactive gate later via Controller.EnableInteractiveApproval.
+	// resolves ordinary "ask" decisions to allow — preserving `reasonix run`
+	// autonomy — while deny rules and fresh-human approval tools hard-block.
+	// Interactive frontends (chat, desktop) swap in an interactive gate later via
+	// Controller.EnableInteractiveApproval.
 	// Sub-agents always run headless: they have no UI to answer a prompt, so they
 	// inherit this same gate.
 	policy := permission.New(cfg.Permissions.Mode, cfg.Permissions.Allow, cfg.Permissions.Ask, cfg.Permissions.Deny)
-	headlessGate := permission.NewGate(policy, nil)
+	headlessGate := control.NewHeadlessPermissionGate(policy)
 
 	// Hooks: load the global settings.json plus the project's (only when trusted —
 	// project hooks run arbitrary shell commands, so cloning a repo must not
@@ -569,6 +574,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 	taskModel := firstNonEmpty(cfg.Agent.SubagentModels["task"], cfg.Agent.SubagentModel)
 	taskEffort := firstNonEmpty(cfg.Agent.SubagentEfforts["task"], cfg.Agent.SubagentEffort)
+	maxSubagentDepth := agent.NormalizeMaxSubagentDepth(cfg.Agent.MaxSubagentDepth)
 	taskToolAdded := false
 	readOnlyTaskToolAdded := false
 	var taskTool *agent.TaskTool
@@ -579,7 +585,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			keepPolicy,
 			taskModel, taskEffort, resolveSubagentProvider).
 			WithTranscripts(subagentStore, root, modelName, entry.Effort).
-			WithTranscriptIdentityResolver(subagentIdentity)
+			WithTranscriptIdentityResolver(subagentIdentity).
+			WithMaxSubagentDepth(maxSubagentDepth)
 	}
 	addTaskTool := func() string {
 		if taskToolAdded {
@@ -651,7 +658,11 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			}
 			prov, price, ctxWin = p, pr, cw
 		}
-		subReg := agent.ReadOnlySubagentToolRegistry(reg, sk.AllowedTools)
+		childDepth := agent.SubagentDepth(sctx) + 1
+		if childDepth > maxSubagentDepth {
+			return "", fmt.Errorf("subagent delegation depth limit reached (max_subagent_depth=%d)", maxSubagentDepth)
+		}
+		subReg := agent.ReadOnlySubagentToolRegistryForDepth(reg, sk.AllowedTools, childDepth, maxSubagentDepth)
 		if subReg.Len() == 0 {
 			return "", fmt.Errorf("read_only_skill: skill %q has no read-only tools available", sk.Name)
 		}
@@ -677,6 +688,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			ArchiveDir:          config.ArchiveDir(),
 			KeepPolicy:          keepPolicy,
 			ReasoningLanguage:   agent.ReasoningLanguageFromContext(sctx),
+			SubagentDepth:       childDepth,
+			MaxSubagentDepth:    maxSubagentDepth,
 		}, agent.NestedSink(sctx, event.Discard))
 	}
 	// Writer-capable subagent skills reuse the sub-agent machinery via this
@@ -696,7 +709,11 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			}
 			prov, price, ctxWin = p, pr, cw
 		}
-		subReg := agent.SubagentToolRegistry(reg, sk.AllowedTools)
+		childDepth := agent.SubagentDepth(sctx) + 1
+		if childDepth > maxSubagentDepth {
+			return "", fmt.Errorf("subagent delegation depth limit reached (max_subagent_depth=%d)", maxSubagentDepth)
+		}
+		subReg := agent.SubagentToolRegistryForDepth(reg, sk.AllowedTools, childDepth, maxSubagentDepth)
 		continueFrom := strings.TrimSpace(runOpts.ContinueFrom)
 		legacyForkFrom := strings.TrimSpace(runOpts.ForkFrom)
 		if continueFrom != "" && legacyForkFrom != "" {
@@ -757,6 +774,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			ArchiveDir:        config.ArchiveDir(),
 			KeepPolicy:        keepPolicy,
 			ReasoningLanguage: agent.ReasoningLanguageFromContext(sctx),
+			SubagentDepth:     childDepth,
+			MaxSubagentDepth:  maxSubagentDepth,
 		}, agent.NestedSink(sctx, event.Discard))
 		if err != nil {
 			return "", errors.Join(err, subagentStore.SaveFailed(run))
@@ -983,6 +1002,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		KeepPolicy:                         keepPolicy,
 		ReasoningLanguage:                  cfg.ReasoningLanguage(),
 		PlanModeAllowedTools:               cfg.Agent.PlanModeAllowedTools,
+		SubagentDepth:                      0,
+		MaxSubagentDepth:                   maxSubagentDepth,
 		MemoryCompiler:                     memCompiler,
 		MemoryCompilerVerbosity:            cfg.MemoryCompilerVerbosity(),
 		UseMemoryCompilerLLMClassification: strings.TrimSpace(os.Getenv("REASONIX_MEMORY_COMPILER_LLM_CLASSIFICATION")) == "true",
@@ -1078,6 +1099,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		OnRememberMCPReadOnlyTrust: func(serverName, rawToolName string) control.MCPReadOnlyTrustResult {
 			return rememberMCPReadOnlyTrust(root, serverName, rawToolName)
 		},
+		SessionRecoveryMeta: opts.SessionRecoveryMeta,
+		OnSessionRecovered:  opts.OnSessionRecovered,
 	}
 	// Guardian: when guardian_model is configured, spawn an LLM safety reviewer
 	// that can auto-allow safe Ask decisions and annotate risky ones before
@@ -1360,6 +1383,7 @@ func NewProviderWithProxy(e *config.ProviderEntry, proxy netclient.ProxySpec) (p
 			"reasoning_protocol": config.ReasoningProtocolForEntry(e),
 			"chat_url":           e.ChatURL,
 			"headers":            e.Headers,
+			"extra_body":         e.ExtraBody,
 			"proxy_spec":         proxy,
 			"vision":             config.EffectiveVision(e),
 			"vision_detail":      e.VisionDetail,

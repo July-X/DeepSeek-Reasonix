@@ -208,6 +208,10 @@ export interface TabMeta {
   goal?: string;
   goalStatus?: GoalStatus;
   autoResearch?: AutoResearchCompactView;
+  recovered?: boolean;
+  recoveryReason?: string;
+  recoveryDigest?: string;
+  recoveryParentId?: string;
   startupErr?: string;
   active: boolean;
   cwd: string;
@@ -228,6 +232,10 @@ export interface ProjectNode {
   running?: boolean;
   status?: ProjectTopicStatus;
   pinned?: boolean;
+  recovered?: boolean;
+  recoveryReason?: string;
+  recoveryDigest?: string;
+  recoveryParentId?: string;
   children?: ProjectNode[];
 }
 
@@ -237,6 +245,23 @@ export interface TopicMeta {
   id: string;
   title: string;
   createdAt: number;
+}
+
+export interface SessionRecoveryEvent {
+  originalPath?: string;
+  recoveryPath: string;
+  scope?: string;
+  workspaceRoot?: string;
+  topicId?: string;
+  topicTitle?: string;
+  recoveryReason?: string;
+  recoveryDigest?: string;
+  recoveryParentId?: string;
+  existing?: boolean;
+}
+
+export interface SessionRecoveryFailedEvent {
+  reason?: "lease_held" | "lease_unavailable" | string;
 }
 
 export interface ContextPanelInfo {
@@ -683,10 +708,54 @@ export interface CapabilitiesView {
   servers: ServerView[];
   skills: SkillView[];
   skillRoots: SkillRootView[];
+  plugins: PluginView[];
 }
 export interface SkillsSettingsView {
   skills: SkillView[];
   skillRoots: SkillRootView[];
+}
+export interface PluginView {
+  name: string;
+  version?: string;
+  description?: string;
+  source?: string;
+  root: string;
+  manifestKind?: string;
+  enabled: boolean;
+  skills: number;
+  hooks: number;
+  mcpServers: number;
+  skillDetails?: PluginSkillView[];
+  hookDetails?: PluginHookView[];
+  mcpServerDetails?: PluginMCPServerView[];
+  warnings?: string[];
+  error?: string;
+}
+export interface PluginSkillView {
+  name: string;
+  description?: string;
+  path?: string;
+  invocation?: string;
+  runAs?: string;
+}
+export interface PluginHookView {
+  event: string;
+  match?: string;
+  command?: string;
+  contextFile?: string;
+  description?: string;
+}
+export interface PluginMCPServerView {
+  name: string;
+  transport?: string;
+  command?: string;
+  url?: string;
+}
+export interface PluginInstallOptions {
+  dryRun?: boolean;
+  link?: boolean;
+  replace?: boolean;
+  name?: string;
 }
 export interface MCPServerInput {
   name: string;
@@ -791,7 +860,7 @@ export interface MemoryView {
 }
 
 // SettingsTab is the top-level navigation item in the Settings Centre modal.
-export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "skills" | "memory" | "hooks" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
+export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "skills" | "plugins" | "memory" | "hooks" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
 
 // Settings panel payloads (desktop/settings_app.go).
 export interface ProviderView {
@@ -808,6 +877,7 @@ export interface ProviderView {
   default: string;
   apiKeyEnv: string;
   headers?: Record<string, string> | null; // optional extra request headers for compatible gateways
+  extraBody?: Record<string, unknown> | null; // optional extra top-level request body fields for compatible gateways
   keySet: boolean; // the env var currently resolves to a value
   requiresKey?: boolean; // false for explicit no-auth providers
   configured?: boolean; // selectable: key is set or no key is required
@@ -816,6 +886,7 @@ export interface ProviderView {
   balanceUrl: string; // optional wallet-balance endpoint; "" disables the readout
   contextWindow: number;
   reasoningProtocol: string; // auto|deepseek|openai|none; empty = auto/model registry
+  thinking: string; // provider-specific thinking override: ""|enabled|disabled|adaptive
   supportedEfforts: string[]; // custom /effort levels; empty = use built-in Kind/BaseURL default
   defaultEffort: string; // /effort level when user picks "auto" or unset; "" = supportedEfforts[0]
   modelOverrides?: ProviderModelOverrideView[] | null;
@@ -881,6 +952,7 @@ export interface AgentView {
   temperature: number;
   maxSteps: number;
   plannerMaxSteps: number;
+  maxSubagentDepth: number;
   systemPrompt: string;
   coldResumePrune: boolean;
   reasoningLanguage: string; // "auto" | "zh" | "en"
