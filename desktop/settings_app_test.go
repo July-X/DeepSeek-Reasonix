@@ -130,6 +130,43 @@ func TestProviderViewFromEntryShowsKeySource(t *testing.T) {
 	}
 }
 
+func TestSettingsExposesEffectiveSandboxWriteRoots(t *testing.T) {
+	home := isolateDesktopUserDirs(t)
+	project := robustTempDir(t)
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	cfg.Sandbox.AllowWrite = []string{
+		"${HOME}/.m2",
+		"${HOME}/.m2/repository",
+	}
+	if err := cfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	app := NewApp()
+	app.tabs = map[string]*WorkspaceTab{
+		"project": {ID: "project", Scope: "project", WorkspaceRoot: project, Ready: true},
+	}
+	app.activeTabID = "project"
+
+	got := app.Settings().Sandbox
+	if got.EffectiveWorkspaceRoot != project {
+		t.Fatalf("EffectiveWorkspaceRoot = %q, want %q", got.EffectiveWorkspaceRoot, project)
+	}
+	// Settings expose expanded configured roots; the writer confiner normalizes
+	// separators later when enforcing them.
+	want := []string{
+		project,
+		home + "/.m2",
+		home + "/.m2/repository",
+	}
+	if !reflect.DeepEqual(got.EffectiveWriteRoots, want) {
+		t.Fatalf("EffectiveWriteRoots = %v, want %v", got.EffectiveWriteRoots, want)
+	}
+	if !reflect.DeepEqual(got.AllowWrite, cfg.Sandbox.AllowWrite) {
+		t.Fatalf("AllowWrite = %v, want raw configured paths %v", got.AllowWrite, cfg.Sandbox.AllowWrite)
+	}
+}
+
 func TestProviderViewFromEntryExposesNoAuthAvailability(t *testing.T) {
 	isolateDesktopUserDirs(t)
 	t.Setenv("LOCAL_API_KEY", "")
@@ -414,6 +451,35 @@ func TestSaveProviderPersistsThinkingOverride(t *testing.T) {
 	}
 	if got.Thinking != "disabled" {
 		t.Fatalf("saved provider thinking = %q, want disabled", got.Thinking)
+	}
+}
+
+func TestSaveProviderPersistsAuthHeader(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	app := NewApp()
+	if err := app.SaveProvider(ProviderView{
+		Name:       "minimax-global-anthropic",
+		Kind:       "anthropic",
+		BaseURL:    "https://api.minimax.io/anthropic",
+		Models:     []string{"MiniMax-M3"},
+		APIKeyEnv:  "MINIMAX_API_KEY",
+		AuthHeader: true,
+	}); err != nil {
+		t.Fatalf("SaveProvider: %v", err)
+	}
+
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	got, ok := cfg.Provider("minimax-global-anthropic")
+	if !ok {
+		t.Fatal("saved provider not found")
+	}
+	if !got.AuthHeader {
+		t.Fatal("saved provider auth_header = false, want true")
+	}
+	view := providerViewFromEntry(*got, false, true)
+	if !view.AuthHeader {
+		t.Fatal("provider view authHeader = false, want true")
 	}
 }
 
@@ -763,7 +829,7 @@ func TestSetReasoningLanguageUpdatesLiveTabControllers(t *testing.T) {
 	}
 
 	userComposed := userCtrl.Compose("hi")
-	if !strings.Contains(userComposed, "Simplified Chinese") {
+	if !strings.Contains(userComposed, "简体中文") {
 		t.Fatalf("user-level tab Compose = %q, want zh reasoning language", userComposed)
 	}
 	projectComposed := projectCtrl.Compose("hi")

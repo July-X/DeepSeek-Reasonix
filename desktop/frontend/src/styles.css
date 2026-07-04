@@ -4034,6 +4034,75 @@ a[href] {
   font-size: 11px;
   line-height: 1.25;
 }
+
+/* pasted text blocks in user messages (mirroring .composer__pasted-*) */
+.msg-pasted {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0;
+}
+.msg-pasted-block {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.msg-pasted-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 5px 6px 5px 9px;
+  color: var(--fg-dim);
+  font-size: 13px;
+}
+.msg-pasted-head > svg {
+  flex-shrink: 0;
+  color: var(--fg-faint);
+}
+.msg-pasted-label {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg-pasted-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+}
+.msg-pasted-head button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg-faint);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.msg-pasted-head button:hover {
+  color: var(--fg);
+  background: var(--hover);
+}
+.msg-pasted-expanded {
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--border-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .msg--assistant {
   color: var(--fg);
   display: flex;
@@ -9230,6 +9299,8 @@ body > .mermaid-diagram--fullscreen {
   min-width: 0;
 }
 .mem-select {
+  padding-right: 30px;
+  text-overflow: ellipsis;
 }
 .mem-hint {
   margin-top: 6px;
@@ -13365,16 +13436,19 @@ body > .mermaid-diagram--fullscreen {
 }
 .provider-template-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+  grid-auto-rows: 92px;
+  align-items: stretch;
+  gap: 8px;
 }
 .provider-template-card {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 5px;
+  gap: 4px;
+  height: 100%;
   min-width: 0;
-  padding: 12px;
+  padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-elev-1);
@@ -13385,6 +13459,24 @@ body > .mermaid-diagram--fullscreen {
 .provider-template-card:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
 }
+.provider-template-card:disabled {
+  cursor: default;
+  opacity: 0.68;
+}
+.provider-template-card--added,
+.provider-template-card--installed,
+.provider-template-card--installed-modified,
+.provider-template-card--name-conflict {
+  background: color-mix(in srgb, var(--bg-elev-1) 82%, var(--bg) 18%);
+}
+.provider-template-card--installed-modified,
+.provider-template-card--name-conflict {
+  cursor: default;
+}
+.provider-template-card--similar-existing {
+  border-color: color-mix(in srgb, var(--warning, #b7791f) 34%, var(--border));
+  background: color-mix(in srgb, var(--warning-soft, #fff7ed) 24%, var(--bg-elev-1) 76%);
+}
 .provider-template-card--active {
   border-color: color-mix(in srgb, var(--accent) 58%, var(--border));
   background: var(--bg-elev-2);
@@ -13393,12 +13485,55 @@ body > .mermaid-diagram--fullscreen {
     0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .provider-template-card strong {
+  display: -webkit-box;
+  max-width: 100%;
+  overflow: hidden;
+  line-height: 1.2;
   font-size: var(--font-control);
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
 }
 .provider-template-card span {
+  display: -webkit-box;
+  max-width: 100%;
+  overflow: hidden;
   color: var(--fg-dim);
   font-size: var(--font-control-small);
-  line-height: 1.4;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.provider-template-card--installed-modified > span,
+.provider-template-card--name-conflict > span {
+  -webkit-line-clamp: 1;
+}
+.provider-template-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  margin-top: auto;
+  min-width: 0;
+}
+.provider-template-card__actions .btn {
+  height: 24px;
+  min-width: 0;
+  padding: 0 7px;
+  font-size: var(--text-2xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.provider-template-card__actions .inline-confirm {
+  display: inline-flex;
+  flex: 0 1 auto;
+  gap: 4px;
+  max-width: none;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+  -webkit-box-orient: initial;
 }
 .provider-access-card {
   display: flex;
@@ -13895,6 +14030,11 @@ body > .mermaid-diagram--fullscreen {
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+.set-rule--path {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 .set-rule__x {
   border: none;
@@ -17192,6 +17332,30 @@ body > .mermaid-diagram--fullscreen {
   pointer-events: auto;
   user-select: none;
   --wails-draggable: no-drag;
+  transition: opacity var(--dur-base) ease;
+}
+
+/* When the workspace panel is closed (no layout--workspace-open or
+   layout--workspace-maximized), make the window controls box transparent so it
+   blends into the title bar / background instead of showing a distinct box. */
+.app--windows-frameless .layout:not(.layout--workspace-open):not(.layout--workspace-maximized) ~ .windows-window-controls {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+:root[data-theme-style] .app--windows-frameless .layout:not(.layout--workspace-open):not(.layout--workspace-maximized) ~ .windows-window-controls {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+/* When a drawer/palette overlay is open, dim the window controls so they
+   visually sit behind the backdrop instead of staying highlighted on top. */
+.drawer-backdrop[data-state="open"] ~ .windows-window-controls {
+  opacity: 0.35;
+}
+:root[data-theme-style] .drawer-backdrop[data-state="open"] ~ .windows-window-controls {
+  opacity: 0.35;
 }
 
 .windows-window-control {
@@ -27661,25 +27825,34 @@ body > .mermaid-diagram--fullscreen {
 
 .app--creation .workbench-dock__tabs,
 :root[data-theme-style] .app--creation .workbench-dock__tabs {
-  width: 100%;
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  width: auto;
+  flex: 0 0 auto;
+  display: flex;
   align-items: stretch;
-  gap: 0;
+  justify-content: flex-start;
+  gap: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .app--creation .workbench-dock__tab,
 :root[data-theme-style] .app--creation .workbench-dock__tab {
-  justify-content: center;
-  width: 100%;
+  flex: 0 0 auto;
+  width: auto;
   max-width: none;
   height: 40px;
-  padding: 0 8px 1px;
+  padding: 0 12px 1px;
   gap: 6px;
+  justify-content: center;
   color: color-mix(in srgb, var(--fg-dim) 72%, transparent);
   font-size: 12px;
   font-weight: 560;
   letter-spacing: 0.01em;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .app--creation .workbench-dock__tab--active,
@@ -28053,6 +28226,18 @@ body > .mermaid-diagram--fullscreen {
   --windows-window-controls-height: 56px;
 }
 
+/* When workspace panel is open in creation mode, match the dock tools height
+   (40px) instead of the tall 56px default, so the window controls box does not
+   extend below the workbench-dock__tools. */
+.app--windows-frameless.app--creation .layout--workspace-open ~ .windows-window-controls,
+.app--windows-frameless.app--creation .layout--workspace-maximized ~ .windows-window-controls {
+  height: 40px;
+}
+:root[data-theme-style] .app--windows-frameless.app--creation .layout--workspace-open ~ .windows-window-controls,
+:root[data-theme-style] .app--windows-frameless.app--creation .layout--workspace-maximized ~ .windows-window-controls {
+  height: 40px;
+}
+
 .app--windows-frameless .app-chrome--native-tabs,
 :root[data-theme-style] .app--windows-frameless .app-chrome--native-tabs {
   --windows-frameless-titlebar-tools-offset: var(--windows-window-controls-safe);
@@ -28067,6 +28252,17 @@ body > .mermaid-diagram--fullscreen {
 .app--windows-frameless .topicbar,
 :root[data-theme-style] .app--windows-frameless .topicbar {
   padding-right: var(--windows-window-controls-safe);
+}
+
+/* When workspace panel is open the workbench-dock covers the right edge, so the
+   topicbar no longer needs the window-controls safe space — use the normal 18px
+   padding instead to prevent buttons from being pushed off-screen or overlapping
+   the dock. */
+.app--windows-frameless .layout--workspace-open .topicbar,
+.app--windows-frameless .layout--workspace-maximized .topicbar,
+:root[data-theme-style] .app--windows-frameless .layout--workspace-open .topicbar,
+:root[data-theme-style] .app--windows-frameless .layout--workspace-maximized .topicbar {
+  padding-right: 18px;
 }
 
 .app--windows-frameless .workbench-dock__tools,

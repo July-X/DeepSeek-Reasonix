@@ -225,6 +225,47 @@ func TestStreamSendsCustomHeaders(t *testing.T) {
 	}
 }
 
+func TestStreamUsesMiMoAPIKeyHeader(t *testing.T) {
+	var gotAuth, gotAPIKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("api-key")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	p, err := New(provider.Config{
+		Name:    "mimo",
+		BaseURL: "https://api.xiaomimimo.com/v1",
+		Model:   "mimo-v2.5-pro",
+		APIKey:  "mimo-key",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c := p.(*client)
+	c.chatURL = srv.URL
+
+	ch, err := p.Stream(context.Background(), provider.Request{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("stream error: %v", chunk.Err)
+		}
+	}
+	if gotAPIKey != "mimo-key" {
+		t.Fatalf("api-key = %q, want mimo-key", gotAPIKey)
+	}
+	if gotAuth != "" {
+		t.Fatalf("Authorization = %q, want omitted for MiMo", gotAuth)
+	}
+}
+
 func TestStreamSendsExtraBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -536,6 +577,39 @@ func TestBuildRequestForwardsReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestBuildRequestTemperatureSerialization(t *testing.T) {
+	c := &client{model: "m"}
+
+	omitted := c.buildRequest(provider.Request{})
+	if omitted.Temperature != nil {
+		t.Fatalf("unset request temperature = %v, want nil", omitted.Temperature)
+	}
+	b, err := json.Marshal(omitted)
+	if err != nil {
+		t.Fatalf("marshal omitted: %v", err)
+	}
+	if strings.Contains(string(b), "temperature") {
+		t.Fatalf("unset temperature must be omitted from payload: %s", b)
+	}
+
+	zero := c.buildRequest(provider.Request{Temperature: provider.TemperaturePtr(0)})
+	if zero.Temperature == nil || *zero.Temperature != 0 {
+		t.Fatalf("zero request temperature = %v, want ptr(0)", zero.Temperature)
+	}
+	b, err = json.Marshal(zero)
+	if err != nil {
+		t.Fatalf("marshal zero: %v", err)
+	}
+	if !strings.Contains(string(b), `"temperature":0`) {
+		t.Fatalf("explicit zero temperature must be serialized: %s", b)
+	}
+
+	nonzero := c.buildRequest(provider.Request{Temperature: provider.TemperaturePtr(0.25)})
+	if nonzero.Temperature == nil || *nonzero.Temperature != 0.25 {
+		t.Fatalf("nonzero request temperature = %v, want ptr(0.25)", nonzero.Temperature)
+	}
+}
+
 func TestBuildRequestDeepSeekThinking(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -555,6 +629,23 @@ func TestBuildRequestDeepSeekThinking(t *testing.T) {
 				t.Fatalf("ReasoningEffort = %q, want %q", req.ReasoningEffort, tc.wantReasoning)
 			}
 		})
+	}
+}
+
+func TestBuildRequestDeepSeekPreservesCallerTemperature(t *testing.T) {
+	c := &client{model: "deepseek-v4", deepseek: true, effort: "high"}
+
+	omitted := c.buildRequest(provider.Request{})
+	if omitted.Temperature != nil {
+		t.Fatalf("DeepSeek default temperature = %v, want omitted", omitted.Temperature)
+	}
+
+	zero := c.buildRequest(provider.Request{Temperature: provider.TemperaturePtr(0)})
+	if zero.Temperature == nil || *zero.Temperature != 0 {
+		t.Fatalf("DeepSeek explicit zero temperature = %v, want ptr(0)", zero.Temperature)
+	}
+	if zero.Thinking == nil || zero.Thinking.Type != "enabled" {
+		t.Fatalf("DeepSeek thinking = %+v, want enabled", zero.Thinking)
 	}
 }
 
@@ -785,6 +876,34 @@ func TestBuildRequestNonDeepSeekOmitsThinking(t *testing.T) {
 	}
 }
 
+func TestNewOllamaCloudReasoningEffort(t *testing.T) {
+	p, err := New(provider.Config{Name: "ollama-cloud", BaseURL: "https://ollama.com/v1", Model: "nemotron-3-nano:30b", Extra: map[string]any{"effort": "max"}})
+	if err != nil {
+		t.Fatalf("New max: %v", err)
+	}
+	c := p.(*client)
+	if got := c.buildRequest(provider.Request{}).ReasoningEffort; got != "max" {
+		t.Fatalf("Ollama Cloud reasoning_effort = %q, want max", got)
+	}
+
+	p, err = New(provider.Config{Name: "ollama-cloud", BaseURL: "https://ollama.com/v1", Model: "nemotron-3-nano:30b", Extra: map[string]any{"effort": "none"}})
+	if err != nil {
+		t.Fatalf("New none: %v", err)
+	}
+	c = p.(*client)
+	b, err := json.Marshal(c.buildRequest(provider.Request{}))
+	if err != nil {
+		t.Fatalf("marshal none: %v", err)
+	}
+	if strings.Contains(string(b), "reasoning_effort") {
+		t.Fatalf("Ollama Cloud effort none must omit reasoning_effort: %s", b)
+	}
+
+	if _, err := New(provider.Config{Name: "ollama-cloud", BaseURL: "https://ollama.com/v1", Model: "nemotron-3-nano:30b", Extra: map[string]any{"effort": "ultra"}}); err == nil {
+		t.Fatal("New invalid effort succeeded, want error")
+	}
+}
+
 func TestNewDeepSeekThinkingDefaultsAndValidation(t *testing.T) {
 	p, err := New(provider.Config{Name: "deepseek", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4"})
 	if err != nil {
@@ -928,8 +1047,8 @@ func TestBuildRequestContentNullForAssistantToolCalls(t *testing.T) {
 	if !strings.Contains(s, `"content":"all done"`) {
 		t.Errorf("text assistant turn should keep its string content: %s", s)
 	}
-	if !strings.Contains(s, `"parameters":{"type":"object"}`) {
-		t.Errorf("no-param tool should serialize a valid empty-object schema: %s", s)
+	if !strings.Contains(s, `"parameters":{"properties":{},"type":"object"}`) {
+		t.Errorf("no-param tool should serialize a strict empty-object schema: %s", s)
 	}
 }
 
@@ -958,7 +1077,7 @@ func TestBuildRequestOmitsResponseOnlyToolCallIndex(t *testing.T) {
 	}
 }
 
-func TestBuildRequestOmitsEmptyToolDescriptionAndParameters(t *testing.T) {
+func TestBuildRequestDefaultsEmptyToolParameters(t *testing.T) {
 	c := &client{name: "x", model: "m", baseURL: "https://api.example.com/v1"}
 	req := provider.Request{
 		Tools: []provider.ToolSchema{{Name: "noargs"}},
@@ -985,7 +1104,7 @@ func TestBuildRequestOmitsEmptyToolDescriptionAndParameters(t *testing.T) {
 	if _, ok := fn["description"]; ok {
 		t.Fatalf("empty description should be omitted: %s", body)
 	}
-	if _, ok := fn["parameters"]; ok {
-		t.Fatalf("nil parameters should be omitted: %s", body)
+	if got, want := string(fn["parameters"]), `{"properties":{},"type":"object"}`; got != want {
+		t.Fatalf("nil parameters should default to %s, got %s in %s", want, got, body)
 	}
 }

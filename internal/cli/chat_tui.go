@@ -2735,6 +2735,9 @@ func (m chatTUI) renderApprovalBanner() string {
 	if !control.RequiresFreshHumanApprovalTool(m.pendingApproval.Tool) {
 		choices = fmt.Sprintf(i18n.M.ToolApprovalChoices, exactSessionRule, exactPersistentRule)
 	}
+	if m.pendingApproval.Tool == agent.PlanModeReadOnlyCommandApprovalTool {
+		choices = i18n.M.PlanModeReadOnlyCommandChoices
+	}
 	if !control.RequiresFreshHumanApprovalTool(m.pendingApproval.Tool) && m.pendingApproval.Tool == "bash" && permission.BashCommandPrefix(m.pendingApproval.Subject) != "" {
 		prefixRule := permission.RememberRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject)
 		choices = fmt.Sprintf(i18n.M.BashPrefixChoices, prefixRule, prefixRule)
@@ -2750,6 +2753,9 @@ func (m chatTUI) renderApprovalBanner() string {
 // MCP tools are advertised as mcp__<server>__<tool>; showing the short tool name
 // first keeps the approval prompt readable while preserving the source.
 func approvalToolDetails(toolName string) (name, detail string) {
+	if toolName == agent.PlanModeReadOnlyCommandApprovalTool {
+		return "bash", fmt.Sprintf(i18n.M.ToolApprovalSourceFmt, i18n.M.ToolApprovalBuiltIn)
+	}
 	if server, short, ok := tool.SplitMCPName(toolName); ok {
 		lines := []string{}
 		if strings.EqualFold(short, "understand_image") {
@@ -3831,7 +3837,7 @@ func (m *chatTUI) showSandboxStatus() {
 	b.WriteString("  phase 1  OS bash sandbox\n")
 	fmt.Fprintf(&b, "    bash        %s", bash)
 	if bash == "enforce" && !available {
-		b.WriteString(" (inactive: no OS sandbox on this host — bash runs unconfined)")
+		b.WriteString(" (unavailable: no OS sandbox on this host — bash execution is refused)")
 	}
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "    network     %v\n", network)
