@@ -1045,6 +1045,20 @@ func (a *App) reportTabSnapshotError(tab *WorkspaceTab, action string, err error
 	if tab == nil || tab.sink == nil {
 		return
 	}
+	// Autosave fires once per turn; on a persistently failing disk that would
+	// stream a chat warning after every turn. Rate-limit the user-facing
+	// notice per tab (the slog line above always records every failure). Saves
+	// triggered by an explicit action are one-shot and always surface.
+	if action == "autosave" {
+		tab.saveMu.Lock()
+		now := time.Now()
+		if !tab.lastAutosaveWarnAt.IsZero() && now.Sub(tab.lastAutosaveWarnAt) < autosaveWarnInterval {
+			tab.saveMu.Unlock()
+			return
+		}
+		tab.lastAutosaveWarnAt = now
+		tab.saveMu.Unlock()
+	}
 	prefix := "Session autosave failed"
 	if strings.TrimSpace(action) != "" && action != "autosave" {
 		prefix = "Session save failed before " + action
@@ -1551,7 +1565,9 @@ func (a *App) ClearSession() error {
 		return err
 	}
 	if err := tab.ensureSessionLease(ctrl.SessionPath()); err != nil {
-		return err
+		// Wails bridge return: a raw lease error would carry the session path
+		// and holder id across to the frontend.
+		return userFacingSessionLeaseError("", err)
 	}
 	tab.resetTelemetry()
 	a.persistTabSessionPath(tab, ctrl.SessionPath())
@@ -1582,7 +1598,10 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 	snap := a.tabRuntimeSnapshot(tab)
 	oldSink := snap.sink
 	if oldSink != nil {
-		oldSink.setBinding(detachedRuntimeTabID(oldPath), nil)
+		// Rebind under the runtime key, matching the id cloneDetachedRuntimeTab
+		// derives — a raw path here would hash to a different detached id on
+		// Windows where keys are case-folded.
+		oldSink.setBinding(detachedRuntimeTabID(sessionRuntimeKey(oldPath)), nil)
 		oldSink.clearContext()
 	}
 	if oldCtrl.RuntimeStatus().Cancellable {
@@ -1647,20 +1666,35 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 	path := agent.NewSessionPath(newCtrl.SessionDir(), newCtrl.Label())
 	if err := tab.ensureSessionLease(path); err != nil {
 		newCtrl.Close()
-		return err
+		// Surfaces through ClearSession's Wails return; keep the holder's
+		// path/pid/writer id out of it.
+		return userFacingSessionLeaseError("", err)
 	}
 	newCtrl.SetSessionPath(path)
 
 	a.mu.Lock()
-	if current := a.tabs[tab.ID]; current == tab {
-		tab.Ctrl = newCtrl
-		tab.sink = newSink
-		tab.SessionPath = path
-		tab.Label = newCtrl.Label()
-		tab.Ready = true
-		tab.StartupErr = ""
-		a.saveTabsLocked()
+	if current := a.tabs[tab.ID]; current != tab {
+		a.mu.Unlock()
+		// The old session is already destroyed either way; release what this
+		// clear acquired for the replaced tab (fresh controller and its
+		// lease) so neither leaks, and still finish the old runtime teardown.
+		newCtrl.Close()
+		tab.releaseSessionLease()
+		oldCtrl.CloseAfterDestroy()
+		a.emitProjectTreeChanged()
+		return fmt.Errorf("tab %q changed while clearing the session", tab.ID)
 	}
+	tab.Ctrl = newCtrl
+	tab.sink = newSink
+	tab.SessionPath = path
+	tab.Label = newCtrl.Label()
+	tab.Ready = true
+	tab.StartupErr = ""
+	// Supersede any in-flight startup build: the session it was resuming
+	// was just destroyed, and finishing later would pass the generation
+	// check and overwrite this controller.
+	a.supersedeTabBuildLocked(tab)
+	a.saveTabsLocked()
 	a.mu.Unlock()
 	oldCtrl.CloseAfterDestroy()
 	a.emitProjectTreeChanged()
@@ -6949,9 +6983,13 @@ type sessionLeaseBusyError struct {
 }
 
 func (e *sessionLeaseBusyError) Error() string {
+	// The raw SessionLeaseError text carries the session path and the
+	// holder's host-pid-writer id; every user-facing surface must render
+	// this wrapper instead. An empty setting means the failure gated opening
+	// the session itself (startup bind), not changing a setting on it.
 	setting := strings.TrimSpace(e.setting)
 	if setting == "" {
-		setting = "this setting"
+		return "this session is already open in another Reasonix window or still running in the background; close the other window or open a copy"
 	}
 	return fmt.Sprintf("this session is already open in another Reasonix window or still running in the background; close the other window or open a copy before changing %s", setting)
 }
@@ -6971,6 +7009,25 @@ func userFacingSessionLeaseError(setting string, err error) error {
 		return &sessionLeaseBusyError{setting: setting, err: err}
 	}
 	return err
+}
+
+// sessionPathAfterSnapshot returns where a controller rebuild should keep
+// persisting after the old controller was snapshotted. Snapshotting is not
+// path-neutral: a snapshot conflict can recover by retargeting the controller
+// (and the tab's session lease, via handleTabSessionRecovered) to a recovery
+// branch, so a prevPath captured before the snapshot may be stale. Reusing the
+// stale path would bind the rebuilt controller — carrying the just-recovered
+// transcript — back to the original file, turning every later save into a new
+// conflict that derives yet another recovery branch. Falls back to fallback
+// when the controller is gone or persistence is disabled (empty SessionPath).
+func sessionPathAfterSnapshot(ctrl control.SessionAPI, fallback string) string {
+	if ctrl == nil {
+		return fallback
+	}
+	if path := strings.TrimSpace(ctrl.SessionPath()); path != "" {
+		return path
+	}
+	return fallback
 }
 
 func (a *App) ensureTabSessionLeaseForRebuild(tab *WorkspaceTab, path, setting string) error {
@@ -6994,10 +7051,16 @@ func (a *App) canReclaimCurrentProcessSessionLease(tab *WorkspaceTab, path strin
 		return false
 	}
 	var leaseErr *agent.SessionLeaseError
-	if !errors.As(err, &leaseErr) || leaseErr == nil || leaseErr.Info == nil {
+	if !errors.As(err, &leaseErr) || leaseErr == nil {
 		return false
 	}
-	if leaseErr.Info.PID != os.Getpid() || leaseErr.Info.WriterID != agent.SessionWriterID() {
+	// A readable info naming a foreign runtime is respected here; reclaim
+	// would refuse it anyway. A nil Info (lease.json deleted by the user,
+	// quarantined by AV, or torn by a crash) must still attempt the reclaim:
+	// the OS lock is the arbiter there, and refusing on missing metadata
+	// wedges a session nobody actually holds as permanently busy.
+	if leaseErr.Info != nil &&
+		(leaseErr.Info.PID != os.Getpid() || leaseErr.Info.WriterID != agent.SessionWriterID()) {
 		return false
 	}
 	a.mu.RLock()
@@ -7106,6 +7169,7 @@ func (a *App) SetModelForTab(tabID, name string) error {
 		if err := a.snapshotTabForAction(tab, "changing model"); err != nil {
 			return err
 		}
+		prevPath = sessionPathAfterSnapshot(oldCtrl, prevPath)
 		carried = oldCtrl.History()
 	}
 
@@ -7155,6 +7219,9 @@ func (a *App) SetModelForTab(tabID, name string) error {
 	tab.model = name
 	tab.effort = cloneStringPtr(effortOverride)
 	tab.Label = newCtrl.Label()
+	// Supersede any in-flight startup build: it would otherwise finish later,
+	// overwrite this controller, and release/steal the tab's session lease.
+	a.supersedeTabBuildLocked(tab)
 	a.saveTabsLocked()
 	a.mu.Unlock()
 	if oldCtrl != nil {
@@ -7261,6 +7328,7 @@ func (a *App) SetEffortForTab(tabID, level string) error {
 		if err := a.snapshotTabForAction(tab, "changing effort"); err != nil {
 			return err
 		}
+		prevPath = sessionPathAfterSnapshot(oldCtrl, prevPath)
 		carried = oldCtrl.History()
 	}
 	sharedHost := a.lookupSharedHost(snap.sharedHostKey)
@@ -7304,6 +7372,7 @@ func (a *App) SetEffortForTab(tabID, level string) error {
 	tab.Label = newCtrl.Label()
 	tab.StartupErr = ""
 	tab.Ready = true
+	a.supersedeTabBuildLocked(tab)
 	a.saveTabsLocked()
 	a.mu.Unlock()
 	if oldCtrl != nil {
@@ -7386,6 +7455,7 @@ func (a *App) SetTokenModeForTab(tabID, mode string) error {
 		if err := a.snapshotTabForAction(tab, "changing token mode"); err != nil {
 			return err
 		}
+		prevPath = sessionPathAfterSnapshot(oldCtrl, prevPath)
 		carried = oldCtrl.History()
 	}
 	sharedHost := a.lookupSharedHost(snap.sharedHostKey)
@@ -7429,6 +7499,7 @@ func (a *App) SetTokenModeForTab(tabID, mode string) error {
 	tab.Label = newCtrl.Label()
 	tab.StartupErr = ""
 	tab.Ready = true
+	a.supersedeTabBuildLocked(tab)
 	a.saveTabsLocked()
 	a.mu.Unlock()
 	if oldCtrl != nil {
