@@ -574,6 +574,16 @@ export function onFilesDropped(cb: (paths: string[]) => void): () => void {
 
 // onReady subscribes to the agent:ready event fired when boot.Build completes.
 // The frontend re-fetches Meta/Context/History when this lands.
+// onRuntimeRebuilt fires when a tab's controller is replaced in place
+// (model/effort/token-mode switch, clear-while-running). The rebuilt
+// controller restarts prompt ids, so per-tab id-keyed state must reset.
+export function onRuntimeRebuilt(cb: (tabId?: string) => void): () => void {
+  if (realApp() && typeof window !== "undefined" && window.runtime) {
+    return window.runtime.EventsOn("runtime:rebuilt", (tabId?: unknown) => cb(typeof tabId === "string" ? tabId : undefined));
+  }
+  return () => {};
+}
+
 export function onReady(cb: (tabId?: string) => void): () => void {
   if (realApp() && typeof window !== "undefined" && window.runtime) {
     return window.runtime.EventsOn("agent:ready", (tabId?: unknown) => cb(typeof tabId === "string" ? tabId : undefined));
@@ -627,6 +637,11 @@ function bridgeBreadcrumb(method: string): string {
   return "";
 }
 
+function elapsedMs(startedAt: number): number {
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  return Math.max(0, Math.round(now - startedAt));
+}
+
 export const app: AppBindings = new Proxy({} as AppBindings, {
   get(_t, prop) {
     const target = realApp() ?? getMock();
@@ -635,18 +650,26 @@ export const app: AppBindings = new Proxy({} as AppBindings, {
     return (...args: unknown[]) => {
       const method = String(prop);
       const crumb = bridgeBreadcrumb(method);
+      const startedAt = crumb ? (typeof performance !== "undefined" ? performance.now() : Date.now()) : 0;
       if (crumb) addBreadcrumb("bridge", crumb);
       try {
         const result = (v as (...a: unknown[]) => unknown).apply(target, args);
         if (result && typeof (result as Promise<unknown>).then === "function") {
-          return (result as Promise<unknown>).catch((err) => {
-            if (crumb) addBreadcrumb("bridge.error", method);
-            throw err;
-          });
+          return (result as Promise<unknown>).then(
+            (value) => {
+              if (crumb) addBreadcrumb("bridge", `${crumb} done ms=${elapsedMs(startedAt)}`);
+              return value;
+            },
+            (err) => {
+              if (crumb) addBreadcrumb("bridge.error", `${method} ms=${elapsedMs(startedAt)}`);
+              throw err;
+            },
+          );
         }
+        if (crumb) addBreadcrumb("bridge", `${crumb} done ms=${elapsedMs(startedAt)}`);
         return result;
       } catch (err) {
-        if (crumb) addBreadcrumb("bridge.error", method);
+        if (crumb) addBreadcrumb("bridge.error", `${method} ms=${elapsedMs(startedAt)}`);
         throw err;
       }
     };
@@ -820,8 +843,8 @@ const mockProviderPresetTemplates: MockProviderPresetTemplate[] = [
   mockPreset("qwen-coding-plan-cn-anthropic", "Qwen Coding Plan CN Anthropic", "Alibaba Cloud Qwen Coding Plan China Anthropic-compatible endpoint.", "QWEN_CODING_API_KEY", mockProviderTemplate({ name: "qwen-coding-plan-cn-anthropic", kind: "anthropic", baseUrl: "https://coding.dashscope.aliyuncs.com/apps/anthropic", models: mockQwenPlanModels, visionModels: mockQwenPlanVisionModels, default: "qwen3.7-plus", apiKeyEnv: "QWEN_CODING_API_KEY", thinking: "adaptive" })),
   mockPreset("qwen-coding-plan-global", "Qwen Coding Plan Global", "Alibaba Cloud Qwen Coding Plan international endpoint.", "QWEN_CODING_API_KEY", mockProviderTemplate({ name: "qwen-coding-plan-global", kind: "openai", baseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1", models: mockQwenPlanModels, visionModels: mockQwenPlanVisionModels, default: "qwen3.7-plus", apiKeyEnv: "QWEN_CODING_API_KEY" })),
   mockPreset("qwen-coding-plan-global-anthropic", "Qwen Coding Plan Global Anthropic", "Alibaba Cloud Qwen Coding Plan international Anthropic-compatible endpoint.", "QWEN_CODING_API_KEY", mockProviderTemplate({ name: "qwen-coding-plan-global-anthropic", kind: "anthropic", baseUrl: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic", models: mockQwenPlanModels, visionModels: mockQwenPlanVisionModels, default: "qwen3.7-plus", apiKeyEnv: "QWEN_CODING_API_KEY", thinking: "adaptive" })),
-  mockPreset("stepfun", "StepFun", "StepFun coding-plan OpenAI-compatible endpoint.", "STEPFUN_API_KEY", mockProviderTemplate({ name: "stepfun", kind: "openai", baseUrl: "https://api.stepfun.ai/step_plan/v1", models: mockStepFunModels, default: "step-3.7-flash", apiKeyEnv: "STEPFUN_API_KEY", supportedEfforts: ["low", "medium", "high"], defaultEffort: "medium" })),
-  mockPreset("stepfun-anthropic", "StepFun Anthropic", "StepFun coding-plan Anthropic-compatible endpoint.", "STEPFUN_API_KEY", mockProviderTemplate({ name: "stepfun-anthropic", kind: "anthropic", baseUrl: "https://api.stepfun.ai/step_plan", models: mockStepFunModels, default: "step-3.7-flash", apiKeyEnv: "STEPFUN_API_KEY", thinking: "adaptive", supportedEfforts: ["low", "medium", "high"], defaultEffort: "medium" })),
+  mockPreset("stepfun", "StepFun", "StepFun coding-plan OpenAI-compatible endpoint.", "STEPFUN_API_KEY", mockProviderTemplate({ name: "stepfun", kind: "openai", baseUrl: "https://api.stepfun.com/step_plan/v1", models: mockStepFunModels, default: "step-3.7-flash", apiKeyEnv: "STEPFUN_API_KEY", supportedEfforts: ["low", "medium", "high"], defaultEffort: "medium" })),
+  mockPreset("stepfun-anthropic", "StepFun Anthropic", "StepFun coding-plan Anthropic-compatible endpoint.", "STEPFUN_API_KEY", mockProviderTemplate({ name: "stepfun-anthropic", kind: "anthropic", baseUrl: "https://api.stepfun.com/step_plan", models: mockStepFunModels, default: "step-3.7-flash", apiKeyEnv: "STEPFUN_API_KEY", thinking: "adaptive", supportedEfforts: ["low", "medium", "high"], defaultEffort: "medium" })),
   mockPreset("novita", "NovitaAI", "NovitaAI OpenAI-compatible multi-model gateway.", "NOVITA_API_KEY", mockProviderTemplate({ name: "novita", kind: "openai", baseUrl: "https://api.novita.ai/openai/v1", models: mockNovitaModels, default: "zai-org/glm-5.2", apiKeyEnv: "NOVITA_API_KEY" })),
   mockPreset("gmi", "GMI Cloud", "GMI Cloud direct multi-model OpenAI-compatible gateway.", "GMI_API_KEY", mockProviderTemplate({ name: "gmi", kind: "openai", baseUrl: "https://api.gmi-serving.com/v1", models: mockGMIModels, default: "zai-org/GLM-5.2-FP8", apiKeyEnv: "GMI_API_KEY", headers: { "User-Agent": "Reasonix" } })),
   mockPreset("vercel-ai-gateway", "Vercel AI Gateway", "Vercel AI Gateway via Anthropic-compatible Messages API.", "AI_GATEWAY_API_KEY", mockProviderTemplate({ name: "vercel-ai-gateway", kind: "anthropic", baseUrl: "https://ai-gateway.vercel.sh", models: mockVercelModels, visionModels: ["anthropic/claude-sonnet-4.6", "anthropic/claude-opus-4.8", "openai/gpt-5.4", "openai/gpt-5.4-pro", "moonshotai/kimi-k2.7-code"], default: "anthropic/claude-sonnet-4.6", apiKeyEnv: "AI_GATEWAY_API_KEY", authHeader: true, contextWindow: 1000000 })),

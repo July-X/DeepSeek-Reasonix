@@ -188,6 +188,11 @@ type Controller struct {
 	autosaveWG  sync.WaitGroup
 	planMode    bool
 	sessionPath string
+	// recoveryDepthCapNotices records session paths that already surfaced the
+	// depth-cap recovery warning. Repeated saves on the same conflict copy are
+	// diagnostic noise for the UI; keep logging/diagnostics, but emit the user
+	// notice once per controller/session path.
+	recoveryDepthCapNotices map[string]bool
 	// snapshotMu serializes the whole save/recovery handoff for this controller.
 	// Agent-level path locks protect individual files, but recovery also moves
 	// controller-owned state (sessionPath, guardianPath, checkpoints, rewrite
@@ -199,10 +204,6 @@ type Controller struct {
 	// Not reentrant — never call snapshot (or anything that snapshots, such as
 	// recoverInterruptedTurn or maybeColdResumePrune) while holding it.
 	snapshotMu sync.Mutex
-	// savedRewriteVersion is the session rewrite generation that has been
-	// durably persisted for sessionPath. Auto-compaction rewrites history inside
-	// a normal turn; the next autosave must use SaveRewrite, not SaveSnapshot.
-	savedRewriteVersion int
 	// turn counts model turns this session, passed to hooks in their payload.
 	turn int
 
@@ -460,7 +461,6 @@ func New(opts Options) *Controller {
 	cmdsInit := opts.Commands
 	c.commands.Store(&cmdsInit)
 	if c.executor != nil {
-		c.savedRewriteVersion = c.executor.Session().RewriteVersion()
 		c.executor.SetPreEditHook(func(ch diff.Change) {
 			c.checkpoints.snapshot(ch)
 		})
@@ -2119,13 +2119,18 @@ func (c *Controller) NewSession() error {
 	}
 	c.setActiveJobSession(c.SessionPath())
 	c.executor.SetSession(agent.NewSession(c.systemPrompt))
-	c.markSessionRewritePersisted(c.executor.Session())
 	if c.guardianSess != nil {
 		c.guardianSess.Reset()
 	}
 	c.ResetPlannerSession()
 	c.rebindCheckpoints(c.SessionPath())
 	c.snapshotMu.Unlock()
+	// A new session starts with no active goal: without this, a running goal's
+	// text kept injecting into the fresh session's first turns. The old
+	// session's goal-state sidecar was persisted before the rotation and stays
+	// intact, so resuming it restores its goal; the cleared state below lands
+	// on the NEW path (rebindCheckpoints just moved it).
+	c.ClearGoal()
 	c.mu.Lock()
 	c.startedOnce = true // NewSession fires SessionStart itself; don't re-fire on the next turn
 	c.mu.Unlock()
@@ -2180,13 +2185,14 @@ func (c *Controller) ClearSession() error {
 	}
 	c.setActiveJobSession(c.SessionPath())
 	c.executor.SetSession(agent.NewSession(c.systemPrompt))
-	c.markSessionRewritePersisted(c.executor.Session())
 	if c.guardianSess != nil {
 		c.guardianSess.Reset()
 	}
 	c.ResetPlannerSession()
 	c.rebindCheckpoints(c.SessionPath())
 	c.snapshotMu.Unlock()
+	// Same contract as NewSession: the fresh session starts with no active goal.
+	c.ClearGoal()
 	c.mu.Lock()
 	c.startedOnce = true
 	c.mu.Unlock()
@@ -2421,7 +2427,6 @@ func (c *Controller) forkNamed(turn int, name string, switchToFork bool) (string
 		// See snapshotMu: the swap must not interleave with an in-flight save.
 		c.snapshotMu.Lock()
 		c.executor.SetSession(sess)
-		c.markSessionRewritePersisted(sess)
 		c.ResetPlannerSession()
 		c.mu.Lock()
 		c.sessionPath = newPath
@@ -2501,7 +2506,6 @@ func (c *Controller) Branch(name string) (string, error) {
 	// See snapshotMu: the swap must not interleave with an in-flight save.
 	c.snapshotMu.Lock()
 	c.executor.SetSession(sess)
-	c.markSessionRewritePersisted(sess)
 	c.ResetPlannerSession()
 	c.mu.Lock()
 	c.sessionPath = newPath
@@ -2562,7 +2566,6 @@ func (c *Controller) SwitchBranch(ref string) (agent.BranchInfo, error) {
 	c.snapshotMu.Lock()
 	if c.executor != nil {
 		c.executor.SetSession(loaded)
-		c.markSessionRewritePersisted(loaded)
 	}
 	c.ResetPlannerSession()
 	c.mu.Lock()
@@ -2682,7 +2685,6 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 	c.snapshotMu.Lock()
 	if c.executor != nil {
 		c.executor.SetSession(s)
-		c.markSessionRewritePersisted(s)
 	}
 	c.ResetPlannerSession()
 	c.mu.Lock()
@@ -2786,60 +2788,6 @@ func (c *Controller) SnapshotRewrite() error {
 	return c.snapshot(false, true)
 }
 
-// snapshotRewriteDecision reports whether the next save must be an owned
-// rewrite, and returns the rewrite version the decision was based on. After a
-// successful save the caller records that same captured version via
-// markSessionRewriteVersionPersisted: re-reading RewriteVersion() after the
-// write would let a compaction that landed mid-save be recorded as persisted
-// when it never reached disk, turning the next autosave into a spurious
-// snapshot conflict and a recovery branch.
-func (c *Controller) snapshotRewriteDecision(s *agent.Session, forceRewrite bool) (bool, int) {
-	if s == nil {
-		return forceRewrite, 0
-	}
-	rewriteVersion := s.RewriteVersion()
-	if forceRewrite {
-		return true, rewriteVersion
-	}
-	c.mu.Lock()
-	saved := c.savedRewriteVersion
-	c.mu.Unlock()
-	return rewriteVersion > saved, rewriteVersion
-}
-
-// markSessionRewritePersisted resets the persisted-rewrite baseline to s's
-// current rewrite version. Only session-swap paths (new/clear/fork/branch/
-// switch/resume/adopt) may use it: they install a session whose in-memory
-// history is exactly what disk holds, so its current version is persisted by
-// construction. Save paths must record their captured decision version via
-// markSessionRewriteVersionPersisted instead.
-func (c *Controller) markSessionRewritePersisted(s *agent.Session) {
-	if s == nil {
-		return
-	}
-	rewriteVersion := s.RewriteVersion()
-	c.mu.Lock()
-	c.savedRewriteVersion = rewriteVersion
-	c.mu.Unlock()
-}
-
-// markSessionRewriteVersionPersisted records version as durably saved for s.
-// It never lowers the baseline (a concurrent save may have persisted a newer
-// rewrite already), and it leaves the counter alone when s is no longer the
-// executor's session: the swap that raced this save owns the baseline now,
-// and an old session's version leaking onto a fresh session could exceed that
-// session's own rewrite version, making its next compaction look persisted.
-func (c *Controller) markSessionRewriteVersionPersisted(s *agent.Session, version int) {
-	if s == nil || c.executor == nil || c.executor.Session() != s {
-		return
-	}
-	c.mu.Lock()
-	if version > c.savedRewriteVersion {
-		c.savedRewriteVersion = version
-	}
-	c.mu.Unlock()
-}
-
 // midTurnSnapshotInterval is atomic (nanoseconds) so a test shrinking it
 // cannot race a previous test's still-parking autosave goroutine.
 var midTurnSnapshotInterval atomic.Int64
@@ -2902,7 +2850,7 @@ func (c *Controller) snapshot(markActivity, forceRewrite bool) error {
 			"label", c.Label(), "session_dir", c.SessionDir())
 		return errNoSessionPath
 	}
-	forceRewrite, rewriteVersion := c.snapshotRewriteDecision(s, forceRewrite)
+	forceRewrite = forceRewrite || s.NeedsRewriteSave()
 	var err error
 	if forceRewrite {
 		err = s.SaveRewrite(path)
@@ -2910,31 +2858,30 @@ func (c *Controller) snapshot(markActivity, forceRewrite bool) error {
 		err = s.SaveSnapshot(path)
 		if errors.Is(err, agent.ErrSessionSnapshotConflict) {
 			// The no-rewrite decision may already be stale: auto-compaction
-			// can rewrite history between the decision and the write. Re-decide
+			// can rewrite history between the decision and the write. Re-check
 			// and retry once as an owned rewrite before treating the failure as
 			// a real cross-runtime conflict.
-			if retry, retryVersion := c.snapshotRewriteDecision(s, false); retry {
-				forceRewrite, rewriteVersion = true, retryVersion
+			if s.NeedsRewriteSave() {
+				forceRewrite = true
 				err = s.SaveRewrite(path)
 			}
 		}
 	}
-	adoptedDiskSession := false
 	if err != nil {
 		if !errors.Is(err, agent.ErrSessionSnapshotConflict) {
 			return err
 		}
-		recoveredPath, recovered, recoverErr := c.recoverSnapshotConflict(path, err, forceRewrite)
+		recoveredPath, outcome, recoverErr := c.recoverSnapshotConflict(path, err, forceRewrite)
 		if recoverErr != nil {
 			return recoverErr
 		}
-		if !recovered {
+		if outcome == conflictDropped {
 			return nil
 		}
-		// Adoption swaps in a freshly loaded session whose rewrite baseline
-		// adoptDiskSession already set; the version captured above belongs to
-		// the replaced session and must not be re-applied to the new one.
-		adoptedDiskSession = recoveredPath == path
+		// Whatever recovery did — adopted the disk transcript, force-saved
+		// the depth-capped branch, or forked — the rewrite baseline lives on
+		// the session object and was advanced by the save that succeeded, so
+		// there is nothing to re-anchor here.
 		path = recoveredPath
 		s = c.executor.Session()
 	}
@@ -2956,9 +2903,6 @@ func (c *Controller) snapshot(markActivity, forceRewrite bool) error {
 	preview, turns := agent.SessionPreviewFromMessages(s.Snapshot())
 	if err := agent.UpdateSessionMeta(path, modelRef, preview, turns, markActivity); err != nil {
 		return err
-	}
-	if !adoptedDiskSession {
-		c.markSessionRewriteVersionPersisted(s, rewriteVersion)
 	}
 	return nil
 }
@@ -2982,9 +2926,101 @@ func snapshotConflictLogAttrs(saveErr error, path, mode string) []any {
 	return attrs
 }
 
-func (c *Controller) recoverSnapshotConflict(path string, saveErr error, forceRewrite bool) (string, bool, error) {
+type snapshotConflictDiagnostic struct {
+	At               time.Time `json:"at"`
+	BranchID         string    `json:"branch_id"`
+	Mode             string    `json:"mode"`
+	Outcome          string    `json:"outcome"`
+	Kind             string    `json:"kind,omitempty"`
+	DiskMessages     int       `json:"disk_messages,omitempty"`
+	SnapshotMessages int       `json:"snapshot_messages,omitempty"`
+	BaseRevision     int64     `json:"base_revision,omitempty"`
+	DiskRevision     int64     `json:"disk_revision,omitempty"`
+	RecoveryBranchID string    `json:"recovery_branch_id,omitempty"`
+	ExistingRecovery bool      `json:"existing_recovery,omitempty"`
+}
+
+func appendSnapshotConflictDiagnostic(path, mode, outcome string, saveErr error, recoveryPath string, existing bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	rec := snapshotConflictDiagnostic{
+		At:       time.Now(),
+		BranchID: agent.BranchID(path),
+		Mode:     mode,
+		Outcome:  outcome,
+	}
+	var conflict *agent.SessionSnapshotConflictError
+	if errors.As(saveErr, &conflict) && conflict != nil {
+		rec.Kind = string(conflict.Kind)
+		rec.DiskMessages = conflict.ExistingMessages
+		rec.SnapshotMessages = conflict.SnapshotMessages
+		rec.BaseRevision = conflict.BaseRevision
+		rec.DiskRevision = conflict.DiskRevision
+	}
+	if recoveryPath != "" {
+		rec.RecoveryBranchID = agent.BranchID(recoveryPath)
+		rec.ExistingRecovery = existing
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	logPath := store.SessionConflictLog(path)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(data, '\n'))
+}
+
+// conflictOutcome is recoverSnapshotConflict's declared result. Callers act
+// on it directly instead of re-deriving what happened from path or session
+// pointer comparisons — the misclassification that broke the depth-cap
+// rewrite baseline (#6120) hid in exactly that inference.
+type conflictOutcome int
+
+const (
+	// conflictDropped: nothing was recovered and the disk transcript could
+	// not be adopted; this snapshot was deliberately dropped.
+	conflictDropped conflictOutcome = iota
+	// conflictAdoptedDisk: the executor session object was replaced by the
+	// newer disk transcript; adoptDiskSession already reset its baselines.
+	conflictAdoptedDisk
+	// conflictForceSavedBranch: recovery depth was exhausted and the same
+	// in-memory session was force-saved onto the same branch; that save
+	// advanced the session-owned rewrite baseline like any other full save.
+	conflictForceSavedBranch
+	// conflictForkedBranch: the same in-memory session moved to a freshly
+	// forked recovery branch path.
+	conflictForkedBranch
+)
+
+const recoveryDepthCapNoticeText = "repeated save conflicts were detected; saved the current conflict copy in place"
+
+func (c *Controller) emitRecoveryDepthCapNotice(path string) {
+	key := filepath.Clean(strings.TrimSpace(path))
+	c.mu.Lock()
+	if c.recoveryDepthCapNotices == nil {
+		c.recoveryDepthCapNotices = make(map[string]bool)
+	}
+	if c.recoveryDepthCapNotices[key] {
+		c.mu.Unlock()
+		return
+	}
+	c.recoveryDepthCapNotices[key] = true
+	c.mu.Unlock()
+	c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: recoveryDepthCapNoticeText})
+}
+
+func (c *Controller) recoverSnapshotConflict(path string, saveErr error, forceRewrite bool) (string, conflictOutcome, error) {
 	if c.executor == nil || strings.TrimSpace(path) == "" {
-		return "", false, saveErr
+		return "", conflictDropped, saveErr
 	}
 	mode := "snapshot"
 	if forceRewrite {
@@ -2993,10 +3029,11 @@ func (c *Controller) recoverSnapshotConflict(path string, saveErr error, forceRe
 	logAttrs := snapshotConflictLogAttrs(saveErr, path, mode)
 	if kind, ok := agent.SnapshotConflictKind(saveErr); ok && kind == agent.SessionSnapshotConflictStalePrefix {
 		if c.adoptDiskSession(path) {
+			appendSnapshotConflictDiagnostic(path, mode, "adopted_newer_disk_transcript", saveErr, "", false)
 			slog.Warn("controller: snapshot conflict; adopted newer disk transcript", logAttrs...)
 			c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
 				Text: "session changed on disk; adopted the newer transcript"})
-			return path, true, nil
+			return path, conflictAdoptedDisk, nil
 		}
 	}
 	reason := "snapshot conflict"
@@ -3022,27 +3059,29 @@ func (c *Controller) recoverSnapshotConflict(path string, saveErr error, forceRe
 			// transcript back onto the current branch keeps the data and
 			// stops the chain.
 			if forceErr := c.executor.Session().Save(path); forceErr != nil {
-				return "", false, fmt.Errorf("recovery chain depth exceeded; force save failed: %w", forceErr)
+				return "", conflictDropped, fmt.Errorf("recovery chain depth exceeded; force save failed: %w", forceErr)
 			}
+			appendSnapshotConflictDiagnostic(path, mode, "recovery_depth_cap_force_saved", saveErr, path, false)
 			slog.Warn("controller: snapshot conflict; recovery depth cap reached, force-saved onto current branch", logAttrs...)
-			c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
-				Text: "session conflicts kept recurring; kept the transcript on the current recovery branch"})
-			return path, true, nil
+			c.emitRecoveryDepthCapNotice(path)
+			return path, conflictForceSavedBranch, nil
 		}
 		if errors.Is(err, agent.ErrSessionRecoveryNotNeeded) {
 			if c.adoptDiskSession(path) {
+				appendSnapshotConflictDiagnostic(path, mode, "recovery_not_needed_adopted_disk_transcript", saveErr, "", false)
 				slog.Warn("controller: snapshot conflict; recovery not needed, adopted disk transcript", logAttrs...)
 				c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
 					Text: "session changed on disk; adopted the newer transcript (local changes already covered)"})
-				return path, true, nil
+				return path, conflictAdoptedDisk, nil
 			}
 			// Nothing was recovered AND the disk transcript could not be
 			// adopted: the snapshot is silently dropped. Leave a trace so
 			// "my last turns vanished" reports can be tied to this path.
+			appendSnapshotConflictDiagnostic(path, mode, "recovery_not_needed_adopt_failed", saveErr, "", false)
 			slog.Warn("controller: snapshot conflict; recovery not needed but disk transcript could not be adopted", logAttrs...)
-			return "", false, nil
+			return "", conflictDropped, nil
 		}
-		return "", false, fmt.Errorf("recover stale session snapshot: %w", err)
+		return "", conflictDropped, fmt.Errorf("recover stale session snapshot: %w", err)
 	}
 	recoveryInfo := SessionRecoveryInfo{
 		OriginalPath: path,
@@ -3053,7 +3092,7 @@ func (c *Controller) recoverSnapshotConflict(path string, saveErr error, forceRe
 	}
 	if c.onSessionRecovered != nil {
 		if err := c.onSessionRecovered(recoveryInfo); err != nil {
-			return "", false, fmt.Errorf("commit recovered session: %w", err)
+			return "", conflictDropped, fmt.Errorf("commit recovered session: %w", err)
 		}
 	}
 	c.mu.Lock()
@@ -3063,11 +3102,12 @@ func (c *Controller) recoverSnapshotConflict(path string, saveErr error, forceRe
 	c.setActiveJobSession(info.Path)
 	c.rebindCheckpoints(info.Path)
 	c.transplantInFlightTurnMarker(path, info.Path)
+	appendSnapshotConflictDiagnostic(path, mode, "forked_recovery_branch", saveErr, info.Path, info.Existing)
 	slog.Warn("controller: snapshot conflict; forked recovery branch",
 		append(logAttrs, "recovery", info.Path, "existing", info.Existing)...)
 	c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
-		Text: fmt.Sprintf("session changed on disk; unsaved local transcript was saved as recovery branch %s", agent.BranchID(info.Path))})
-	return info.Path, true, nil
+		Text: "session changed on disk; unsaved local transcript was saved as a conflict copy"})
+	return info.Path, conflictForkedBranch, nil
 }
 
 func (c *Controller) adoptDiskSession(path string) bool {
@@ -3076,7 +3116,6 @@ func (c *Controller) adoptDiskSession(path string) bool {
 		return false
 	}
 	c.executor.SetSession(loaded)
-	c.markSessionRewritePersisted(loaded)
 	c.ResetPlannerSession()
 	c.rebindCheckpoints(path)
 	c.setActiveJobSession(path)
@@ -3273,8 +3312,10 @@ func (c *Controller) replaceSessionAfterCancel(msgs []provider.Message) {
 	if path != "" {
 		if err := c.executor.Session().SaveRewrite(path); err != nil {
 			if errors.Is(err, agent.ErrSessionSnapshotConflict) {
-				if _, _, recoverErr := c.recoverSnapshotConflict(path, err, true); recoverErr != nil {
+				if _, outcome, recoverErr := c.recoverSnapshotConflict(path, err, true); recoverErr != nil {
 					slog.Warn("controller: post-cancel transcript recovery", "err", recoverErr)
+				} else if outcome == conflictDropped {
+					slog.Warn("controller: post-cancel transcript dropped after conflict", "path", path)
 				}
 			} else {
 				slog.Warn("controller: post-cancel transcript flush", "err", err)
