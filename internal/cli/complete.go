@@ -101,14 +101,17 @@ func (m *chatTUI) slashItems() []compItem {
 		{label: "/export", insert: "/export", hint: i18n.M.CmdExport},
 	}
 	for _, c := range m.commands {
-		items = append(items, compItem{label: "/" + c.Name, insert: "/" + c.Name + " ", hint: c.Description})
+		if c.Hidden {
+			continue
+		}
+		items = append(items, compItem{label: "/" + c.Name, insert: "/" + c.Name + " ", hint: customCommandHint(c)})
 	}
 	for _, s := range m.skills {
 		hint := s.Description
 		if s.RunAs == skill.RunSubagent {
 			hint = "🧬 " + hint
 		}
-		items = append(items, compItem{label: "/" + s.Name, insert: "/" + s.Name + " ", hint: hint})
+		items = append(items, compItem{label: "/" + s.SlashName(), insert: "/" + s.SlashName() + " ", hint: skillCommandHint(s, hint)})
 	}
 	for _, p := range m.prompts() {
 		items = append(items, compItem{label: "/" + p.Name, insert: "/" + p.Name + " ", hint: p.Description})

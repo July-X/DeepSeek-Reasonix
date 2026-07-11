@@ -3404,35 +3404,51 @@ func TestRunGuardedPanicEmitsTurnDone(t *testing.T) {
 	}
 }
 
-func TestRunGuardedRejectsReplacementUntilTurnDoneReturns(t *testing.T) {
-	turnDoneEntered := make(chan struct{})
+// TestRunGuardedParksReplacementUntilTurnDoneReturns pins the finishing-window
+// admission contract from both sides: a replacement turn arriving while
+// TurnDone is being delivered must NOT start inside the window (the original
+// transport-crosstalk guarantee this window exists for), and it must START —
+// exactly once — when the window closes. The second half replaces the old
+// silent-drop behavior, which lost real input: every caller that submits upon
+// seeing turn_done (a frontend's queued auto-send, a bot, a fast Enter) raced
+// this window, observed as a CI-flaky lost turn and worked around in
+// Composer.tsx by gating auto-send on submitDisabled instead of turn_done.
+func TestRunGuardedParksReplacementUntilTurnDoneReturns(t *testing.T) {
+	firstTurnDone := make(chan struct{})
 	releaseTurnDone := make(chan struct{})
 	firstBodyDone := make(chan struct{})
-	secondBodyRan := make(chan struct{}, 1)
+	secondBodyRan := make(chan struct{}, 2)
+	var turnDones int32
 	c := New(Options{Sink: event.FuncSink(func(e event.Event) {
 		if e.Kind == event.TurnDone {
-			close(turnDoneEntered)
-			<-releaseTurnDone
+			if atomic.AddInt32(&turnDones, 1) == 1 {
+				close(firstTurnDone)
+				<-releaseTurnDone
+			}
 		}
 	})})
 
-	c.runGuarded(func(context.Context) error {
+	if got := c.runGuarded(func(context.Context) error {
 		close(firstBodyDone)
 		return nil
-	})
+	}); got != turnStarted {
+		t.Fatalf("first admission = %v, want turnStarted", got)
+	}
 	<-firstBodyDone
 	select {
-	case <-turnDoneEntered:
+	case <-firstTurnDone:
 	case <-time.After(time.Second):
 		t.Fatal("TurnDone delivery did not start")
 	}
 	if !c.RuntimeStatus().Running {
 		t.Fatal("controller reported idle while TurnDone was still being delivered")
 	}
-	c.runGuarded(func(context.Context) error {
+	if got := c.runGuarded(func(context.Context) error {
 		secondBodyRan <- struct{}{}
 		return nil
-	})
+	}); got != turnParked {
+		t.Fatalf("finishing-window admission = %v, want turnParked", got)
+	}
 	select {
 	case <-secondBodyRan:
 		t.Fatal("replacement turn started before TurnDone delivery completed")
@@ -3440,12 +3456,25 @@ func TestRunGuardedRejectsReplacementUntilTurnDoneReturns(t *testing.T) {
 	}
 
 	close(releaseTurnDone)
-	deadline := time.Now().Add(time.Second)
-	for c.RuntimeStatus().Running && time.Now().Before(deadline) {
+	select {
+	case <-secondBodyRan:
+	case <-time.After(30 * time.Second):
+		t.Fatal("parked turn was never started after the finishing window closed")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for c.Running() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if c.RuntimeStatus().Running {
-		t.Fatal("controller remained busy after TurnDone returned")
+	if c.Running() {
+		t.Fatal("controller remained busy after the parked turn completed")
+	}
+	if got := atomic.LoadInt32(&turnDones); got != 2 {
+		t.Fatalf("TurnDone emitted %d times, want 2 (one per turn)", got)
+	}
+	select {
+	case <-secondBodyRan:
+		t.Fatal("parked turn ran more than once")
+	default:
 	}
 }
 
@@ -4025,6 +4054,63 @@ func TestReloadCommandsSameNameAcrossDirs(t *testing.T) {
 	}
 	if !strings.Contains(sent, "Hello from Reasonix") {
 		t.Errorf("expected .reasonix version to win, got render: %q", sent)
+	}
+}
+
+func TestReloadCommandsUsesCanonicalPluginNameAlongsideProjectShortName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+	reasonixHome := filepath.Join(home, ".reasonix")
+	t.Setenv("REASONIX_HOME", reasonixHome)
+
+	pluginRoot := filepath.Join(reasonixHome, "plugins", "pwf")
+	if err := os.MkdirAll(filepath.Join(pluginRoot, ".claude-plugin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginRoot, pluginpkg.ClaudeManifest), []byte(`{"name":"pwf"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeCmdFile(t, filepath.Join(pluginRoot, "commands"), "plan", "Plugin plan", "PLUGIN $1")
+	writeCmdFile(t, filepath.Join(pluginRoot, "commands"), "status", "Plugin status", "STATUS $1")
+	if err := pluginpkg.Upsert(reasonixHome, pluginpkg.InstalledPlugin{Name: "pwf", Root: "plugins/pwf", ManifestKind: "claude", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	workspace := t.TempDir()
+	writeCmdFile(t, filepath.Join(workspace, ".reasonix", "commands"), "plan", "Project plan", "PROJECT $1")
+	c := New(Options{Sink: &typedNilControllerSink{}, Registry: tool.NewRegistry(), WorkspaceRoot: workspace})
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("ReloadCommands: %v", err)
+	}
+
+	if got, ok := c.CustomCommand("/plan task"); !ok || got != "PROJECT task" {
+		t.Fatalf("short command = %q, %v; want project winner", got, ok)
+	}
+	if got, ok := c.CustomCommand("/pwf:plan task"); !ok || got != "PLUGIN task" {
+		t.Fatalf("qualified plugin command = %q, %v", got, ok)
+	}
+	if got, ok := c.CustomCommand("/status now"); !ok || got != "STATUS now" {
+		t.Fatalf("hidden compatible short command = %q, %v", got, ok)
+	}
+	if got, ok := c.CustomCommand("/pwf:status now"); !ok || got != "STATUS now" {
+		t.Fatalf("canonical plugin status command = %q, %v", got, ok)
+	}
+	cmds := c.Commands()
+	canonicalFound := false
+	hiddenFound := false
+	for _, cmd := range cmds {
+		if cmd.Name == "pwf:plan" && cmd.Plugin == "pwf" && cmd.ShortName == "plan" && !cmd.Hidden {
+			canonicalFound = true
+		}
+		if cmd.Name == "status" && cmd.Plugin == "pwf" && cmd.ShortName == "status" && cmd.Hidden {
+			hiddenFound = true
+		}
+	}
+	if !canonicalFound || !hiddenFound {
+		t.Fatalf("plugin command metadata missing: %+v", cmds)
 	}
 }
 

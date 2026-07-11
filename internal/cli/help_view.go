@@ -91,9 +91,23 @@ func builtinHelpItems() []compItem {
 func customHelpItems(commands []command.Command) []compItem {
 	items := make([]compItem, 0, len(commands))
 	for _, c := range commands {
-		items = append(items, compItem{label: "/" + c.Name, hint: c.Description})
+		if c.Hidden {
+			continue
+		}
+		items = append(items, compItem{label: "/" + c.Name, hint: customCommandHint(c)})
 	}
 	return items
+}
+
+func customCommandHint(c command.Command) string {
+	if c.Plugin == "" {
+		return c.Description
+	}
+	source := "plugin " + c.Plugin
+	if c.Description == "" {
+		return source
+	}
+	return source + " · " + c.Description
 }
 
 func skillHelpItems(skills []skill.Skill) []compItem {
@@ -103,9 +117,20 @@ func skillHelpItems(skills []skill.Skill) []compItem {
 		if s.RunAs == skill.RunSubagent {
 			hint = "subagent · " + hint
 		}
-		items = append(items, compItem{label: "/" + s.Name, hint: hint})
+		items = append(items, compItem{label: "/" + s.SlashName(), hint: skillCommandHint(s, hint)})
 	}
 	return items
+}
+
+func skillCommandHint(s skill.Skill, hint string) string {
+	if s.Plugin == "" {
+		return hint
+	}
+	source := "plugin " + s.Plugin
+	if hint == "" {
+		return source
+	}
+	return source + " · " + hint
 }
 
 func promptHelpItems(prompts []plugin.Prompt) []compItem {

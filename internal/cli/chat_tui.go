@@ -540,7 +540,7 @@ func newChatTUI(ctrl control.SessionAPI, missing string, eventCh chan event.Even
 		history:              ctrl.History(),
 		host:                 ctrl.Host(),
 		commands:             ctrl.Commands(),
-		skills:               ctrl.Skills(),
+		skills:               ctrl.SlashSkills(),
 		viewport:             viewport.New(viewport.WithWidth(termW)),
 		statusLineCount:      2,
 	}
@@ -3899,12 +3899,11 @@ func (m *chatTUI) echoLocalCommand(input string) {
 
 // commandNames renders the custom command list for /help, "" when there are none.
 func (m *chatTUI) commandNames() string {
-	if len(m.commands) == 0 {
-		return ""
-	}
-	names := make([]string, len(m.commands))
-	for i, c := range m.commands {
-		names[i] = "/" + c.Name
+	names := make([]string, 0, len(m.commands))
+	for _, c := range m.commands {
+		if !c.Hidden {
+			names = append(names, "/"+c.Name)
+		}
 	}
 	return strings.Join(names, " · ")
 }
