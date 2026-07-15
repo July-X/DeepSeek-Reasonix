@@ -12,6 +12,7 @@
 ## 目录
 
 - [配置](#配置)
+- [CLI 命令参考](./CLI.zh-CN.md)
 - [环境变量](#环境变量)
 - [Serve Web 前端](#serve-web-前端)
 - [配置路径](./CONFIG_PATHS.zh-CN.md)
@@ -189,6 +190,22 @@ Goal、由 `todo_write` 工具驱动的实时 Todo 面板，以及已配置 prov
 `--model`、`--max-steps` 或 `--resume`；不传 `--model` 时，`serve` 使用用户全局
 `default_model`。
 
+## 通过 ACP 接入编辑器
+
+`reasonix acp` 向 ACP 编辑器客户端公开三条彼此独立的会话轴：
+
+- `modes`：`normal`、`plan`、`goal`。选择 Goal 后，下一条用户输入会成为活动目标，
+  并启动 Reasonix 现有的 Goal 持续推进循环。
+- `work_mode`：`economy`、`balanced`、`delivery`。切换时会原子重建 Controller，
+  同时保留历史、协作方式和工具权限。`reasonix acp --profile ...` 仍可设置启动默认值。
+- `tool_approval`：`ask`、`auto`、`yolo`。切换权限不会重建 Controller，也不会改变
+  协作方式或工作模式。
+
+模型和推理强度仍是独立的 ACP 配置项。Reasonix 会按 ACP 会话持久化这三条轴；旧会话元数据
+缺少新字段时，工作模式继承 ACP 进程的启动 profile（未传 `--profile` 时为均衡），权限和
+协作方式使用“询问 + 常规”。为兼容旧版混合 mode 列表，`session/set_mode` 仍接受
+`default`（常规 + 询问）和 `auto`（常规 + Yolo），新客户端应使用拆分后的独立选择器。
+
 ## 自定义 OpenAI-compatible provider
 
 在桌面端打开 **设置 -> 模型 -> 接入 -> 添加模型服务 -> 自定义供应商**，用于接入代理、
@@ -269,7 +286,8 @@ Thinking 覆盖选项：
 ## 快捷键
 
 这里按使用端来写，因为用户通常是先知道“我现在在桌面端/CLI”，再找对应按键。
-核心模式规则很小：`Shift+Tab` 只管 Plan，`Ctrl/Cmd+Y` 只管 YOLO，粘贴继续走系统粘贴快捷键。
+桌面端仍用 `Shift+Tab` 切换 Plan；CLI 则用它在 Ask、Auto、Plan 之间循环。
+`Ctrl/Cmd+Y` 只管 YOLO，粘贴继续走系统粘贴快捷键。
 
 `[ui].shortcut_layout` 仍被接受以兼容旧配置，但下面的快捷键行为已经跨布局统一。
 
@@ -347,13 +365,12 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 
 | 按键或命令 | 作用 | 说明 |
 | --- | --- | --- |
-| `Shift+Tab` | 切换 Plan 开/关 | Plan 是只读规划，不会循环 Ask/Auto/YOLO。 |
+| `Shift+Tab` | 按 Ask → Auto → Plan → Ask 循环 | YOLO 不进入这个安全模式循环；底部状态栏会显示当前模式。 |
 | `Ctrl+Y` | 切换 YOLO 开/关 | 关闭 YOLO 时会尽量恢复之前的 Ask/Auto 基底。终端若能转发 Command/Super，也可能识别 `Cmd+Y`，但稳定可用的是 `Ctrl+Y`。 |
 | `--yolo`、`--dangerously-skip-permissions` | 启动时进入 YOLO | 和 `Ctrl+Y` 是同一个运行时模式。 |
 | `/work-mode [economy|balanced|delivery]` | 查看或切换当前会话的工作模式 | `/profile` 是兼容别名。切换会原子重建运行时，保留对话和审批姿态；有工作正在进行时会拒绝切换。 |
 | `Ctrl+O` | 切换详细 reasoning 显示 | 也可通过 `/verbose` 使用。 |
 | `Ctrl+B` | 展开或收起较长 shell 输出 | TUI 默认不启用鼠标报告，因此可和终端原生文本选择共存。 |
-| Ask / Auto | 没有键盘循环 | Ask 是默认交互基底；Auto 不通过 `Shift+Tab` 进入，需要由暴露工具审批姿态的客户端或 API 直接设置。 |
 | `/goal <目标>`、`/goal --research <目标>`、`/goal --simple <目标>`、`/goal status`、`/goal clear` | 启动、查看或清除 Goal | Goal 不进入任何快捷键循环；明显长周期目标会自动启用 AutoResearch。普通输入命中强 AutoResearch 信号时也会自动升级为 Goal。 |
 | `/migrate`、`/migrate --from <旧目录>` | 重试旧数据迁移，或从指定 v0.x 来源导入 sessions | Windows v0.52 自定义安装/数据目录用 `--from`；该形式只导入 sessions。详见[配置路径](./CONFIG_PATHS.zh-CN.md)。 |
 
@@ -361,11 +378,11 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 
 | 上下文 | 按键 | 作用 |
 | --- | --- | --- |
-| 斜杠或 `@` 补全 | `Up` / `Down`、`Tab` / `Enter`、`Esc` | 移动、接受或关闭补全菜单。 |
+| 斜杠或 `@` 补全 | `Up` / `Down`、`Ctrl+P` / `Ctrl+N`、`Tab` / `Enter`、`Esc` | 移动、接受或关闭补全菜单。 |
 | 工具审批提示 | `y`/`1`、`a`/`2`、`p`/`3`、`n`/`4`、`Enter`、`Esc`、`Ctrl+C` | 允许一次、本会话允许、持久允许、拒绝、默认允许一次、拒绝，或取消当前 turn。 |
 | Ask 问题卡 | `Up`/`Down` 或 `j`/`k`、`Left`/`Right` 或 `h`/`l`、`Space`、`Enter`、`1`-`9`、`Esc`、`Ctrl+C` | 导航答案/问题标签、切换多选、提交/激活、选择编号选项、关闭，或取消当前 turn。 |
 | Rewind 选择器 | `Up`/`Down` 或 `j`/`k`、`Enter`、`b`、`c`、`d`、`f`、`s`、`u`、`Esc` | 选择 turn，应用 both/conversation/code/fork/summarize 动作，或返回/关闭。 |
-| Resume 选择器 | `Up`/`Down` 或 `j`/`k`、`Enter`、`Esc` | 选择已保存 session 或关闭选择器。 |
+| 模型、provider 或 Resume 选择器 | `Up`/`Down` 或 `Ctrl+P`/`Ctrl+N`；搜索词为空时可用 `j`/`k`；输入文字过滤；`Enter`；`Esc` | 搜索、选择或关闭选择器；开始搜索后 `j`/`k` 会作为查询字符输入；`/provider` 会继续打开该 provider 的模型列表。 |
 | MCP 导入选择器 | `Up`/`Down` 或 `j`/`k`、`Space`、`Enter`、`Esc` / `Ctrl+C` | 移动、勾选服务器、导入勾选服务器，或取消。 |
 | MCP 管理器 | `Up`/`Down` 或 `j`/`k`、`Enter`、`Left`/`Right` 或 `h`/`l`、`r`、数字键、`q` / `Ctrl+C` | 导航服务器列表/详情、刷新、选择动作，或关闭。 |
 | `/clear` 确认 | 方向键或 `j`/`k` / `Tab`、`Enter`、`y`、`n`、`Esc` / `Ctrl+C` | 在 Clear/Cancel 间切换、确认清空，或取消。 |
@@ -669,9 +686,10 @@ project memory、tool schema 或 cache-stable system prompt。公开发布、破
 
 ## 双模型协同
 
-`reasonix setup` 刻意保持首次体验极简：选 provider → 输入 key（所选 provider 的所有
-SKU 都会启用）。若要让两个模型协同（执行器 + 规划器，各自独立、缓存稳定的
-session），向导后手动在 `reasonix.toml` 加一行即可：
+`reasonix setup` 现在统一管理 provider、模型列表、凭据、连接测试和默认模型；所有修改
+会暂存到“保存并退出”，并同步维护桌面端 provider access。完整用法见
+[CLI 命令参考](./CLI.zh-CN.md#配置供应商)。若要让两个模型协同（执行器 + 规划器，
+各自独立、缓存稳定的 session），向导后手动在 `reasonix.toml` 加一行即可：
 
 ```toml
 [agent]
@@ -703,8 +721,11 @@ ephemeral 只读 subagent，只暴露只读研究工具和安全前台 bash，�
 source 仍会启用可写 skill 工具，plan mode 下继续阻断。
 
 启动会话时可以用 `--profile economy|balanced|delivery` 选择运行模式，例如
-`reasonix run --profile delivery "修复并验证这个 bug"`。Economy（轻量）精简初始工具面并按需
-连接可选来源；Balanced（均衡）是保持旧请求字节兼容的默认档，提供完整工具面；Delivery（交付优先）
+`reasonix run --profile delivery "修复并验证这个 bug"`。Economy（轻量）初始只带 9 个工具：
+直接读/bash/编辑/写入、后台 shell 生命周期控制、`ask` 和 `connect_tool_source`；专用搜索/文件/
+workflow 工具、session history、memory 写入、slash command、Skills、MCP、LSP、网络、安装与
+subagent 都在任务需要时才连接。
+Balanced（均衡）是提供完整工具面的默认档；Delivery（交付优先）
 保留完整工具面，额外增加稳定能力代理 `use_capability`（按需 inspect/call MCP，包括
 `auto_start=false`，且不改变主工具 Schema），并增加“明确验收标准、修复根因、运行验证、复审最终
 diff”的稳定交付合约。该合约由宿主运行时强制执行：没有具体 `todo_write` 验收清单时会阻止变更和验证
@@ -716,8 +737,9 @@ diff”的稳定交付合约。该合约由宿主运行时强制执行：没有�
 `/work-mode economy|balanced|delivery` 热切换；`/profile` 是兼容别名。切换会原子重建
 Controller，同时保留 history、session 路径、Lease 和 Ask/Auto/Yolo 审批姿态；当前 turn、审批/询问、
 后台任务或另一场运行时切换尚未结束时会拒绝切换。构建失败时旧 Controller 继续可用。该命令只修改当前
-会话，不持久化新的全局默认值。跨 Profile 切换会产生一次新的 provider 缓存前缀；进入目标 Profile 后，
-system contract 和工具 Schema 在后续轮次保持稳定。
+会话，不持久化新的全局默认值。跨 Profile 切换会产生一次新的 provider 缓存前缀。均衡与交付优先模式下，
+system contract 和工具 Schema 在后续轮次保持稳定；轻量模式下，每次成功调用 `connect_tool_source`
+都会在下一次请求加入对应工具 Schema，形成一次新前缀，之后在工具面再次变化前保持稳定。
 
 桌面端标签页提供相同三档并持久化轻量或交付优先
 模式；旧的空值/`full` 继续解释为均衡模式。
