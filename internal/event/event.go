@@ -116,8 +116,9 @@ type Profile struct {
 }
 
 // Tool describes a tool call for ToolDispatch / ToolResult events. On dispatch
-// only ID/Name/Args/ReadOnly are set; on result Output/Err/Truncated are filled
-// in. Args is the raw JSON arguments — a sink compacts it for display.
+// ID/Name/Args/ReadOnly and optional preview metadata are set; on result
+// Output/Err/Truncated are filled in. Args is the raw JSON arguments — a sink
+// compacts it for display.
 type Tool struct {
 	ID         string
 	Name       string
@@ -135,6 +136,11 @@ type Tool struct {
 	// Partial dispatch — a liveness signal while a large payload streams. Zero
 	// on the initial start dispatch and on full dispatches.
 	ArgChars int
+	// Refreshed marks a repeated full ToolDispatch for the same ID whose file
+	// preview was recomputed after an earlier writer in the provider batch
+	// changed disk. Frontends that can upsert by ID should replace the existing
+	// preview; append-only sinks should ignore it to avoid duplicate tool cards.
+	Refreshed bool
 	// ParentID, when set, is the ID of the tool call that spawned this one — a
 	// sub-agent's calls carry the parent `task` call's ID so a frontend can nest
 	// them under it. Empty for top-level calls.
@@ -156,10 +162,34 @@ type FileDiff struct {
 // Approval identifies a pending tool-call approval for an ApprovalRequest
 // event. ID correlates the request with the controller's Approve(ID, …) reply.
 type Approval struct {
-	ID      string
-	Tool    string
-	Subject string
-	Reason  string // optional annotation explaining why approval is needed
+	ID       string
+	Tool     string
+	Subject  string
+	Reason   string    // optional annotation explaining why approval is needed
+	Fresh    bool      // current human decision required; do not offer remembered grants
+	MCPTrust *MCPTrust // host-local MCP safety summary; nil for non-MCP approvals
+}
+
+// MCPTrust is the credential-free safety snapshot attached to an MCP tool
+// approval. It is a local UI/event payload only: provider requests never see it.
+type MCPTrust struct {
+	Server          string
+	TrustState      string
+	TrustSource     string
+	TrustScope      string
+	IsolationState  string
+	IsolationReason string
+	IdentityChanged bool
+	ChangedTools    []string
+	ToolChanges     []MCPToolChange
+	Readers         []string
+	Writers         []string
+	Destructive     []string
+}
+
+type MCPToolChange struct {
+	Name string
+	Kind string
 }
 
 // AskOption is one choice the user can pick for an AskQuestion.
@@ -233,6 +263,14 @@ type CacheDiagnostics struct {
 	CacheHitTokens      int
 }
 
+// FinalReadiness carries machine-readable recovery requirements on TurnDone.
+// Missing values are stable category ids; user-facing detail stays localized in
+// the frontend instead of scraping the diagnostic error string.
+type FinalReadiness struct {
+	Attempts int
+	Missing  []string
+}
+
 const (
 	UsageSourceExecutor         = "executor"
 	UsageSourcePlanner          = "planner"
@@ -256,6 +294,7 @@ const (
 	NoticeCodeExecutorHandoff = "executor_handoff"
 	NoticeCodeToolBudget      = "tool_budget"
 	NoticeCodeLoopGuard       = "loop_guard"
+	NoticeCodeWorkspaceLease  = "workspace_lease"
 )
 
 type Event struct {
@@ -276,14 +315,15 @@ type Event struct {
 	// session (Usage events only), so a frontend can show the aggregate hit-rate
 	// — which doesn't crater on a short turn or after compaction — alongside
 	// Usage's single-turn numbers.
-	SessionHit   int        // Usage: cumulative cache-hit prompt tokens this session
-	SessionMiss  int        // Usage: cumulative cache-miss prompt tokens this session
-	Level        Level      // Notice
-	Approval     Approval   // ApprovalRequest
-	Ask          Ask        // AskRequest
-	Err          error      // TurnDone: non-nil on failure
-	Outcome      string     // TurnDone: optional machine-readable recoverable outcome
-	Compaction   Compaction // Compaction
+	SessionHit   int             // Usage: cumulative cache-hit prompt tokens this session
+	SessionMiss  int             // Usage: cumulative cache-miss prompt tokens this session
+	Level        Level           // Notice
+	Approval     Approval        // ApprovalRequest
+	Ask          Ask             // AskRequest
+	Err          error           // TurnDone: non-nil on failure
+	Outcome      string          // TurnDone: optional machine-readable recoverable outcome
+	Readiness    *FinalReadiness // TurnDone: structured final-readiness recovery state
+	Compaction   Compaction      // Compaction
 	Guardian     GuardianResult
 	RetryAttempt int // Retrying: 1-based attempt about to be made
 	RetryMax     int // Retrying: total attempts before giving up

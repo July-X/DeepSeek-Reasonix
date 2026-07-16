@@ -39,7 +39,7 @@ import { useWailsResizeFix } from "./lib/useWailsResizeFix";
 import { asArray } from "./lib/array";
 import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, t, useI18n, useT, type Translator } from "./lib/i18n";
 import { localizedNoticeText, useController, type Item, type LiveStream } from "./lib/useController";
-import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered } from "./lib/bridge";
+import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered, openExternal } from "./lib/bridge";
 import { generativeMusic, isGenerativeMusicEnabled } from "./lib/generative-music";
 import { clearAttentionChimeKeys, playAttentionChime, playSuccessChime, shouldPlayAttentionChimeForEvent } from "./lib/sound";
 import { NoticeCard, Transcript } from "./components/Transcript";
@@ -64,6 +64,7 @@ import { OnboardingOverlay } from "./components/OnboardingOverlay";
 import { AppChrome } from "./components/AppChrome";
 import { ShortcutsCheatsheet } from "./components/ShortcutsCheatsheet";
 import { ProjectTree } from "./components/ProjectTree";
+import { WorktreeBadge } from "./components/WorktreeBadge";
 import { HeartbeatPanel } from "./custom/features/heartbeat/HeartbeatPanel";
 import "./custom/features/heartbeat/heartbeat.css";
 import { CopyButton } from "./components/CopyButton";
@@ -374,6 +375,7 @@ type SidebarImConnection = {
 type DesktopNavigationInput =
   | { kind: "topic"; scope: string; workspaceRoot: string; topicId: string; sessionPath?: string }
   | { kind: "blank"; scope: string; workspaceRoot: string }
+  | { kind: "delivery-worktree"; workspaceRoot: string }
   | { kind: "sidebar-im"; connection: SidebarImConnection }
   | { kind: "resume-session"; session: SessionMeta };
 type PendingDesktopNavigationRequest = PendingNavigationRequest<DesktopNavigationInput>;
@@ -998,6 +1000,7 @@ export default function App() {
     state,
     activeTabId,
     sendToTab,
+    recoverDeliveryToTab,
     runShellForTab,
     steerForTab,
     notice,
@@ -1033,6 +1036,7 @@ export default function App() {
     setTokenMode,
     switchTab,
     openProjectTab,
+    createDeliveryWorktree,
     openGlobalTab,
     closeTab,
     reorderTabs,
@@ -1064,6 +1068,7 @@ export default function App() {
   const settingsFocus = useOverlayStore((s) => s.settingsFocus);
   const setSettingsFocus = useOverlayStore((s) => s.setSettingsFocus);
   const [desktopLayoutStyle, setDesktopLayoutStyle] = useState<DesktopLayoutStyle>("workbench");
+  const [safeMode, setSafeMode] = useState(false);
   const singleSurfaceLayout = desktopLayoutStyle === "workbench" || desktopLayoutStyle === "creation";
   const [startupUpdateChecksEnabled, setStartupUpdateChecksEnabled] = useState<boolean | null>(null);
   const [histView, setHistView] = useState<HistoryViewState | null>(null);
@@ -1336,6 +1341,7 @@ export default function App() {
       ]);
       if (cancelled) return;
       applyDesktopPreferences(settings);
+      setSafeMode(settings.safeMode === true);
       hydrateDisplayMode(settings.displayMode);
       setSidebarImConnections(sidebarImConnectionsFromBot(settings.bot, t, runtimeStatus));
       setImTopicSources(sidebarImTopicSourcesFromBot(settings.bot, t));
@@ -2655,9 +2661,9 @@ export default function App() {
       goal: state.meta?.goal,
       activeTabId: () => activeTabIdRef.current,
       resumeGoal: resumeControllerGoalForTab,
-      send: (tabId) => commitThenSend(tabId, t("notice.deliveryIncompleteContinuePrompt")),
+      send: (tabId) => recoverDeliveryToTab(tabId, t("notice.deliveryIncompleteContinuePrompt")),
     });
-  }, [commitThenSend, controllerReady, resumeControllerGoalForTab, state.meta?.goal, t]);
+  }, [controllerReady, recoverDeliveryToTab, resumeControllerGoalForTab, state.meta?.goal, t]);
   commitThenSendRef.current = commitThenSend;
 
   const handleMessageAction = useCallback((turn: number, scope: string) => {
@@ -2853,6 +2859,25 @@ export default function App() {
         return;
       }
 
+      if (request.kind === "delivery-worktree") {
+        const result = await createDeliveryWorktree(request.workspaceRoot);
+        if (!latest()) return;
+        seedActiveTabMeta(result.tab);
+        setProjectRevision((value) => value + 1);
+        await refreshLatestTabMetas();
+        if (!latest()) return;
+        showToast(
+          result.sourceDirty
+            ? t("projectTree.worktreeCreatedDirty", { branch: result.branch })
+            : t("projectTree.worktreeCreated", { branch: result.branch }),
+          result.sourceDirty ? "warn" : "info",
+          { durationMs: result.sourceDirty ? 7000 : 3500 },
+        );
+        setTabRevealSignal((signal) => signal + 1);
+        setTranscriptRevealSignal((signal) => signal + 1);
+        return;
+      }
+
       if (request.kind === "sidebar-im") {
         const { connection } = request;
         const target = sidebarImSessionTarget(connection);
@@ -2912,6 +2937,11 @@ export default function App() {
         void refreshLatestTabMetas();
         return;
       }
+      if (request.kind === "delivery-worktree") {
+        console.warn("isolated Delivery workspace creation failed", err);
+        showToast(err instanceof Error ? err.message : String(err), "error", { durationMs: 6000 });
+        return;
+      }
       if (request.kind === "sidebar-im") {
         console.warn("bot sidebar open failed", err);
         showToast(t("sidebar.imOpenFailed", { name: request.connection.title }));
@@ -2929,7 +2959,7 @@ export default function App() {
         showToast(err?.message || String(err));
       }
     }
-  }, [activateTopic, ensureBlankSurface, ensureBlankTab, openChannelSession, openGlobalTab, openProjectTab, openTopicSession, refreshHistoryView, resumeSession, seedActiveTabMeta, showToast, singleSurfaceLayout, t]);
+  }, [activateTopic, createDeliveryWorktree, ensureBlankSurface, ensureBlankTab, openChannelSession, openGlobalTab, openProjectTab, openTopicSession, refreshHistoryView, resumeSession, seedActiveTabMeta, showToast, singleSurfaceLayout, t]);
 
   const enqueueNavigation = useCallback((input: DesktopNavigationInput): Promise<void> => enqueueNavigationRequest(
     { seqRef: navigationSeqRef, runningRef: navigationRunningRef, pendingRef: navigationPendingRef },
@@ -3419,6 +3449,7 @@ export default function App() {
               onOpenTopic={handleOpenTopic}
               onOpenProjectHistory={openProjectHistory}
               onCreateTopic={(scope, workspaceRoot) => openBlankSession(scope, scope === "project" ? workspaceRoot : "")}
+              onCreateDeliveryWorktree={(workspaceRoot) => enqueueNavigation({ kind: "delivery-worktree", workspaceRoot })}
               onTopicsChanged={refreshProjectsAndTabs}
               onRenameTopic={renameTopic}
               refreshSignal={projectRevision}
@@ -3650,6 +3681,7 @@ export default function App() {
               {topicbarSubtitleVisible && (
                 <div className="topicbar__subtitle" title={topicbarSubtitleTitle}>
                   {topicbarWorkspaceLabel && <span>{topicbarWorkspaceLabel}</span>}
+                  {activeTab?.isolatedWorktree && <WorktreeBadge size={11} />}
                   {topicbarImSourcePlatform && (
                     <span className={`topicbar__source-chip topicbar__source-chip--${topicbarImSourcePlatform}`}>
                       {topicbarImSourceLabel}
@@ -3795,8 +3827,17 @@ export default function App() {
           {state.meta?.startupErr && (
             <div className="banner banner--error">{t("topbar.startupError", { msg: state.meta.startupErr })}</div>
           )}
+          {safeMode && (
+            <div className="banner banner--warning">{t("guard.safeMode")}</div>
+          )}
 
-          <UpdateBanner enabled={startupUpdateChecksEnabled === true} />
+          <UpdateBanner
+            enabled={startupUpdateChecksEnabled === true}
+            onShowReleaseNotes={(latest) => {
+              const version = latest.replace(/^(?:desktop-)?v/, "");
+              void openExternal(`https://reasonix.io/changelog/v${version}/`);
+            }}
+          />
 
           <main className="main">
             {sidebarImDetailConnection ? (
