@@ -118,6 +118,7 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 	c.executor.Session().Add(provider.Message{Role: provider.RoleUser, Content: input, Images: images, CreatedAt: time.Now().UnixMilli()})
 
 	for _, sk := range skills {
+		sk = c.skills.prepare(sk)
 		callID := fmt.Sprintf("slash-skill-%d", c.slashSkillSeq.Add(1))
 		args, _ := json.Marshal(map[string]string{"name": sk.Name, "arguments": task})
 		toolEvent := event.Tool{
@@ -154,9 +155,6 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchestratedTurn) (err error) {
 	c := o.c
 	c.maybeSessionStart(ctx)
-	if !turn.synthetic {
-		c.maybeAutoPlan(ctx, turn.raw)
-	}
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
@@ -213,15 +211,13 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		c.clearInFlightTurn()
 	} else {
 		c.appendAutoResearchHeartbeat(autoResearchTaskID, autoresearch.HeartbeatWarning, err.Error())
-		// When the user explicitly cancels (Ctrl+C), the incomplete turn's
-		// assistant messages and tool results are already saved to the
-		// session. If they stay, the next turn's model sees leftover
-		// in-progress todo items and partial tool calls and may re-execute
-		// the interrupted work. Keep the real user prompt for visible turns so
-		// follow-up questions and resumes do not lose the user's context (#5499).
+		// When the user explicitly cancels, keep the real prompt and any fully
+		// paired tool work. Partial reasoning/output remains durable for display
+		// but is marked local-only, and a bounded recovery summary is folded into
+		// the next real user turn (#5499, #6680).
 		if errors.Is(err, context.Canceled) && c.CancelRequested() {
 			if turn.synthetic || IsSyntheticUserMessage(turn.raw) {
-				c.stripTurnMessagesAfter(startMessages)
+				c.stripInterruptedSyntheticTurnMessagesAfter(startMessages)
 			} else {
 				c.stripCancelledVisibleTurnMessagesAfterWithFallback(startMessages, provider.Message{
 					Role:      provider.RoleUser,
@@ -230,6 +226,18 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 					CreatedAt: time.Now().UnixMilli(),
 				})
 			}
+		} else if !turn.synthetic && !IsSyntheticUserMessage(turn.raw) && c.hasInterruptedDisplayAfter(startMessages, provider.Message{
+			Role: provider.RoleUser, Content: input,
+		}) {
+			// Provider/API failures use the same safe recovery path as an explicit
+			// stop once the agent has recorded a partial stream. Completed tool
+			// pairs survive; unsafe stream fragments stay local-only.
+			c.stripCancelledVisibleTurnMessagesAfterWithFallback(startMessages, provider.Message{
+				Role:      provider.RoleUser,
+				Content:   input,
+				Images:    append([]string(nil), userImages...),
+				CreatedAt: time.Now().UnixMilli(),
+			})
 		}
 		c.clearInFlightTurn()
 		return err
@@ -251,14 +259,6 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		return err
 	}
 	if !allow {
-		// When plan mode is already off, the user explicitly exited plan mode
-		// while the approval was pending. Suppress auto-plan for the next turn
-		// so it does not immediately re-enter the mode the user just left.
-		c.mu.Lock()
-		if !c.planMode {
-			c.suppressAutoPlan = true
-		}
-		c.mu.Unlock()
 		return nil // keep planning; plan mode stays on
 	}
 	c.SetPlanMode(false)
@@ -276,7 +276,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	}()
 	if err != nil {
 		if errors.Is(err, context.Canceled) && c.CancelRequested() {
-			c.stripTurnMessagesAfter(execStart)
+			c.stripInterruptedSyntheticTurnMessagesAfter(execStart)
 		}
 		return err
 	}

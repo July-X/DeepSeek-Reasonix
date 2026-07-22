@@ -60,6 +60,7 @@ type Config struct {
 	Bot              BotConfig           `toml:"bot"`
 	Serve            ServeConfig         `toml:"serve"`
 	Secrets          SecretsConfig       `toml:"secrets"`
+	Remote           RemoteConfig        `toml:"remote"`
 
 	providerSources            map[string]providerSourceScope
 	shadowedProjectProviders   []ProviderEntry
@@ -150,6 +151,7 @@ type DesktopConfig struct {
 	Metrics                 *bool    `toml:"metrics"`                    // aggregate desktop metrics (anonymous signal/bucket counts; no content); nil keeps the default enabled
 	ProviderAccess          []string `toml:"provider_access"`            // desktop-only list of provider entries shown in Settings > Model > Access
 	ExpandThinking          bool     `toml:"expand_thinking"`            // true = show reasoning text expanded by default; false = collapsed
+	ConversationWidth       string   `toml:"conversation_width"`         // standard|full; max transcript width; empty = standard
 }
 
 // DesktopExternalOpener returns the user-selected external opener id. The
@@ -329,6 +331,15 @@ func (c *Config) DesktopDisplayMode() string {
 	default:
 		return "standard"
 	}
+}
+
+// DesktopConversationWidth returns the normalized desktop conversation width.
+// Unknown and missing values fall back to standard for backward compatibility.
+func (c *Config) DesktopConversationWidth() string {
+	if c != nil && strings.EqualFold(strings.TrimSpace(c.Desktop.ConversationWidth), "full") {
+		return "full"
+	}
+	return "standard"
 }
 
 // NormalizeToolApprovalMode returns the canonical desktop/session tool approval
@@ -1037,12 +1048,18 @@ type AgentConfig struct {
 	// Deprecated compatibility fields. Old TOML and desktop clients may still
 	// send them, but config loading normalizes both to zero and rendering omits
 	// them. One-off CLI and unattended bot limits remain separate controls.
-	MaxSteps            int               `toml:"max_steps"`
-	PlannerMaxSteps     int               `toml:"planner_max_steps"`
-	Temperature         float64           `toml:"temperature"`
-	PlannerModel        string            `toml:"planner_model"`
-	GuardianModel       string            `toml:"guardian_model"`
-	GuardianTemperature float64           `toml:"guardian_temperature"`
+	MaxSteps            int     `toml:"max_steps"`
+	PlannerMaxSteps     int     `toml:"planner_max_steps"`
+	Temperature         float64 `toml:"temperature"`
+	PlannerModel        string  `toml:"planner_model"`
+	GuardianModel       string  `toml:"guardian_model"`
+	GuardianTemperature float64 `toml:"guardian_temperature"`
+	// RecoveryModel optionally names a dedicated model for the independent
+	// recovery reviewer. Empty falls back to GuardianModel, then the main model.
+	RecoveryModel string `toml:"recovery_model"`
+	// RecoveryTemperature is accepted from older configs but ignored. Auto
+	// Guard review is deterministic at temperature zero.
+	RecoveryTemperature float64           `toml:"recovery_temperature"`
 	SubagentModel       string            `toml:"subagent_model"`
 	SubagentModels      map[string]string `toml:"subagent_models"`
 	SubagentEffort      string            `toml:"subagent_effort"`
@@ -1060,16 +1077,17 @@ type AgentConfig struct {
 	// startup (a built-in like "explanatory"/"learning"/"concise", or a custom
 	// .reasonix/output-styles/<name>.md). Empty = the unmodified prompt.
 	OutputStyle string `toml:"output_style"`
-	// AutoPlan controls whether interactive turns that look multi-step start in
-	// plan mode automatically: "off" keeps plan mode manual, "on" enables the
-	// approval gate. Legacy "ask" is treated as "on".
+	// Deprecated compatibility field. Automatic plan mode was retired in config
+	// version 5; old TOML remains readable, but loading normalizes it to "off"
+	// and rendering omits it. Plan mode remains available as an explicit user
+	// choice.
 	AutoPlan string `toml:"auto_plan"`
 	// ReasoningLanguage controls the preferred language for visible reasoning
 	// text. Empty/auto follows the conversation language. Applied as transient
 	// turn context, not the stable prompt.
 	ReasoningLanguage string `toml:"reasoning_language"`
-	// AutoPlanClassifier optionally names a provider/model used to classify
-	// borderline auto-plan decisions. Empty keeps the zero-cost heuristic path.
+	// Deprecated compatibility field paired with AutoPlan. Old TOML remains
+	// readable, but loading clears it and rendering omits it.
 	AutoPlanClassifier string `toml:"auto_plan_classifier"`
 	// Compaction window fractions: soft = notice only, compact = trigger, force = hard ceiling.
 	SoftCompactRatio    float64 `toml:"soft_compact_ratio"`
@@ -1084,10 +1102,6 @@ type AgentConfig struct {
 	// ColdResumePrune elides stale tool results when a session reopens past the
 	// provider cache window. nil = default enabled.
 	ColdResumePrune *bool `toml:"cold_resume_prune"`
-	// PlanModeAllowedTools is a legacy compatibility field. Concrete MCP names may
-	// still become local read-only trust aliases, but this field does not control
-	// main Plan workflow availability.
-	PlanModeAllowedTools []string `toml:"plan_mode_allowed_tools"`
 	// PlanModeReadOnlyCommands is retained for old config/session round trips. Main
 	// Plan bash calls now use the ordinary Permissions classifier and Sandbox.
 	PlanModeReadOnlyCommands []string `toml:"plan_mode_read_only_commands"`
@@ -1168,6 +1182,10 @@ type ProviderModelOverride struct {
 	SupportedEfforts  []string `toml:"supported_efforts"`
 	DefaultEffort     string   `toml:"default_effort"`
 	Vision            *bool    `toml:"vision"`
+	// ContextWindow overrides the provider-wide context budget for this model.
+	// Zero inherits ProviderEntry.ContextWindow so existing configurations keep
+	// their current compaction behavior.
+	ContextWindow int `toml:"context_window"`
 }
 
 // ModelList returns the models this provider exposes: the explicit `models` list,
@@ -1313,6 +1331,9 @@ func (e *ProviderEntry) applyModelOverride() {
 	if ov.Vision != nil {
 		e.visionOverride = ov.Vision
 	}
+	if ov.ContextWindow > 0 {
+		e.ContextWindow = ov.ContextWindow
+	}
 }
 
 func (e *ProviderEntry) modelOverrideForModel(model string) (ProviderModelOverride, bool) {
@@ -1426,12 +1447,6 @@ type PermissionsConfig struct {
 	Deny  []string `toml:"deny"`
 }
 
-// MCPToolPolicy is local execution policy for one raw server tool name. It is
-// intentionally absent from provider-visible tool schemas.
-type MCPToolPolicy struct {
-	ApprovalMode string `toml:"approval_mode" json:"approval_mode"`
-}
-
 // MCPConfigSource records where a merged MCP entry came from. It is runtime
 // provenance only and is never serialized back into TOML or .mcp.json.
 type MCPConfigSource string
@@ -1475,18 +1490,6 @@ type PluginEntry struct {
 	// from this server. Keys are server-local tool names, not model-visible
 	// mcp__server__tool names.
 	ToolTimeoutSeconds map[string]int `toml:"tool_timeout_seconds"`
-	// TrustedReadOnlyTools is a local trust and compatibility override for
-	// audited readers. Third-party readOnlyHint alone is not a Plan-mode trust
-	// boundary.
-	TrustedReadOnlyTools []string `toml:"trusted_read_only_tools"`
-	// DefaultToolsApprovalMode is auto|prompt|writes|approve. Empty uses the
-	// source-aware runtime default (direct for user-authorized servers, auto for
-	// project-provided servers).
-	DefaultToolsApprovalMode string `toml:"default_tools_approval_mode"`
-	// Tools overrides approval policy by raw server-local tool name.
-	Tools map[string]MCPToolPolicy `toml:"tools"`
-	// ApprovalsReviewer is user|auto_review. Empty preserves legacy routing.
-	ApprovalsReviewer string `toml:"approvals_reviewer"`
 	// AutoStart controls whether the server connects during session startup.
 	// Nil preserves historical behavior: configured servers start automatically.
 	AutoStart *bool `toml:"auto_start"`
@@ -1512,6 +1515,9 @@ func (e PluginEntry) ShouldAutoStart() bool {
 // ResolvedTier returns the normalized tier ("eager"|"background") with the
 // project default applied. Legacy lazy and unknown values fall back to
 // background so enabled MCPs are available without manual connection.
+//
+// Tier no longer changes runtime process start timing; it remains for config
+// compatibility and diagnostics only.
 func (e PluginEntry) ResolvedTier() string {
 	return resolvedMCPTier(e.Tier)
 }
@@ -1529,10 +1535,31 @@ func resolvedMCPTier(tier string) string {
 	}
 }
 
+// AutoStartPlugins returns enabled MCP entries for the catalog. Durable
+// enable/disable overrides in mcp-activation.json take precedence over the
+// legacy auto_start field. auto_start=false without an override still maps to
+// disabled; true/nil map to enabled. "Auto start" no longer means "spawn the
+// process at session boot" — enabled servers register cached tools and start
+// on first real tool call.
 func (c *Config) AutoStartPlugins() []PluginEntry {
+	return c.EnabledPlugins("", DefaultMCPActivationStore())
+}
+
+// EnabledPlugins returns catalog-enabled MCP entries for workspace, consulting
+// the activation store when provided.
+func (c *Config) EnabledPlugins(workspace string, activation *MCPActivationStore) []PluginEntry {
+	if c == nil {
+		return nil
+	}
 	out := make([]PluginEntry, 0, len(c.Plugins))
 	for _, p := range c.Plugins {
-		if p.ShouldAutoStart() {
+		enabled := p.ShouldAutoStart()
+		if activation != nil {
+			if resolved, err := activation.IsEnabled(p, workspace); err == nil {
+				enabled = resolved
+			}
+		}
+		if enabled {
 			out = append(out, p)
 		}
 	}
@@ -1559,11 +1586,11 @@ const LanguagePolicy = `Reply in the same language the user is using in their mo
 // Default returns the built-in default configuration.
 func Default() *Config {
 	return &Config{
-		ConfigVersion:    4,
+		ConfigVersion:    5,
 		DefaultModel:     "deepseek-flash",
 		CredentialsStore: CredentialsStoreAuto,
 		UI:               UIConfig{Theme: "auto"},
-		Desktop:          DesktopConfig{DefaultToolApprovalMode: "auto"},
+		Desktop:          DesktopConfig{DefaultToolApprovalMode: "auto", ConversationWidth: "standard"},
 		Notifications: NotificationsConfig{
 			Enabled:         false,
 			TurnDone:        true,

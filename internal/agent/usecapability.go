@@ -10,7 +10,6 @@ import (
 
 	"reasonix/internal/capability"
 	"reasonix/internal/event"
-	"reasonix/internal/mcptrust"
 	"reasonix/internal/plugin"
 	"reasonix/internal/tool"
 )
@@ -28,7 +27,7 @@ type UseCapabilityTool struct {
 	// timeout. nil falls back to context.Background() for direct/test use.
 	lifeCtx context.Context
 	// specs are the boot-converted plugin specs (env expansion, workspace
-	// overrides, timeouts, trusted read-only tools). The proxy never rebuilds
+	// overrides and timeouts). The proxy never rebuilds
 	// specs from raw config entries — that would fork the conversion logic.
 	specs    []plugin.Spec
 	registry *tool.Registry // live registry for already-exposed MCP tools
@@ -359,38 +358,24 @@ func (t *UseCapabilityTool) resolveCall(ctx context.Context, id string, args jso
 	if !ok {
 		return t.resolveUnavailable(base, id, modelName, fmt.Sprintf("MCP server %q is not configured", server)), nil
 	}
+	spec = plugin.ResolveStoredAuthorization(ctx, spec)
 	destructive := false
 	if t.catalog != nil {
 		if entry, found := t.catalog().Lookup(id); found {
 			destructive = entry.Destructive
 		}
 	}
-	trustedReader := false
-	capabilityFingerprint := ""
-	trustReason := ""
-	if cached, found, trustErr := plugin.CachedToolTrustForSpec(ctx, spec, raw); trustErr != nil {
-		trustReason = trustErr.Error()
-	} else if found {
+	readOnly := false
+	if cached, found := plugin.CachedToolSafetyForSpec(spec, raw); found {
 		destructive = destructive || cached.Destructive
-		trustedReader = cached.TrustedReader
-		capabilityFingerprint = cached.CapabilityFingerprint
-	} else if spec.TrustManager == nil {
-		// Compatibility for direct library users that have no host trust store.
-		trustedReader = spec.ReadOnlyToolNames[raw] || spec.ReadOnlyModelToolNames[modelName]
+		readOnly = cached.ReadOnly
 	}
 	lazy := &onDemandMCPTool{proxy: t, spec: spec, server: server, raw: raw, modelName: modelName, destructive: destructive}
-	lazy.readOnlyTrusted = trustedReader
-	lazy.capabilityFingerprint = capabilityFingerprint
-	lazy.trustReason = trustReason
-	// Strict read-only execution requires a positive receipt authority: the
-	// hint/legacy compatibility path above keeps its historical classification
-	// for ordinary sessions but cannot admit tools into a strict child.
-	lazy.trustAuthority = spec.TrustManager != nil
+	lazy.readOnly = readOnly
 	base.Target = lazy
 	base.TargetName = modelName
-	// Conservative: an unstarted tool counts as a writer unless the user
-	// explicitly trusted it read-only in config (spec-level trust, the same
-	// source live remote tools honor).
+	// Cached server hints control ordinary approval. Strict read-only execution
+	// additionally requires server authorization and live read-only metadata.
 	base.ReadOnly = lazy.ReadOnly()
 	if len(args) == 0 {
 		base.Args = json.RawMessage(`{}`)
@@ -437,8 +422,7 @@ func findMCPTool(tools []tool.Tool, raw, modelName string) tool.Tool {
 
 // onDemandMCPTool defers MCP server startup to Execute so permission and hook
 // gates always run before any subprocess or network side effect. Before the live
-// handshake it can only use a backward-compatible local read-only override;
-// otherwise it remains write-capable until the resolved MCP tool is classified.
+// handshake it remains write-capable until the resolved MCP tool is classified.
 type onDemandMCPTool struct {
 	proxy     *UseCapabilityTool
 	spec      plugin.Spec
@@ -446,59 +430,38 @@ type onDemandMCPTool struct {
 	raw       string
 	modelName string
 	// destructive comes from the schema cache when available. A live promotion
-	// is detected in Execute and deferred to a fresh-approved retry.
-	destructive           bool
-	readOnlyTrusted       bool
-	capabilityFingerprint string
-	trustReason           string
-	trustAuthority        bool
+	// is detected in Execute so a retry re-enters the current Plan/read-only
+	// execution boundary.
+	destructive bool
+	readOnly    bool
 }
 
 func (o *onDemandMCPTool) Name() string { return o.modelName }
 
 func (o *onDemandMCPTool) Description() string {
-	return "on-demand MCP tool " + o.server + "/" + o.raw + " (connects after approval)"
+	return "on-demand MCP tool " + o.server + "/" + o.raw + " (connects when first used)"
 }
 
 func (o *onDemandMCPTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
 
 func (o *onDemandMCPTool) ReadOnly() bool {
-	return o.readOnlyTrusted
+	return o.readOnly
 }
-
-// ReadOnly is true only after the cached snapshot matches an established local
-// receipt, never from an unauthenticated server hint.
-func (o *onDemandMCPTool) PlanModeUntrustedReadOnly() bool { return false }
 
 func (o *onDemandMCPTool) ReadOnlyExecutionHostMutation() bool { return true }
 
-func (o *onDemandMCPTool) ReadOnlyExecutionTrustAuthority() bool { return o.trustAuthority }
+func (o *onDemandMCPTool) MCPServerAuthorized() bool { return o.spec.ServerAuthorized() }
 
 func (o *onDemandMCPTool) ReadOnlyExecutionBlockReason() string {
-	reason := "start this MCP capability; ask the parent session to trust, re-review, or execute it"
-	if strings.TrimSpace(o.trustReason) != "" {
-		reason += " (local verification failed: " + o.trustReason + ")"
-	}
-	return reason
+	return "connect this MCP capability from a parent session first"
 }
 
 // MCPServerName/MCPRawToolName expose the deferred target for audit and
 // diagnostics (tool.MCPMetadata).
 func (o *onDemandMCPTool) MCPServerName() string  { return o.server }
 func (o *onDemandMCPTool) MCPRawToolName() string { return o.raw }
-func (o *onDemandMCPTool) MCPCapabilityFingerprint() string {
-	return o.capabilityFingerprint
-}
 func (o *onDemandMCPTool) MCPDestructiveHint() bool {
 	return o.destructive
-}
-
-func (o *onDemandMCPTool) MCPApprovalMode() string {
-	return o.spec.ToolApprovalMode(o.raw)
-}
-
-func (o *onDemandMCPTool) MCPApprovalReviewer() string {
-	return tool.NormalizeMCPApprovalReviewer(o.spec.ApprovalsReviewer)
 }
 
 func (o *onDemandMCPTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -519,25 +482,13 @@ func (o *onDemandMCPTool) Execute(ctx context.Context, args json.RawMessage) (st
 		}
 		return "", fmt.Errorf("%s", msg)
 	}
-	for _, status := range o.proxy.host.SecurityStatuses() {
-		if status.Name == o.server && status.TrustState == mcptrust.TrustChanged {
-			return "", fmt.Errorf("MCP server %q security attributes changed; the current call was blocked before tools/call and requires parent-session re-verification", o.server)
-		}
-	}
-	if live, ok := target.(tool.MCPCapabilityFingerprint); ok && o.capabilityFingerprint != "" && live.MCPCapabilityFingerprint() != "" && live.MCPCapabilityFingerprint() != o.capabilityFingerprint {
-		return "", fmt.Errorf("MCP server %q changed the security schema for tool %q; the current call was blocked before tools/call and requires parent-session re-verification", o.server, o.raw)
-	}
-	if o.readOnlyTrusted && (!target.ReadOnly() || planModeUntrustedReadOnly(target)) {
-		return "", fmt.Errorf("MCP server %q no longer exposes tool %q as a trusted reader; the current call was blocked before tools/call and requires parent-session re-verification", o.server, o.raw)
-	}
-	if annotations, ok := target.(tool.MCPAnnotations); ok && annotations.MCPDestructiveHint() && !o.destructive {
-		return "", destructiveMCPDiscoveryError(o.server, o.raw)
+	if _, err := plugin.ReconcileCachedToolSafety(o.server, o.raw, plugin.CachedToolSafety{
+		ReadOnly:    o.readOnly,
+		Destructive: o.destructive,
+	}, target); err != nil {
+		return "", err
 	}
 	return target.Execute(ctx, args)
-}
-
-func destructiveMCPDiscoveryError(server, rawTool string) error {
-	return fmt.Errorf("MCP server %q marks tool %q as destructive; retry so Reasonix can request fresh approval before execution", server, rawTool)
 }
 
 func (t *UseCapabilityTool) ensureServerTools(ctx context.Context, server string) ([]tool.Tool, error) {
@@ -632,7 +583,7 @@ func (t *UseCapabilityTool) ConnectedProxyTools() map[string][]plugin.CachedTool
 
 // specFor looks up the boot-converted spec for server. The proxy deliberately
 // holds []plugin.Spec, not raw config entries: env expansion, workspace
-// overrides, call timeouts, and trusted read-only tool names all live in the
+// overrides, call timeouts, and read-only tool names all live in the
 // shared conversion and must not be re-derived here.
 func (t *UseCapabilityTool) specFor(server string) (plugin.Spec, bool) {
 	for _, s := range t.specs {

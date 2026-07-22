@@ -1775,6 +1775,7 @@ func migrateSessionSidecars(oldPath, newPath, newID string) error {
 		{store.SessionEventLogDamaged(oldPath), store.SessionEventLogDamaged(newPath)},
 		{store.SessionEventIndex(oldPath), store.SessionEventIndex(newPath)},
 		{store.SessionConflictLog(oldPath), store.SessionConflictLog(newPath)},
+		{store.SessionRecoveryState(oldPath), store.SessionRecoveryState(newPath)},
 		{store.SessionCheckpointDir(oldPath), store.SessionCheckpointDir(newPath)},
 		{store.SessionJobsDir(oldPath), store.SessionJobsDir(newPath)},
 	} {
@@ -2034,7 +2035,7 @@ func ContinueSessionPath(prevPath, dir, model string) string {
 // the model so the filename hints at what the conversation was with. dir is
 // typically config.SessionDir().
 func NewSessionPath(dir, model string) string {
-	safe := strings.NewReplacer("/", "-", "\\", "-").Replace(model)
+	safe := strings.NewReplacer("/", "-", "\\", "-", ":", "-", "<", "-", ">", "-", "\"", "-", "|", "-", "?", "-", "*", "-").Replace(model)
 	if safe == "" {
 		safe = "session"
 	}

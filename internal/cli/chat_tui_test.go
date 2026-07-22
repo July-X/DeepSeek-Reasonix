@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"reasonix/internal/event"
 	"reasonix/internal/i18n"
 	"reasonix/internal/provider"
+	"reasonix/internal/secrets"
 	"reasonix/internal/skill"
 	"reasonix/internal/testenv"
 )
@@ -33,6 +35,31 @@ type stubbornTurnRunner struct {
 }
 
 const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+const (
+	middleClickPasteHelperFlag = "GO_WANT_REASONIX_MIDDLE_CLICK_PASTE_HELPER"
+	middleClickPasteHelperMode = "REASONIX_MIDDLE_CLICK_PASTE_HELPER_MODE"
+	middleClickPasteTestValue  = "REASONIX_MIDDLE_CLICK_TEST_VALUE"
+)
+
+func TestMiddleClickPasteCommandHelper(t *testing.T) {
+	if os.Getenv(middleClickPasteHelperFlag) != "1" {
+		return
+	}
+	switch os.Getenv(middleClickPasteHelperMode) {
+	case "credential":
+		if value := os.Getenv(middleClickPasteTestValue); value != "" {
+			_, _ = fmt.Fprint(os.Stdout, value)
+		} else {
+			_, _ = fmt.Fprint(os.Stdout, "filtered")
+		}
+	case "newlines":
+		_, _ = fmt.Fprint(os.Stdout, "line\n\n")
+	default:
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
 
 func TestMain(m *testing.M) {
 	old := detectTermuxTerminal
@@ -951,6 +978,78 @@ func TestApprovalChoicesPreserveDecisionSemantics(t *testing.T) {
 			}
 		})
 	}
+
+	grantable := approvalChoices(&event.Approval{
+		Kind: "recovery", Recovery: &event.RecoveryApproval{CanGrantTask: true},
+	})
+	wantGrantable := []approvalChoice{{allow: true}, {allow: true, allowForSession: true}, {}}
+	if len(grantable) != len(wantGrantable) {
+		t.Fatalf("grantable recovery choices = %d, want %d", len(grantable), len(wantGrantable))
+	}
+	for i := range grantable {
+		grantable[i].label = ""
+		if grantable[i] != wantGrantable[i] {
+			t.Fatalf("grantable recovery choice %d = %+v, want %+v", i, grantable[i], wantGrantable[i])
+		}
+	}
+	labels := approvalChoiceLabels(&event.Approval{Kind: "recovery", Recovery: &event.RecoveryApproval{
+		CanGrantTask: true, TaskGrantScope: "git push origin → feature",
+	}})
+	if len(labels) != 3 || !strings.Contains(labels[1], "git push origin → feature") {
+		t.Fatalf("grantable recovery labels = %v", labels)
+	}
+	planLabels := approvalChoiceLabels(&event.Approval{Kind: "recovery", Recovery: &event.RecoveryApproval{
+		ChangeKind: "strategy",
+	}})
+	if len(planLabels) != 2 || planLabels[0] != "Adopt the new plan and continue" || planLabels[1] != "Do not adopt; let Auto adjust" {
+		t.Fatalf("plan-change recovery labels = %v", planLabels)
+	}
+}
+
+func TestPlanChangeApprovalBannerUsesNeutralCopyAndShowsPlans(t *testing.T) {
+	m := newTestChatTUI()
+	m.width = 120
+	m.pendingApproval = &event.Approval{
+		ID: "plan-change", Tool: "todo_write", Reason: "choose the public API direction", Kind: "recovery",
+		Recovery: &event.RecoveryApproval{
+			ChangeKind: "scope", PlanBefore: "1. Keep API [in_progress]", PlanAfter: "1. Replace API [in_progress]",
+		},
+	}
+	banner := ansi.Strip(m.renderApprovalBanner())
+	for _, want := range []string{"The execution plan needs your decision", "Previous plan: 1. Keep API", "Proposed plan: 1. Replace API"} {
+		if !strings.Contains(banner, want) {
+			t.Fatalf("plan-change banner missing %q:\n%s", want, banner)
+		}
+	}
+}
+
+func TestPlanChangeApprovalStartsWithoutSelection(t *testing.T) {
+	m := newTestChatTUI()
+	m.ingestEvent(event.Event{
+		Kind: event.ApprovalRequest,
+		Approval: event.Approval{
+			ID: "plan-change", Tool: "todo_write", Kind: "recovery",
+			Recovery: &event.RecoveryApproval{ChangeKind: "strategy"},
+		},
+	})
+	if m.approvalSelection != -1 {
+		t.Fatalf("plan approval selection = %d, want no default", m.approvalSelection)
+	}
+	banner := ansi.Strip(m.renderApprovalBanner())
+	if strings.Contains(banner, "❯ 1.") || strings.Contains(banner, "❯ 2.") {
+		t.Fatalf("plan approval banner preselected a choice:\n%s", banner)
+	}
+
+	next, _ := m.handleApprovalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = next.(chatTUI)
+	if m.pendingApproval == nil {
+		t.Fatal("Enter without a selection resolved the plan decision")
+	}
+	next, _ = m.handleApprovalKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = next.(chatTUI)
+	if m.approvalSelection != 0 {
+		t.Fatalf("first navigation selected %d, want first choice", m.approvalSelection)
+	}
 }
 
 func TestApprovalArrowKeysMoveVisibleSelection(t *testing.T) {
@@ -1458,6 +1557,29 @@ func clipboardTextPasteResultFromCmd(t *testing.T, cmd tea.Cmd) clipboardTextPas
 	return clipboardTextPasteMsg{}
 }
 
+func middleClickPasteResultFromCmd(t *testing.T, cmd tea.Cmd) tea.PasteMsg {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("expected middle-click paste command")
+	}
+	msg := cmd()
+	switch msg := msg.(type) {
+	case tea.PasteMsg:
+		return msg
+	case tea.BatchMsg:
+		for _, child := range msg {
+			if child == nil {
+				continue
+			}
+			if result, ok := child().(tea.PasteMsg); ok {
+				return result
+			}
+		}
+	}
+	t.Fatalf("middle-click command returned %T, want tea.PasteMsg", msg)
+	return tea.PasteMsg{}
+}
+
 func setLocalClipboardSession(t *testing.T) {
 	t.Helper()
 	t.Setenv("SSH_CONNECTION", "")
@@ -1537,6 +1659,192 @@ func TestMouseRightClickPasteUsesCanonicalFoldedPastePath(t *testing.T) {
 	}
 	if len(m.pastedBlocks) != 1 || m.pastedBlocks[0].text != pasted {
 		t.Fatalf("right-click folded paste block = %+v", m.pastedBlocks)
+	}
+}
+
+func TestMiddleClickUsesTmuxPasteBufferInsideTmux(t *testing.T) {
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+	previousTmux := readTmuxPasteBuffer
+	previousPrimary := readPrimaryPasteSelection
+	t.Cleanup(func() {
+		readTmuxPasteBuffer = previousTmux
+		readPrimaryPasteSelection = previousPrimary
+	})
+	readTmuxPasteBuffer = func() (string, error) { return "tmux buffer", nil }
+	readPrimaryPasteSelection = func() (string, error) {
+		t.Fatal("middle-click inside tmux must not read the desktop PRIMARY selection")
+		return "", nil
+	}
+
+	msg := pasteMiddleClick()()
+	paste, ok := msg.(tea.PasteMsg)
+	if !ok || paste.Content != "tmux buffer" {
+		t.Fatalf("middle-click result = %#v, want tmux-buffer PasteMsg", msg)
+	}
+}
+
+func TestMouseMiddleClickPastesPrimarySelectionThroughCanonicalPath(t *testing.T) {
+	setLocalClipboardSession(t)
+	t.Setenv("TMUX", "")
+	previous := readPrimaryPasteSelection
+	t.Cleanup(func() { readPrimaryPasteSelection = previous })
+	readPrimaryPasteSelection = func() (string, error) { return "primary selection", nil }
+
+	m := newComposerMouseTestTUI(t, 60, 16)
+	m.input.SetValue("before ")
+	next, cmd := m.Update(tea.MouseClickMsg{Button: tea.MouseMiddle})
+	m = next.(chatTUI)
+	paste := middleClickPasteResultFromCmd(t, cmd)
+	next, _ = m.Update(paste)
+	m = next.(chatTUI)
+
+	if got := m.input.Value(); got != "before primary selection" {
+		t.Fatalf("middle-click paste produced %q, want %q", got, "before primary selection")
+	}
+}
+
+func TestMouseMiddleClickDoesNotMutateHiddenComposer(t *testing.T) {
+	setLocalClipboardSession(t)
+	t.Setenv("TMUX", "")
+	previous := readPrimaryPasteSelection
+	t.Cleanup(func() { readPrimaryPasteSelection = previous })
+	readPrimaryPasteSelection = func() (string, error) {
+		t.Fatal("middle-click with a hidden composer must not read PRIMARY")
+		return "", nil
+	}
+
+	m := newComposerMouseTestTUI(t, 60, 16)
+	m.input.SetValue("before")
+	m.pendingApproval = &event.Approval{ID: "approval", Tool: "bash", Subject: "echo hi"}
+	if !m.hideComposer() {
+		t.Fatal("test setup did not hide composer")
+	}
+
+	next, cmd := m.Update(tea.MouseClickMsg{Button: tea.MouseMiddle})
+	m = next.(chatTUI)
+	if cmd != nil {
+		t.Fatalf("hidden-composer middle-click returned command with message %#v", cmd())
+	}
+	if got := m.input.Value(); got != "before" {
+		t.Fatalf("hidden composer changed to %q", got)
+	}
+}
+
+func TestMouseMiddleClickPasteOverSSHDoesNotReadRemotePrimary(t *testing.T) {
+	t.Setenv("SSH_CONNECTION", "host 22 client 1234")
+	t.Setenv("SSH_CLIENT", "")
+	t.Setenv("SSH_TTY", "")
+	t.Setenv("TMUX", "")
+	previous := readPrimaryPasteSelection
+	t.Cleanup(func() { readPrimaryPasteSelection = previous })
+	readPrimaryPasteSelection = func() (string, error) {
+		t.Fatal("SSH middle-click must not read PRIMARY on the remote host")
+		return "", nil
+	}
+
+	m := newComposerMouseTestTUI(t, 60, 16)
+	next, cmd := m.Update(tea.MouseClickMsg{Button: tea.MouseMiddle})
+	m = next.(chatTUI)
+	result := clipboardTextPasteResultFromCmd(t, cmd)
+	if !result.remote {
+		t.Fatalf("SSH middle-click paste result = %+v, want remote hint", result)
+	}
+
+	next, _ = m.Update(result)
+	m = next.(chatTUI)
+	if got := strings.Join(m.transcript, "\n"); !strings.Contains(got, i18n.M.ClipboardTextPasteRemoteHint) {
+		t.Fatalf("SSH middle-click paste notice = %q, want %q", got, i18n.M.ClipboardTextPasteRemoteHint)
+	}
+}
+
+func TestMiddleClickUsesPrimarySelectionOutsideTmux(t *testing.T) {
+	t.Setenv("TMUX", "")
+	previousTmux := readTmuxPasteBuffer
+	previousPrimary := readPrimaryPasteSelection
+	t.Cleanup(func() {
+		readTmuxPasteBuffer = previousTmux
+		readPrimaryPasteSelection = previousPrimary
+	})
+	readTmuxPasteBuffer = func() (string, error) {
+		t.Fatal("middle-click outside tmux must not read a tmux buffer")
+		return "", nil
+	}
+	readPrimaryPasteSelection = func() (string, error) { return "primary selection", nil }
+
+	msg := pasteMiddleClick()()
+	paste, ok := msg.(tea.PasteMsg)
+	if !ok || paste.Content != "primary selection" {
+		t.Fatalf("middle-click result = %#v, want PRIMARY-selection PasteMsg", msg)
+	}
+}
+
+func TestMiddleClickTmuxReadFailureIsSilent(t *testing.T) {
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+	previous := readTmuxPasteBuffer
+	t.Cleanup(func() { readTmuxPasteBuffer = previous })
+	readTmuxPasteBuffer = func() (string, error) { return "", errors.New("no buffers") }
+
+	if msg := pasteMiddleClick()(); msg != nil {
+		t.Fatalf("failed tmux-buffer read returned %#v, want silent no-op", msg)
+	}
+}
+
+func TestMiddleClickPasteCommandsFilterRegisteredCredentials(t *testing.T) {
+	t.Setenv(middleClickPasteHelperFlag, "1")
+	t.Setenv(middleClickPasteHelperMode, "credential")
+	t.Setenv(middleClickPasteTestValue, "credential-leaked")
+	secrets.RegisterCredentialEnvKeys([]string{middleClickPasteTestValue})
+
+	previous := newPasteCommand
+	t.Cleanup(func() { newPasteCommand = previous })
+	newPasteCommand = func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command(os.Args[0], "-test.run=^TestMiddleClickPasteCommandHelper$")
+	}
+
+	for name, read := range map[string]func() (string, error){
+		"tmux":    readTmuxBuffer,
+		"primary": readPrimarySelection,
+	} {
+		t.Run(name, func(t *testing.T) {
+			text, err := read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if text != "filtered" {
+				t.Fatalf("paste helper inherited registered credential: %q", text)
+			}
+		})
+	}
+}
+
+func TestReadPrimarySelectionRequestsTextAndPreservesNewlines(t *testing.T) {
+	t.Setenv(middleClickPasteHelperFlag, "1")
+	t.Setenv(middleClickPasteHelperMode, "newlines")
+
+	previous := newPasteCommand
+	t.Cleanup(func() { newPasteCommand = previous })
+	called := false
+	newPasteCommand = func(name string, args ...string) *exec.Cmd {
+		called = true
+		if name != "wl-paste" {
+			t.Fatalf("first PRIMARY helper = %q, want wl-paste", name)
+		}
+		want := []string{"--primary", "--type", "text", "--no-newline"}
+		if !reflect.DeepEqual(args, want) {
+			t.Fatalf("wl-paste args = %q, want %q", args, want)
+		}
+		return exec.Command(os.Args[0], "-test.run=^TestMiddleClickPasteCommandHelper$")
+	}
+
+	text, err := readPrimarySelection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("PRIMARY helper was not invoked")
+	}
+	if text != "line\n\n" {
+		t.Fatalf("PRIMARY selection = %q, want trailing newlines preserved", text)
 	}
 }
 
@@ -1809,65 +2117,6 @@ func TestEffortCommandAutoClearsProviderEffort(t *testing.T) {
 	section := providerSection(string(body), "deepseek-flash")
 	if strings.Contains(section, `effort      = "`) {
 		t.Fatalf("auto should clear saved deepseek-flash effort:\n%s", section)
-	}
-}
-
-func TestAutoPlanCommandPersistsAndUpdatesController(t *testing.T) {
-	isolateUserConfig(t)
-
-	runner := &recordingTurnRunner{}
-	events := make(chan event.Event, 4)
-	ctrl := control.New(control.Options{
-		AutoPlan: "off",
-		Runner:   runner,
-		Sink: event.FuncSink(func(e event.Event) {
-			events <- e
-		}),
-	})
-	m := newTestChatTUI()
-	m.ctrl = ctrl
-
-	m.runAutoPlanCommand("/auto-plan on")
-
-	body, err := os.ReadFile(config.UserConfigPath())
-	if err != nil {
-		t.Fatalf("read saved config: %v", err)
-	}
-	if !strings.Contains(string(body), `auto_plan   = "on"`) {
-		t.Fatalf("saved config missing auto_plan=on:\n%s", body)
-	}
-	input := "实现 GitHub issue #2395：\n- 新增配置项\n- 自动判断复杂任务\n- 补测试和文档"
-	ctrl.Send(input)
-	waitForCLIEvent(t, events, event.TurnDone)
-	if len(runner.inputs) != 1 || !strings.HasPrefix(agent.StripTransientUserBlocks(runner.inputs[0]), control.PlanModeMarker) {
-		t.Fatalf("/auto-plan on should affect current controller, inputs=%q", runner.inputs)
-	}
-}
-
-func TestAutoPlanCommandWritesUserConfigNotProjectConfig(t *testing.T) {
-	isolateUserConfig(t)
-	projectPath := filepath.Join(mustGetwd(t), "reasonix.toml")
-	if err := os.WriteFile(projectPath, []byte("[agent]\nauto_plan = \"off\"\n"), 0o644); err != nil {
-		t.Fatalf("write project config: %v", err)
-	}
-
-	m := newTestChatTUI()
-	m.ctrl = control.New(control.Options{AutoPlan: "off"})
-	m.runAutoPlanCommand("/auto-plan on")
-
-	userBody, err := os.ReadFile(config.UserConfigPath())
-	if err != nil {
-		t.Fatalf("read user config: %v", err)
-	}
-	if !strings.Contains(string(userBody), `auto_plan   = "on"`) {
-		t.Fatalf("user config missing auto_plan=on:\n%s", userBody)
-	}
-	projectBody, err := os.ReadFile(projectPath)
-	if err != nil {
-		t.Fatalf("read project config: %v", err)
-	}
-	if string(projectBody) != "[agent]\nauto_plan = \"off\"\n" {
-		t.Fatalf("/auto-plan should not rewrite project config:\n%s", projectBody)
 	}
 }
 
@@ -2738,6 +2987,33 @@ func TestPasteFoldExpandOnSubmit(t *testing.T) {
 	}
 }
 
+func TestStrongResearchPromptStaysInOrdinaryMode(t *testing.T) {
+	r := &recordingTurnRunner{}
+	events := make(chan event.Event, 8)
+	ctrl := control.New(control.Options{
+		Runner: r,
+		Sink:   event.FuncSink(func(e event.Event) { events <- e }),
+	})
+	m := newTestChatTUI()
+	m.ctrl = ctrl
+	input := "持续排查这个线上卡顿直到根因明确，并验证修复"
+	m.input.SetValue(input)
+
+	model, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = model.(chatTUI)
+	waitForCLIEvent(t, events, event.TurnDone)
+
+	if len(r.inputs) != 1 || !strings.HasSuffix(r.inputs[0], input) {
+		t.Fatalf("ordinary prompt was not sent unchanged at the user boundary: %q", r.inputs)
+	}
+	if strings.Contains(r.inputs[0], "<active-goal>") || strings.Contains(r.inputs[0], "AutoResearch protocol") {
+		t.Fatalf("ordinary TUI prompt should not enter Goal or AutoResearch:\n%s", r.inputs[0])
+	}
+	if ctrl.GoalStatus() != control.GoalStatusStopped {
+		t.Fatalf("GoalStatus() = %q, want stopped", ctrl.GoalStatus())
+	}
+}
+
 func TestSlashCodeCommentSubmitStartsTurn(t *testing.T) {
 	for _, input := range []string{
 		"// explain this",
@@ -2747,9 +3023,8 @@ func TestSlashCodeCommentSubmitStartsTurn(t *testing.T) {
 			r := &recordingTurnRunner{}
 			events := make(chan event.Event, 8)
 			ctrl := control.New(control.Options{
-				AutoPlan: "off",
-				Runner:   r,
-				Sink:     event.FuncSink(func(e event.Event) { events <- e }),
+				Runner: r,
+				Sink:   event.FuncSink(func(e event.Event) { events <- e }),
 			})
 			m := newTestChatTUI()
 			m.ctrl = ctrl
@@ -2769,9 +3044,8 @@ func TestSlashCodeCommentSubmitStartsTurn(t *testing.T) {
 func TestUnknownSlashCommandDoesNotStartTurn(t *testing.T) {
 	r := &recordingTurnRunner{}
 	ctrl := control.New(control.Options{
-		AutoPlan: "off",
-		Runner:   r,
-		Sink:     event.FuncSink(func(event.Event) {}),
+		Runner: r,
+		Sink:   event.FuncSink(func(event.Event) {}),
 	})
 	m := newTestChatTUI()
 	m.ctrl = ctrl

@@ -16,6 +16,33 @@ type subagentRegistryTool struct {
 	result   string
 }
 
+type subagentCapabilityProxy struct {
+	subagentRegistryTool
+}
+
+type subagentMCPTool struct {
+	subagentRegistryTool
+	server           string
+	raw              string
+	destructive      bool
+	serverAuthorized bool
+}
+
+func (t subagentMCPTool) MCPServerName() string     { return t.server }
+func (t subagentMCPTool) MCPRawToolName() string    { return t.raw }
+func (t subagentMCPTool) MCPDestructiveHint() bool  { return t.destructive }
+func (t subagentMCPTool) MCPServerAuthorized() bool { return t.serverAuthorized }
+
+func (t subagentCapabilityProxy) ResolveCall(_ context.Context, args json.RawMessage) (tool.ResolvedCall, error) {
+	var p struct {
+		CapabilityID string `json:"capability_id"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return tool.ResolvedCall{}, err
+	}
+	return tool.ResolvedCall{DisplayName: t.Name(), CapabilityID: p.CapabilityID, ReadOnly: true, SkipExecute: true, Result: p.CapabilityID}, nil
+}
+
 func (t subagentRegistryTool) Name() string { return t.name }
 func (t subagentRegistryTool) Description() string {
 	return "Execute a command in the shell and return combined stdout/stderr."
@@ -104,6 +131,49 @@ func TestSubagentToolRegistryFiltersUnavailableToolsAndWrapsBash(t *testing.T) {
 	}
 	if _, err := bash.Execute(context.Background(), json.RawMessage(`{"command":"sleep 1","run_in_background":true}`)); err == nil || !strings.Contains(err.Error(), "background bash is unavailable in subagents") {
 		t.Fatalf("background bash should return a subagent-specific error, got %v", err)
+	}
+}
+
+func TestSubagentToolRegistryRestrictsCapabilityProxyToAllowedMCPIDs(t *testing.T) {
+	parent := tool.NewRegistry()
+	parent.Add(subagentCapabilityProxy{subagentRegistryTool{name: "use_capability", readOnly: true}})
+	allowedID := "mcp-tool:figma/search"
+
+	for _, sub := range []*tool.Registry{
+		SubagentToolRegistry(parent, []string{allowedID}),
+		ReadOnlySubagentToolRegistry(parent, []string{allowedID}),
+	} {
+		proxy, ok := sub.Get("use_capability")
+		if !ok {
+			t.Fatalf("restricted capability proxy missing: %v", sub.Names())
+		}
+		resolver, ok := proxy.(tool.CallResolver)
+		if !ok {
+			t.Fatalf("restricted proxy does not resolve calls: %T", proxy)
+		}
+		if _, err := resolver.ResolveCall(context.Background(), json.RawMessage(`{"action":"call","capability_id":"mcp-tool:figma/search"}`)); err != nil {
+			t.Fatalf("allowed capability was rejected: %v", err)
+		}
+		if _, err := resolver.ResolveCall(context.Background(), json.RawMessage(`{"action":"call","capability_id":"mcp-tool:other/delete"}`)); err == nil || !strings.Contains(err.Error(), "outside this subagent's allowed-tools") {
+			t.Fatalf("disallowed capability was not rejected: %v", err)
+		}
+		if _, err := proxy.Execute(context.Background(), json.RawMessage(`{"action":"call","capability_id":"mcp-tool:other/delete"}`)); err == nil {
+			t.Fatal("direct execution bypassed the restricted capability allowlist")
+		}
+	}
+
+	parent.Add(subagentMCPTool{
+		subagentRegistryTool: subagentRegistryTool{name: "mcp__figma__search", readOnly: true},
+		server:               "figma",
+		raw:                  "search",
+		serverAuthorized:     true,
+	})
+	direct := SubagentToolRegistry(parent, []string{"mcp__figma__search", allowedID})
+	if _, ok := direct.Get("mcp__figma__search"); !ok {
+		t.Fatalf("direct MCP tool missing: %v", direct.Names())
+	}
+	if _, ok := direct.Get("use_capability"); ok {
+		t.Fatalf("restricted proxy should not duplicate an available direct MCP tool: %v", direct.Names())
 	}
 }
 
@@ -198,7 +268,12 @@ func TestReadOnlySubagentToolRegistryAllowsOnlyReadOnlyDelegationBeforeDepthLimi
 func TestReadOnlySubagentToolRegistryIncludesMCPReadOnlyHint(t *testing.T) {
 	parent := tool.NewRegistry()
 	parent.Add(subagentRegistryTool{name: "read_file", readOnly: true})
-	parent.Add(fakeTool{name: "mcp__srv__read", readOnly: true})
+	parent.Add(subagentMCPTool{
+		subagentRegistryTool: subagentRegistryTool{name: "mcp__srv__read", readOnly: true},
+		server:               "srv",
+		raw:                  "read",
+		serverAuthorized:     true,
+	})
 
 	sub := ReadOnlySubagentToolRegistry(parent, nil)
 	if _, ok := sub.Get("mcp__srv__read"); !ok {
@@ -206,6 +281,110 @@ func TestReadOnlySubagentToolRegistryIncludesMCPReadOnlyHint(t *testing.T) {
 	}
 	if _, ok := sub.Get("read_file"); !ok {
 		t.Fatalf("a trusted read-only tool should remain; got %v", sub.Names())
+	}
+}
+
+func TestCustomProfileAllowlistRestrictsMCPTools(t *testing.T) {
+	parent := tool.NewRegistry()
+	parent.Add(subagentRegistryTool{name: "read_file", readOnly: true})
+	parent.Add(subagentRegistryTool{name: "write_file"})
+	parent.Add(subagentMCPTool{
+		subagentRegistryTool: subagentRegistryTool{name: "mcp__chrome__list_pages", readOnly: true},
+		server:               "chrome",
+		raw:                  "list_pages",
+		serverAuthorized:     true,
+	})
+	parent.Add(subagentMCPTool{
+		subagentRegistryTool: subagentRegistryTool{name: "mcp__chrome__new_page"},
+		server:               "chrome",
+		raw:                  "new_page",
+		serverAuthorized:     true,
+	})
+	parent.Add(subagentMCPTool{
+		subagentRegistryTool: subagentRegistryTool{name: "mcp__other__secret"},
+		server:               "other",
+		raw:                  "secret",
+		serverAuthorized:     false,
+	})
+
+	// A custom profile boundary is authoritative even for installed MCP tools.
+	general := SubagentToolRegistry(parent, []string{"read_file"})
+	if _, ok := general.Get("read_file"); !ok {
+		t.Fatalf("custom profile should keep allowlisted built-in; got %v", general.Names())
+	}
+	if _, ok := general.Get("write_file"); ok {
+		t.Fatalf("custom profile should not include non-allowlisted writer; got %v", general.Names())
+	}
+	for _, name := range []string{"mcp__chrome__list_pages", "mcp__chrome__new_page", "mcp__other__secret"} {
+		if _, ok := general.Get(name); ok {
+			t.Fatalf("custom profile should exclude non-allowlisted MCP %q; got %v", name, general.Names())
+		}
+	}
+
+	explicit := SubagentToolRegistry(parent, []string{"mcp__chrome__*"})
+	for _, name := range []string{"mcp__chrome__list_pages", "mcp__chrome__new_page"} {
+		if _, ok := explicit.Get(name); !ok {
+			t.Fatalf("explicit MCP wildcard should include %q; got %v", name, explicit.Names())
+		}
+	}
+
+	ro := ReadOnlySubagentToolRegistry(parent, []string{"read_file"})
+	if _, ok := ro.Get("mcp__chrome__list_pages"); ok {
+		t.Fatalf("read-only custom profile should exclude non-allowlisted MCP; got %v", ro.Names())
+	}
+	if _, ok := ro.Get("mcp__chrome__new_page"); ok {
+		t.Fatalf("read-only subagent must not inherit writer MCP; got %v", ro.Names())
+	}
+
+	explicitRO := ReadOnlySubagentToolRegistry(parent, []string{"mcp__chrome__*"})
+	if _, ok := explicitRO.Get("mcp__chrome__list_pages"); !ok {
+		t.Fatalf("read-only MCP wildcard should include the authorized reader; got %v", explicitRO.Names())
+	}
+	if _, ok := explicitRO.Get("mcp__chrome__new_page"); ok {
+		t.Fatalf("read-only MCP wildcard must still exclude writers; got %v", explicitRO.Names())
+	}
+}
+
+func TestMCPToolAvailabilityAcrossGeneralAndReadOnlySubagents(t *testing.T) {
+	tests := []struct {
+		name               string
+		readOnly           bool
+		destructive        bool
+		authorized         bool
+		wantGeneral        bool
+		wantStrictReadOnly bool
+	}{
+		{name: "authorized reader", readOnly: true, authorized: true, wantGeneral: true, wantStrictReadOnly: true},
+		{name: "authorized writer", authorized: true, wantGeneral: true},
+		{name: "authorized destructive reader", readOnly: true, destructive: true, authorized: true, wantGeneral: true},
+		{name: "unauthorized reader", readOnly: true, wantGeneral: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const name = "mcp__srv__tool"
+			parent := tool.NewRegistry()
+			parent.Add(subagentMCPTool{
+				subagentRegistryTool: subagentRegistryTool{name: name, readOnly: tc.readOnly},
+				server:               "srv",
+				raw:                  "tool",
+				destructive:          tc.destructive,
+				serverAuthorized:     tc.authorized,
+			})
+
+			_, gotGeneral := SubagentToolRegistry(parent, nil).Get(name)
+			if gotGeneral != tc.wantGeneral {
+				t.Fatalf("general subagent availability = %v, want %v", gotGeneral, tc.wantGeneral)
+			}
+			_, gotStrictReadOnly := ReadOnlySubagentToolRegistry(parent, nil).Get(name)
+			if gotStrictReadOnly != tc.wantStrictReadOnly {
+				t.Fatalf("read-only subagent availability = %v, want %v", gotStrictReadOnly, tc.wantStrictReadOnly)
+			}
+			_, gotPlanner := FilterReadOnlyRegistry(parent).Get(name)
+			if gotPlanner != tc.wantStrictReadOnly {
+				t.Fatalf("planner availability = %v, want %v", gotPlanner, tc.wantStrictReadOnly)
+			}
+		})
 	}
 }
 

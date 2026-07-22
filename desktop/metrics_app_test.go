@@ -9,7 +9,21 @@ import (
 	"reasonix/internal/config"
 	"reasonix/internal/event"
 	"reasonix/internal/provider"
+	"reasonix/internal/recovery"
 )
+
+type recoveryMetricsDeltaStub struct {
+	deltas []recovery.Metrics
+}
+
+func (s *recoveryMetricsDeltaStub) DrainRecoveryMetrics() recovery.Metrics {
+	if len(s.deltas) == 0 {
+		return recovery.Metrics{}
+	}
+	next := s.deltas[0]
+	s.deltas = s.deltas[1:]
+	return next
+}
 
 func TestObserveClassifiesEvents(t *testing.T) {
 	m := newMetricsAggregator(t.TempDir())
@@ -44,6 +58,27 @@ func TestObserveClassifiesEvents(t *testing.T) {
 	}
 }
 
+func TestObserveControllerRecoveryMetricsConsumesOnlyNewDelta(t *testing.T) {
+	m := newMetricsAggregator(t.TempDir())
+	ctrl := &recoveryMetricsDeltaStub{deltas: []recovery.Metrics{
+		{FailureEvents: 1, HumanPrompts: 1, ReviewLatencyMsSum: 750, ReviewLatencyCount: 1},
+		{},
+	}}
+
+	observeControllerRecoveryMetrics(m, ctrl)
+	observeControllerRecoveryMetrics(m, ctrl)
+
+	if got := m.c["recovery_failure"]["total"]; got != 1 {
+		t.Fatalf("recovery_failure/total = %d, want 1", got)
+	}
+	if got := m.c["recovery_human_prompt"]["total"]; got != 1 {
+		t.Fatalf("recovery_human_prompt/total = %d, want 1", got)
+	}
+	if got := m.c["recovery_review_latency"]["lt_2s"]; got != 1 {
+		t.Fatalf("recovery_review_latency/lt_2s = %d, want 1", got)
+	}
+}
+
 func TestObserveReadsNoMessageText(t *testing.T) {
 	m := newMetricsAggregator(t.TempDir())
 	// A notice that merely mentions the phrase mid-string must not count.
@@ -69,9 +104,6 @@ func TestObserveSettingsSnapshotUsesSafeBuckets(t *testing.T) {
 	}
 	if err := cfg.SetDesktopDisplayMode("compact"); err != nil {
 		t.Fatalf("SetDesktopDisplayMode: %v", err)
-	}
-	if err := cfg.SetAutoPlan("on"); err != nil {
-		t.Fatalf("SetAutoPlan: %v", err)
 	}
 	if err := cfg.SetDesktopStatusBarStyle("icon"); err != nil {
 		t.Fatalf("SetDesktopStatusBarStyle: %v", err)
@@ -112,7 +144,6 @@ func TestObserveSettingsSnapshotUsesSafeBuckets(t *testing.T) {
 		"settings_theme_style":             "graphite",
 		"settings_close_behavior":          "quit",
 		"settings_display_mode":            "compact",
-		"settings_auto_plan":               "on",
 		"settings_status_bar_style":        "icon",
 		"settings_status_bar_items_count":  "n_3",
 		"settings_check_updates":           "off",

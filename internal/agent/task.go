@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -121,6 +122,11 @@ func SubagentToolRegistry(parent *tool.Registry, names []string) *tool.Registry 
 // SubagentToolRegistryForDepth returns the writer-capable tool set for a spawned
 // subagent at childDepth. Recursive delegation tools are available only when the
 // child still has room to spawn one more subagent.
+//
+// With no explicit allowlist, installed MCP tools follow the parent registry so
+// ordinary and background subagents inherit the same zero-config MCP surface.
+// An explicit profile/call allowlist remains authoritative and may select MCP
+// tools by exact name or wildcard just like built-ins.
 func SubagentToolRegistryForDepth(parent *tool.Registry, names []string, childDepth, maxDepth int) *tool.Registry {
 	exclude := append([]string(nil), subagentAlwaysHiddenTools...)
 	if childDepth >= NormalizeMaxSubagentDepth(maxDepth) {
@@ -244,6 +250,9 @@ type TaskTool struct {
 	// bashSandboxEnforced reports whether OS sandbox can honour write roots
 	// for bash inside path-bound writer sub-agents.
 	bashSandboxEnforced func() bool
+	// recoveryGate is the shared Auto Guard boundary for
+	// this session (root + sub-agents). nil disables recovery in children.
+	recoveryGate RecoveryGate
 }
 
 // NewTaskTool wires a task tool to the parent agent's environment so its
@@ -514,7 +523,7 @@ func (r *ReadOnlyTaskTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if err != nil {
 		return "", fmt.Errorf("read-only sub-agent profile: %w", err)
 	}
-	answer, err := r.task.runReadOnlySubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, NewSession(DefaultReadOnlyTaskSystemPrompt), childDepth)
+	answer, err := r.task.runReadOnlySubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, NewSession(DefaultReadOnlyTaskSystemPrompt), childDepth, subagentRecoveryTaskID(ctx, ""))
 	if err != nil {
 		return "", err
 	}
@@ -749,10 +758,11 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 	}
 
 	runSession := func(runCtx context.Context, sink event.Sink) (string, error) {
+		recoveryTaskID := subagentRecoveryTaskID(runCtx, run.Ref)
 		if spec.ReadOnly {
-			return t.runReadOnlySubSession(runCtx, spec.Prompt, subReg, sink, maxSteps, prov, pricing, ctxWin, run.Session, childDepth)
+			return t.runReadOnlySubSession(runCtx, spec.Prompt, subReg, sink, maxSteps, prov, pricing, ctxWin, run.Session, childDepth, recoveryTaskID)
 		}
-		return t.runSubSession(runCtx, spec.Prompt, subReg, sink, maxSteps, prov, pricing, ctxWin, run.Session, childDepth)
+		return t.runSubSession(runCtx, spec.Prompt, subReg, sink, maxSteps, prov, pricing, ctxWin, run.Session, childDepth, recoveryTaskID)
 	}
 
 	if spec.RunInBackground {
@@ -972,8 +982,9 @@ func FilterRegistry(parent *tool.Registry, names []string, exclude ...string) *t
 	for _, e := range exclude {
 		ex[e] = true
 	}
+	customAllowlist := len(names) > 0
 	src := names
-	if len(src) == 0 {
+	if !customAllowlist {
 		src = parent.Names()
 	} else {
 		src = expandToolPatterns(parent, src)
@@ -982,11 +993,103 @@ func FilterRegistry(parent *tool.Registry, names []string, exclude ...string) *t
 		if ex[name] {
 			continue
 		}
-		if tl, ok := parent.Get(name); ok {
-			sub.Add(tl)
+		tl, ok := parent.Get(name)
+		if !ok {
+			continue
+		}
+		sub.Add(tl)
+	}
+	addRestrictedCapabilityProxy(parent, sub, names, ex, false)
+	return sub
+}
+
+// restrictedCapabilityProxy preserves a subagent allowed-tools boundary when
+// an MCP tool is available only through use_capability. The pseudo
+// mcp-tool:<server>/<raw> entries never become provider tools themselves; they
+// select one proxy schema whose resolver rejects every capability outside the
+// exact allowlist.
+type restrictedCapabilityProxy struct {
+	tool.Tool
+	resolver tool.CallResolver
+	allowed  map[string]bool
+	ids      []string
+}
+
+func (t *restrictedCapabilityProxy) Description() string {
+	base := strings.TrimSpace(t.Tool.Description())
+	if base != "" {
+		base += " "
+	}
+	return base + "This subagent is restricted to capability IDs: " + strings.Join(t.ids, ", ") + "."
+}
+
+func (t *restrictedCapabilityProxy) check(args json.RawMessage) error {
+	var p struct {
+		CapabilityID string `json:"capability_id"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return fmt.Errorf("invalid args: %w", err)
+	}
+	id := strings.TrimSpace(p.CapabilityID)
+	if id == "" {
+		return fmt.Errorf("capability_id is required")
+	}
+	if !t.allowed[id] {
+		return fmt.Errorf("capability %q is outside this subagent's allowed-tools", id)
+	}
+	return nil
+}
+
+func (t *restrictedCapabilityProxy) ResolveCall(ctx context.Context, args json.RawMessage) (tool.ResolvedCall, error) {
+	if err := t.check(args); err != nil {
+		return tool.ResolvedCall{}, err
+	}
+	return t.resolver.ResolveCall(ctx, args)
+}
+
+func (t *restrictedCapabilityProxy) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	if err := t.check(args); err != nil {
+		return "", err
+	}
+	return t.Tool.Execute(ctx, args)
+}
+
+func addRestrictedCapabilityProxy(parent, sub *tool.Registry, names []string, excluded map[string]bool, requireReadOnly bool) {
+	if parent == nil || sub == nil || excluded["use_capability"] {
+		return
+	}
+	if _, ok := sub.Get("use_capability"); ok {
+		// An explicit name or wildcard already granted the ordinary proxy.
+		return
+	}
+	direct := map[string]bool{}
+	for _, binding := range parent.MCPBindings() {
+		direct[binding.CapabilityID] = true
+	}
+	allowed := map[string]bool{}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if strings.HasPrefix(name, "mcp-tool:") && !direct[name] {
+			allowed[name] = true
 		}
 	}
-	return sub
+	if len(allowed) == 0 {
+		return
+	}
+	inner, ok := parent.Get("use_capability")
+	if !ok || requireReadOnly && (!inner.ReadOnly() || mcpDestructiveHint(inner)) {
+		return
+	}
+	resolver, ok := inner.(tool.CallResolver)
+	if !ok {
+		return
+	}
+	ids := make([]string, 0, len(allowed))
+	for id := range allowed {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	sub.Add(&restrictedCapabilityProxy{Tool: inner, resolver: resolver, allowed: allowed, ids: ids})
 }
 
 var plannerNonResearchTools = []string{
@@ -1017,7 +1120,14 @@ func ReadOnlySubagentToolRegistry(parent *tool.Registry, names []string) *tool.R
 
 // ReadOnlySubagentToolRegistryForDepth returns the tool set exposed to read-only
 // subagents. It permits only read-only delegation tools while another depth
-// layer is available.
+// layer is available. MCP tools must additionally come from an authorized
+// server, declare readOnly, and must not carry destructiveHint. Writer and
+// destructive MCP tools are omitted from the provider schema entirely.
+//
+// With no explicit allowlist, strict agents inherit every authorized read-only,
+// non-destructive MCP tool from the parent. Custom profile/call allowlists remain
+// authoritative and may select the permitted MCP readers explicitly or by
+// wildcard.
 func ReadOnlySubagentToolRegistryForDepth(parent *tool.Registry, names []string, childDepth, maxDepth int) *tool.Registry {
 	exclude := append([]string(nil), subagentAlwaysHiddenTools...)
 	if childDepth >= NormalizeMaxSubagentDepth(maxDepth) {
@@ -1054,14 +1164,19 @@ func ReadOnlySubagentToolRegistryForDepth(parent *tool.Registry, names []string,
 			sub.Add(readOnlyBash{inner: tl})
 			continue
 		}
-		if !tl.ReadOnly() {
+		if isInstalledMCPTool(tl) {
+			if !mcpServerAuthorized(tl) || !tl.ReadOnly() || mcpDestructiveHint(tl) {
+				continue
+			}
+			sub.Add(tl)
 			continue
 		}
-		if u, ok := tl.(tool.PlanModeUntrustedReadOnly); ok && u.PlanModeUntrustedReadOnly() {
+		if !tl.ReadOnly() {
 			continue
 		}
 		sub.Add(tl)
 	}
+	addRestrictedCapabilityProxy(parent, sub, names, ex, true)
 	return sub
 }
 
@@ -1095,7 +1210,9 @@ func expandToolPatterns(parent *tool.Registry, names []string) []string {
 }
 
 // FilterReadOnlyRegistry builds a sub-registry containing only tools whose
-// ReadOnly contract is true, minus explicit exclusions.
+// ReadOnly contract is true, minus explicit exclusions. MCP tools must
+// additionally come from an authorized server and must not carry
+// destructiveHint.
 func FilterReadOnlyRegistry(parent *tool.Registry, exclude ...string) *tool.Registry {
 	ex := make(map[string]bool, len(exclude))
 	for _, e := range exclude {
@@ -1113,7 +1230,7 @@ func FilterReadOnlyRegistry(parent *tool.Registry, exclude ...string) *tool.Regi
 		if !ok || !tl.ReadOnly() {
 			continue
 		}
-		if u, ok := tl.(tool.PlanModeUntrustedReadOnly); ok && u.PlanModeUntrustedReadOnly() {
+		if isInstalledMCPTool(tl) && (!mcpServerAuthorized(tl) || mcpDestructiveHint(tl)) {
 			continue
 		}
 		sub.Add(tl)
@@ -1133,8 +1250,8 @@ func (t *TaskTool) resolveSubSessionRuntime(modelRef, effort string) (provider.P
 	return prov, pricing, ctxWin, nil
 }
 
-func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int) (string, error) {
-	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth)
+func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int, recoveryTaskID string) (string, error) {
+	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID)
 	// Capture the pristine task before host framing is prepended: delivery
 	// intent classification must judge the task, not the wrapper.
 	opts.ClassifierTaskText = prompt
@@ -1142,8 +1259,8 @@ func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *too
 	return RunSubAgentWithSession(ctx, prov, subReg, sess, prompt, opts, sink)
 }
 
-func (t *TaskTool) runReadOnlySubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int) (string, error) {
-	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth)
+func (t *TaskTool) runReadOnlySubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int, recoveryTaskID string) (string, error) {
+	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID)
 	// Capture the pristine task before host framing is prepended: delivery
 	// intent classification must judge the task, not the wrapper.
 	opts.ClassifierTaskText = prompt
@@ -1155,7 +1272,7 @@ func (t *TaskTool) runReadOnlySubSession(ctx context.Context, prompt string, sub
 // sub-agent spawned through this tool shares (task, read_only_task, and
 // parallel_tasks children). Compaction, language preferences, and depth limits
 // must stay uniform across those paths — add new fields here, not at call sites.
-func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *provider.Pricing, ctxWin, childDepth int) Options {
+func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *provider.Pricing, ctxWin, childDepth int, recoveryTaskID string) Options {
 	return Options{
 		MaxSteps:            maxSteps,
 		Temperature:         t.temperature,
@@ -1176,7 +1293,29 @@ func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *p
 		MaxSubagentDepth:    t.maxDepth(),
 		DeliveryProfile:     t.deliveryProfile,
 		WorkspaceLease:      t.workspaceLease,
+		RecoveryGate:        t.recoveryGate,
+		RecoveryAgentID:     "subagent",
+		RecoveryTaskID:      recoveryTaskID,
 	}
+}
+
+func subagentRecoveryTaskID(ctx context.Context, ref string) string {
+	if ref = strings.TrimSpace(ref); ref != "" {
+		return "subagent:" + ref
+	}
+	if callID, _, _, ok := CallContext(ctx); ok && strings.TrimSpace(callID) != "" {
+		return "subagent:" + strings.TrimSpace(callID)
+	}
+	return "subagent"
+}
+
+// WithRecoveryGate shares Auto Guard with spawned sub-agents.
+func (t *TaskTool) WithRecoveryGate(g RecoveryGate) *TaskTool {
+	if t == nil {
+		return nil
+	}
+	t.recoveryGate = g
+	return t
 }
 
 func (t *TaskTool) withWorkspaceContext(prompt string) string {
@@ -1358,8 +1497,8 @@ func RunReadOnlySubAgentWithSession(ctx context.Context, prov provider.Provider,
 // strictReadOnlyExecutionRegistry is the final construction-time filter shared
 // by every strict child. Callers still apply role-specific filtering (review,
 // planner, profile allowlists), while this layer guarantees that a missed call
-// site cannot expose writers, destructive MCP tools, untrusted readers, or an
-// untrusted host-starting target to the model.
+// site cannot expose writers, destructive MCP tools, readers from unauthorized
+// servers, or an unauthorized host-starting target to the model.
 func strictReadOnlyExecutionRegistry(reg *tool.Registry) *tool.Registry {
 	filtered := tool.NewRegistry()
 	if reg == nil {
@@ -1367,18 +1506,13 @@ func strictReadOnlyExecutionRegistry(reg *tool.Registry) *tool.Registry {
 	}
 	for _, name := range reg.Names() {
 		target, ok := reg.Get(name)
-		if !ok || !target.ReadOnly() || planModeUntrustedReadOnly(target) || mcpDestructiveHint(target) {
+		if !ok || !target.ReadOnly() || mcpDestructiveHint(target) {
 			continue
 		}
-		// An installed MCP reader needs a positive trust authority (receipts),
-		// not a server hint carried through the no-TrustManager compatibility
-		// path: strict children fail closed without a trust store.
-		if isInstalledMCPTool(target) {
-			if authority, ok := target.(tool.ReadOnlyExecutionTrustAuthority); !ok || !authority.ReadOnlyExecutionTrustAuthority() {
-				continue
-			}
+		if isInstalledMCPTool(target) && !mcpServerAuthorized(target) {
+			continue
 		}
-		if mutation, ok := target.(tool.ReadOnlyExecutionHostMutation); ok && mutation.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsTrustedMCPStartup(target) {
+		if mutation, ok := target.(tool.ReadOnlyExecutionHostMutation); ok && mutation.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsMCPStartup(target) {
 			continue
 		}
 		filtered.Add(target)

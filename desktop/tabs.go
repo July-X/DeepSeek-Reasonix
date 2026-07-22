@@ -29,6 +29,7 @@ import (
 	"reasonix/internal/fileutil"
 	"reasonix/internal/notify"
 	"reasonix/internal/provider"
+	"reasonix/internal/remote/workbench/target"
 	"reasonix/internal/store"
 	"reasonix/internal/worktree"
 )
@@ -1106,7 +1107,7 @@ func (t *WorkspaceTab) takeDisplayTurn(cancelled bool) []HistoryMessage {
 				Role:    "notice",
 				Level:   "info",
 				Code:    event.NoticeCodeCancelledTurn,
-				Content: "This turn was interrupted. Partial output is kept for reference but is not included in the model's next-turn history; inspect the workspace before continuing or reverting changes.",
+				Content: "This turn was interrupted. Partial output is kept for reference; only completed tool pairs and a bounded recovery summary enter the next model turn. Inspect the workspace before continuing or reverting changes.",
 			})
 		}
 	}
@@ -1244,6 +1245,10 @@ func (s *tabEventSink) Emit(e event.Event) {
 		if m := app.metrics.Load(); m != nil {
 			m.observe(e)
 			if e.Kind == event.TurnDone {
+				// Content-free recovery counters only (no failure text).
+				if tab := app.tabByID(tabID); tab != nil && tab.Ctrl != nil {
+					observeControllerRecoveryMetrics(m, tab.Ctrl)
+				}
 				m.persist()
 			}
 		}
@@ -1548,10 +1553,10 @@ func (a *App) emitReady(ctx context.Context, tabID ...string) {
 	}
 	if ctx != nil {
 		if len(tabID) > 0 && strings.TrimSpace(tabID[0]) != "" {
-			runtime.EventsEmit(ctx, "agent:ready", strings.TrimSpace(tabID[0]))
+			a.runtimeEvents.Emit(ctx, "agent:ready", strings.TrimSpace(tabID[0]))
 			return
 		}
-		runtime.EventsEmit(ctx, "agent:ready")
+		a.runtimeEvents.Emit(ctx, "agent:ready")
 	}
 }
 
@@ -1675,7 +1680,7 @@ func (s *tabEventSink) flushDisplay(cancelRequested bool) {
 		return
 	}
 	history := ctrl.History()
-	keepExecutorDisplay := cancelRequested && len(history) > 0 && history[len(history)-1].Role == provider.RoleUser
+	keepExecutorDisplay := cancelRequested && (lastHistoryMessageIsUser(history) || hasPendingInterruptedRecovery(history))
 	messages := tab.takeDisplayTurn(keepExecutorDisplay)
 	if len(messages) == 0 {
 		return
@@ -1695,6 +1700,23 @@ func (s *tabEventSink) flushDisplay(cancelRequested bool) {
 		messages:    messages,
 		persist:     recordSessionPlannerDisplay,
 	})
+}
+
+func lastHistoryMessageIsUser(history []provider.Message) bool {
+	return len(history) > 0 && history[len(history)-1].Role == provider.RoleUser
+}
+
+func hasPendingInterruptedRecovery(history []provider.Message) bool {
+	for i := len(history) - 1; i >= 0; i-- {
+		m := history[i]
+		if m.LocalOnly && m.InterruptedTurn != nil {
+			return m.InterruptedTurn.Pending
+		}
+		if m.Role == provider.RoleUser {
+			return false
+		}
+	}
+	return false
 }
 
 func (s *tabEventSink) eventTabAndController() (*WorkspaceTab, control.SessionAPI) {
@@ -1896,7 +1918,7 @@ func (a *App) ListTabs() []TabMeta {
 	}
 	a.mu.RUnlock()
 	if !needsRepair {
-		return enrichTabMetas(out)
+		return a.workbenchProjectTabMetas(enrichTabMetas(out))
 	}
 
 	a.mu.Lock()
@@ -1907,7 +1929,7 @@ func (a *App) ListTabs() []TabMeta {
 		}
 	}
 	a.mu.Unlock()
-	return enrichTabMetas(out)
+	return a.workbenchProjectTabMetas(enrichTabMetas(out))
 }
 
 // syncTabWorkspaceRootSpellings repoints open project tabs at the registry's
@@ -1950,6 +1972,12 @@ func (a *App) registerProjectRoot(workspaceRoot string) {
 // session selected by the given topic. Topic selection resolves to a concrete
 // session path first; the visible tab is then attached to that session runtime.
 func (a *App) OpenProjectTab(workspaceRoot, topicID string) (TabMeta, error) {
+	return a.withWorkbenchLocalNavigation(func() (TabMeta, error) {
+		return a.openProjectTab(workspaceRoot, topicID)
+	})
+}
+
+func (a *App) openProjectTab(workspaceRoot, topicID string) (TabMeta, error) {
 	if workspaceRoot == "" {
 		return TabMeta{}, fmt.Errorf("workspaceRoot is required")
 	}
@@ -2084,6 +2112,12 @@ func (a *App) openTopicTabWithActivation(scope, workspaceRoot, topicID, sessionP
 // OpenGlobalTab opens a new global-scope tab (no project root). The global
 // workspace root is the reasonix user config directory.
 func (a *App) OpenGlobalTab(topicID string) (TabMeta, error) {
+	return a.withWorkbenchLocalNavigation(func() (TabMeta, error) {
+		return a.openGlobalTab(topicID)
+	})
+}
+
+func (a *App) openGlobalTab(topicID string) (TabMeta, error) {
 	globalRoot := globalWorkspaceRoot()
 	if err := os.MkdirAll(globalRoot, 0o755); err != nil {
 		return TabMeta{}, fmt.Errorf("create global workspace: %w", err)
@@ -2097,6 +2131,12 @@ func (a *App) OpenGlobalTab(topicID string) (TabMeta, error) {
 // OpenProjectTab/OpenGlobalTab, it does not resolve the topic to the latest
 // session first; sessionPath is the runtime identity being selected.
 func (a *App) OpenTopicSession(scope, workspaceRoot, topicID, sessionPath string) (TabMeta, error) {
+	return a.withWorkbenchLocalNavigation(func() (TabMeta, error) {
+		return a.openTopicSession(scope, workspaceRoot, topicID, sessionPath)
+	})
+}
+
+func (a *App) openTopicSession(scope, workspaceRoot, topicID, sessionPath string) (TabMeta, error) {
 	scope = strings.TrimSpace(scope)
 	if scope != "project" {
 		scope = "global"
@@ -2122,29 +2162,33 @@ func (a *App) OpenTopicSession(scope, workspaceRoot, topicID, sessionPath string
 // the classic tab path, then prunes every non-active visible tab so historical
 // clicks do not accumulate hidden startup work.
 func (a *App) ActivateTopic(scope, workspaceRoot, topicID, sessionPath string) (TabMeta, error) {
-	a.singleSurfaceMu.Lock()
-	defer a.singleSurfaceMu.Unlock()
+	return a.withWorkbenchLocalNavigation(func() (TabMeta, error) {
+		a.singleSurfaceMu.Lock()
+		defer a.singleSurfaceMu.Unlock()
 
-	var meta TabMeta
-	var err error
-	if strings.TrimSpace(sessionPath) != "" {
-		meta, err = a.OpenTopicSession(scope, workspaceRoot, topicID, sessionPath)
-	} else if strings.TrimSpace(scope) == "project" {
-		meta, err = a.OpenProjectTab(workspaceRoot, topicID)
-	} else {
-		meta, err = a.OpenGlobalTab(topicID)
-	}
-	if err != nil {
-		return TabMeta{}, err
-	}
-	return a.keepOnlyVisibleTab(meta.ID)
+		var meta TabMeta
+		var err error
+		if strings.TrimSpace(sessionPath) != "" {
+			meta, err = a.openTopicSession(scope, workspaceRoot, topicID, sessionPath)
+		} else if strings.TrimSpace(scope) == "project" {
+			meta, err = a.openProjectTab(workspaceRoot, topicID)
+		} else {
+			meta, err = a.openGlobalTab(topicID)
+		}
+		if err != nil {
+			return TabMeta{}, err
+		}
+		return a.keepOnlyVisibleTab(meta.ID)
+	})
 }
 
 // EnsureBlankSurface mirrors EnsureBlankTab for no-tab-strip layouts: after
 // creating or reusing a blank session, it removes other visible tabs while
 // preserving running runtimes as detached background sessions.
 func (a *App) EnsureBlankSurface(scope, workspaceRoot string) (TabMeta, error) {
-	return a.ensureBlankSurface(scope, workspaceRoot, "")
+	return a.withWorkbenchLocalNavigation(func() (TabMeta, error) {
+		return a.ensureBlankSurface(scope, workspaceRoot, "")
+	})
 }
 
 func (a *App) ensureBlankSurface(scope, workspaceRoot, tokenMode string) (TabMeta, error) {
@@ -2178,7 +2222,9 @@ func tabInWorkspace(tab *WorkspaceTab, workspaceRoot string) bool {
 // creates one if none exists. Reusing a blank tab keeps repeated "new session"
 // clicks from piling up empty conversations.
 func (a *App) EnsureBlankTab(scope, workspaceRoot string) (TabMeta, error) {
-	return a.ensureBlankTab(scope, workspaceRoot, "")
+	return a.withWorkbenchLocalNavigation(func() (TabMeta, error) {
+		return a.ensureBlankTab(scope, workspaceRoot, "")
+	})
 }
 
 func (a *App) ensureBlankTab(scope, workspaceRoot, forcedTokenMode string) (TabMeta, error) {
@@ -2382,6 +2428,9 @@ func createEmptySessionFile(dir, model string) (string, error) {
 			if closeErr := f.Close(); closeErr != nil {
 				return "", closeErr
 			}
+			// Ensure branch meta exists for topic ownership; Auto Guard no longer
+			// stores a per-session toggle (it is built into Auto).
+			_, _ = agent.EnsureBranchMeta(path)
 			return path, nil
 		}
 		if os.IsExist(err) {
@@ -2535,7 +2584,6 @@ func (a *App) indexedBlankTopicIDLocked(scope, workspaceRoot string) string {
 func (a *App) SetActiveTab(tabID string) error {
 	a.mu.RLock()
 	_, ok := a.tabs[tabID]
-	active := a.tabs[a.activeTabID]
 	alreadyActive := a.activeTabID == tabID
 	a.mu.RUnlock()
 	if !ok {
@@ -2544,7 +2592,34 @@ func (a *App) SetActiveTab(tabID string) error {
 	if alreadyActive {
 		return nil
 	}
+	k := a.workbench()
+	k.transitionMu.Lock()
+	defer k.transitionMu.Unlock()
+
+	// Re-check after fencing Remote activation. Framework hydration may repeat a
+	// same-tab SetActiveTab call; that is not a user request to leave Remote.
+	a.mu.RLock()
+	_, ok = a.tabs[tabID]
+	active := a.tabs[a.activeTabID]
+	alreadyActive = a.activeTabID == tabID
+	a.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("tab %q not found", tabID)
+	}
+	if alreadyActive {
+		return nil
+	}
+	activeTarget, _, _ := k.targets.Active()
+	switched := activeTarget.Kind == target.KindRemote
+	var targetID target.Identity
+	var targetGen, targetSeq uint64
+	if switched {
+		targetID, targetGen, targetSeq = k.targets.SwitchLocal()
+	}
 	if err := a.snapshotTabForAction(active, "switching tabs"); err != nil {
+		if switched {
+			a.emitWorkbenchTarget("disconnected", targetID, targetGen, targetSeq, "")
+		}
 		return err
 	}
 
@@ -2564,6 +2639,11 @@ func (a *App) SetActiveTab(tabID string) error {
 	// I/O outside the lock — disk writes can block for hundreds of ms on
 	// Windows when antivirus or the search indexer briefly locks the file.
 	a.saveTabsWrite(dir, entries, activeID, version)
+	if switched {
+		a.emitWorkbenchTarget("disconnected", targetID, targetGen, targetSeq, "")
+		a.emitReady(a.ctx, tabID)
+		a.emitRuntimeEvent("runtime:rebuilt", tabID)
+	}
 	return nil
 }
 
@@ -2596,8 +2676,12 @@ func (a *App) ReorderTabs(tabIDs []string) error {
 // background work, the controller is detached so closing a view does not destroy
 // the session runtime.
 func (a *App) CloseTab(tabID string) error {
+	defer a.lockRuntimeMutation("close-tab")()
 	a.sessionRemovalMu.Lock()
 	defer a.sessionRemovalMu.Unlock()
+	// The runtime mutation barrier is acquired before sessionRemovalMu. This waits
+	// for a turn whose admission is already in progress, blocks later turns/builds,
+	// and leaves the tab visible until an earlier MCP Host-wide gate completes.
 
 	a.mu.Lock()
 	tab, ok := a.tabs[tabID]
@@ -2673,7 +2757,8 @@ func (a *App) CloseTab(tabID string) error {
 	closeSink := tab.sink
 	a.mu.Unlock()
 
-	// Tear down outside the lock.
+	// Tear down outside App.mu while retaining the lifecycle barrier acquired
+	// before the tab binding was removed.
 	discardPath, discardTransientBlank := a.transientBlankSessionArtifactPath(tab)
 	if closeCtrl != nil {
 		if controllerHasActiveRuntimeWork(closeCtrl) && a.detachSessionRuntime(tab) {
@@ -2712,6 +2797,7 @@ func (a *App) keepOnlyVisibleTab(tabID string) (TabMeta, error) {
 	// project-tree event stays outside so a listener can never re-enter a
 	// removal path while the lock is held.
 	meta, err := func() (TabMeta, error) {
+		defer a.lockRuntimeMutation("prune-visible-tabs")()
 		a.sessionRemovalMu.Lock()
 		defer a.sessionRemovalMu.Unlock()
 
@@ -2779,7 +2865,7 @@ func (a *App) keepOnlyVisibleTab(tabID string) (TabMeta, error) {
 		a.mu.Unlock()
 
 		for _, tab := range removed {
-			a.removeVisibleTabRuntime(tab)
+			a.removeVisibleTabRuntimeAdmissionHeld(tab)
 		}
 		return meta, nil
 	}()
@@ -2818,7 +2904,7 @@ func (a *App) applySingleSurfaceTabPolicy() error {
 	return err
 }
 
-func (a *App) removeVisibleTabRuntime(tab *WorkspaceTab) {
+func (a *App) removeVisibleTabRuntimeAdmissionHeld(tab *WorkspaceTab) {
 	if tab == nil {
 		return
 	}
@@ -2833,7 +2919,7 @@ func (a *App) removeVisibleTabRuntime(tab *WorkspaceTab) {
 		return
 	}
 	a.markTabRemoved(tab)
-	a.closeTabRuntime(tab)
+	a.closeTabRuntimeAdmissionHeld(tab)
 	if discardTransientBlank {
 		discardTransientBlankSessionArtifacts(discardPath)
 	}
@@ -2964,7 +3050,7 @@ func (a *App) clearTabBuildCancel(tab *WorkspaceTab, generation uint64, cancel c
 	a.mu.Unlock()
 }
 
-func (a *App) closeTabRuntime(tab *WorkspaceTab) {
+func (a *App) closeTabRuntimeAdmissionHeld(tab *WorkspaceTab) {
 	if tab == nil {
 		return
 	}
@@ -3011,6 +3097,10 @@ func (a *App) buildTabController(tab *WorkspaceTab) {
 	a.buildTabControllerWithLoadedSession(tab, loadedTabSession{})
 }
 
+func (a *App) buildTabControllerAdmissionHeld(tab *WorkspaceTab) {
+	a.buildTabControllerWithLoadedSessionAdmissionHeld(tab, loadedTabSession{})
+}
+
 type loadedTabSession struct {
 	Path    string
 	Session *agent.Session
@@ -3022,6 +3112,10 @@ func (s loadedTabSession) matches(path string) bool {
 
 func (a *App) buildTabControllerWithLoadedSession(tab *WorkspaceTab, loadedSession loadedTabSession) {
 	a.buildTabControllerWithContext(tab, loadedSession, a.bootContext(), 0, nil)
+}
+
+func (a *App) buildTabControllerWithLoadedSessionAdmissionHeld(tab *WorkspaceTab, loadedSession loadedTabSession) {
+	a.buildTabControllerWithContextAdmissionHeld(tab, loadedSession, a.bootContext(), 0, nil)
 }
 
 func (a *App) desktopNotificationSender() notify.Sender {
@@ -3065,6 +3159,16 @@ func clearTabStartupError(tab *WorkspaceTab) {
 }
 
 func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loadedTabSession, buildCtx context.Context, buildGeneration uint64, buildCancel context.CancelFunc) {
+	a.runtimeAdmissionMu.RLock()
+	defer a.runtimeAdmissionMu.RUnlock()
+	a.buildTabControllerWithContextAdmissionHeld(tab, loadedSession, buildCtx, buildGeneration, buildCancel)
+}
+
+// buildTabControllerWithContextAdmissionHeld is the build core for callers
+// that already hold either side of runtimeAdmissionMu. Keeping acquisition in
+// the outer wrapper prevents recursive RLock deadlocks when foreground turn
+// admission repairs a stale workspace while an MCP lifecycle writer is queued.
+func (a *App) buildTabControllerWithContextAdmissionHeld(tab *WorkspaceTab, loadedSession loadedTabSession, buildCtx context.Context, buildGeneration uint64, buildCancel context.CancelFunc) {
 	defer a.recoverToPending("buildTabController")
 	keepBuildContext := false
 	defer func() {
@@ -6769,12 +6873,26 @@ func (a *App) SetTopicPinned(topicID string, pinned bool) error {
 	return nil
 }
 
-// TrashTopic removes a topic from the project tree and moves its saved session
-// records into the session trash. Any in-process runtimes for the topic are
-// cancelled and detached from the app first, so their autosave/jobs cannot
-// recreate state after the topic is gone.
+var errTopicHasActiveWork = errors.New("wait for the session to finish, answer pending prompts, and stop background jobs before archiving this topic")
+
+// TrashTopic removes an idle topic from the project tree and moves its saved
+// session records into the session trash. Idle in-process runtimes are detached
+// first, so their autosave cannot recreate state after the topic is gone.
 func (a *App) TrashTopic(topicID string) error {
 	return friendlySessionFileError(a.trashTopic(topicID))
+}
+
+func (a *App) topicHasActiveRuntimeWork(topicID string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, tabs := range []map[string]*WorkspaceTab{a.tabs, a.detachedSessions} {
+		for _, tab := range tabs {
+			if tab != nil && tab.TopicID == topicID && tab.hasActiveRuntimeWork() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (a *App) trashTopic(topicID string) error {
@@ -6784,8 +6902,12 @@ func (a *App) trashTopic(topicID string) error {
 
 	var fallback fallbackRuntimeTarget
 	if err := func() error {
+		defer a.lockRuntimeMutation("trash-topic")()
 		a.sessionRemovalMu.Lock()
 		defer a.sessionRemovalMu.Unlock()
+		if a.topicHasActiveRuntimeWork(topicID) {
+			return errTopicHasActiveWork
+		}
 
 		targets, err := a.topicTrashTargets(topicID)
 		if err != nil {
@@ -6794,17 +6916,17 @@ func (a *App) trashTopic(topicID string) error {
 		removed, nextFallback := a.removeTopicRuntimeBindings(topicID)
 		fallback = nextFallback
 		if err := a.prepareRemovedSessionRuntimes(removed); err != nil {
-			a.closeRemovedSessionRuntimes(removed)
+			a.closeRemainingRemovedSessionRuntimesAdmissionHeld(removed, map[control.SessionAPI]bool{})
 			return err
 		}
 		destroyBegun := false
 		closedRemoved := map[control.SessionAPI]bool{}
 		defer func() {
 			if destroyBegun {
-				a.closeRemainingRemovedSessionRuntimesAfterDestroy(removed, closedRemoved)
+				a.closeRemainingRemovedSessionRuntimesAfterDestroyAdmissionHeld(removed, closedRemoved)
 				return
 			}
-			a.closeRemovedSessionRuntimes(removed)
+			a.closeRemainingRemovedSessionRuntimesAdmissionHeld(removed, closedRemoved)
 		}()
 
 		for _, target := range targets {
@@ -6813,7 +6935,7 @@ func (a *App) trashTopic(topicID string) error {
 				destroyBegun = true
 			}
 			teardownTimedOut := waitDestroyHandles(destroys)
-			a.closeRemovedSessionRuntimesForSessionAfterDestroy(removed, target.dir, target.sessionPath, closedRemoved)
+			a.closeRemovedSessionRuntimesForSessionAfterDestroyAdmissionHeld(removed, target.dir, target.sessionPath, closedRemoved)
 			if teardownTimedOut {
 				if err := agent.MarkCleanupPending(target.sessionPath, "delete"); err != nil {
 					return err

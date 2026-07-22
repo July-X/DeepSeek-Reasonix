@@ -4,7 +4,7 @@ import { asArray } from "../lib/array";
 import { useDeferredClose } from "../lib/useMountTransition";
 import { app, openExternal } from "../lib/bridge";
 import { normalizeLangPref, useI18n, useT, type DictKey, type LangPref } from "../lib/i18n";
-import { apiKeyEnvFromProviderName, inferredVisionModels, mergedFetchedProviderModels, providerApiKeyEnvForSave, providerDefaultModel, providerIsConfigured, providerModelCandidates, providerRequiresKey } from "../lib/providerModels";
+import { apiKeyEnvFromProviderName, inferredVisionModels, mergedFetchedProviderModels, mergeProviderModelContextWindows, providerApiKeyEnvForSave, providerDefaultModel, providerIsConfigured, providerModelCandidates, providerModelContextWindowDrafts, providerModelContextWindowIsSmall, providerRequiresKey } from "../lib/providerModels";
 import { useUpdater } from "../lib/useUpdater";
 import {
   applyTheme,
@@ -15,6 +15,12 @@ import {
   type Theme,
   type ThemeStyle,
 } from "../lib/theme";
+import {
+  applyConversationWidth,
+  getCachedConversationWidth,
+  normalizeConversationWidth,
+  type ConversationWidth,
+} from "../lib/conversationWidth";
 import { applyTextSize, getTextSize, type TextSize } from "../lib/textSize";
 import { snapZoom, zoomToPercent, saveRestartZoom, getRestartZoom, type ZoomLevel } from "../lib/dpiScale";
 import {
@@ -41,13 +47,14 @@ import {
   resetCustomShortcuts,
   resolvedShortcutCombo,
   saveCustomShortcut,
+  shortcutAcceptsCombo,
   shortcutConflict,
   shortcutDefinitions,
   type ShortcutAction,
 } from "../lib/keyboardShortcuts";
 import type { BotAccessView, BotAllowlistView, BotConnectionDiagnostic, BotConnectionView, BotInstallStartResult, BotRouteView, BotSettingsView, HookConfigView, HooksSettingsView, NetworkView, ProviderPresetView, ProviderView, SettingsTab, SettingsView } from "../lib/types";
 import { AppearanceOverview } from "./AppearanceOverview";
-import { applyThemePack, getActiveThemePack, setBaseAppearance } from "../lib/themePack";
+import { applyConfiguredBaseAppearance, setBaseAppearance } from "../lib/themePack";
 import { InlineConfirmButton } from "./InlineConfirmButton";
 import { Tooltip } from "./Tooltip";
 import { AnchoredPopover } from "./AnchoredPopover";
@@ -57,11 +64,14 @@ import { getSuccessPreference, setSuccessPreference, getAttentionPreference, set
 import { ModalCloseButton } from "./ModalCloseButton";
 import { ShortcutComboDisplay } from "./ShortcutComboDisplay";
 
-const SETTINGS_TABS: SettingsTab[] = ["general", "models", "bots", "mcp", "skills", "subagents", "plugins", "memory", "hooks", "diagnostics", "shortcuts", "permissions", "sandbox", "network", "appearance", "updates"];
-export type SettingsInitialFocus = { target: "bot-allowlist"; connectionId?: string };
+const SETTINGS_TABS: SettingsTab[] = ["general", "models", "bots", "mcp", "remote", "skills", "subagents", "plugins", "memory", "hooks", "diagnostics", "shortcuts", "permissions", "sandbox", "network", "appearance", "updates"];
+export type SettingsInitialFocus =
+  | { target: "bot-allowlist"; connectionId?: string }
+  | { target: "model-access" };
 type DesktopPlatform = "darwin" | "windows" | "linux";
 
 const MCPServersSettingsPage = lazy(() => import("./CapabilitiesPanel").then((module) => ({ default: module.MCPServersSettingsPage })));
+const RemoteHostsPage = lazy(() => import("./RemoteHostsPage").then((module) => ({ default: module.RemoteHostsPage })));
 const SkillsSettingsPage = lazy(() => import("./CapabilitiesPanel").then((module) => ({ default: module.SkillsSettingsPage })));
 const PluginsSettingsPage = lazy(() => import("./CapabilitiesPanel").then((module) => ({ default: module.PluginsSettingsPage })));
 const MemorySettingsPage = lazy(() => import("./MemoryPanel").then((module) => ({ default: module.MemorySettingsPage })));
@@ -98,6 +108,7 @@ export function SettingsPanel({
   const [warning, setWarning] = useState<string | null>(null);
   const [theme, setThemeState] = useState<Theme>(getTheme());
   const [themeStyle, setThemeStyleState] = useState<ThemeStyle>(() => getThemeStyle(getTheme()));
+  const [conversationWidth, setConversationWidth] = useState<ConversationWidth>(() => getCachedConversationWidth());
   const [textSize, setTextSizeState] = useState<TextSize>(getTextSize());
   const [zoomPct, setZoomPct] = useState<number>(zoomToPercent(getRestartZoom()));
   const [fontFamily, setFontFamilyState] = useState<FontFamily>(getFontFamily());
@@ -141,7 +152,8 @@ export function SettingsPanel({
     const nextStyle = normalizeThemeStyleForTheme(s.desktopThemeStyle, nextTheme);
     setThemeState(nextTheme);
     setThemeStyleState(nextStyle);
-  }, [s?.desktopTheme, s?.desktopThemeStyle]);
+    setConversationWidth(applyConversationWidth(s.conversationWidth));
+  }, [s?.conversationWidth, s?.desktopTheme, s?.desktopThemeStyle]);
   useEffect(() => {
     if (desktopPlatform !== "windows") return;
     let cancelled = false;
@@ -257,9 +269,10 @@ export function SettingsPanel({
             ) : (
               <>
                 {tab === "general" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><GeneralSection s={s} busy={busy} apply={apply} agentRunning={agentRunning} /></SettingsPageShell>}
-                {tab === "models" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><ModelsSection s={s} busy={busy} apply={apply} backgroundApply={backgroundApply} /></SettingsPageShell>}
+                {tab === "models" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><ModelsSection s={s} busy={busy} apply={apply} backgroundApply={backgroundApply} initialFocus={initialFocus} /></SettingsPageShell>}
                 {tab === "bots" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><BotsSection s={s} busy={busy} apply={apply} initialFocus={initialFocus} /></SettingsPageShell>}
                 {tab === "mcp" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><MCPServersSettingsPage /></Suspense></SettingsPageShell>}
+                {tab === "remote" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><RemoteHostsPage /></Suspense></SettingsPageShell>}
                 {tab === "skills" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><SkillsSettingsPage /></Suspense></SettingsPageShell>}
                 {tab === "subagents" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><Suspense fallback={lazySettingsPageFallback}><SubagentsSettingsPage s={s} onUseInChat={(command) => {
                   pendingSubagentCommandRef.current = command;
@@ -278,6 +291,7 @@ export function SettingsPanel({
                     <AppearanceOverview
                       theme={theme}
                       themeStyle={themeStyle}
+                      conversationWidth={conversationWidth}
                       textSize={textSize}
                       showDisplayZoom={desktopPlatform === "windows"}
                       zoomPct={zoomPct}
@@ -286,19 +300,21 @@ export function SettingsPanel({
                       customFontName={customFontName}
                       customMonoFontName={customMonoFontName}
                       onTheme={(nextTheme) => {
-                        applyTheme(nextTheme, themeStyle, { persist: false });
+                        applyConfiguredBaseAppearance(nextTheme, themeStyle);
                         setThemeState(nextTheme);
-                        setBaseAppearance(nextTheme, themeStyle);
-                        const pack = getActiveThemePack();
-                        if (pack) applyThemePack(pack);
                         void apply(() => app.SetDesktopAppearance(nextTheme, themeStyle));
+                      }}
+                      onConversationWidth={(width) => {
+                        applyConversationWidth(width);
+                        setConversationWidth(width);
+                        void apply(() => app.SetDesktopConversationWidth(width));
                       }}
                       onThemeStyle={(style) => {
                         // AppearanceOverview already persists via ActivateBaseStyle /
                         // experience APIs. Parent only mirrors React + DOM state.
-                        applyTheme(theme, style, { persist: false });
+                        applyTheme(getTheme(), style, { persist: false });
                         setThemeStyleState(style);
-                        setBaseAppearance(theme, style);
+                        setBaseAppearance(getTheme(), style);
                       }}
                       onTextSize={(size) => {
                         applyTextSize(size);
@@ -368,6 +384,7 @@ function settingsPageKind(tab: SettingsTab): "form" | "manager" {
   switch (tab) {
     case "models":
     case "mcp":
+    case "remote":
     case "skills":
     case "subagents":
     case "plugins":
@@ -471,6 +488,7 @@ type SectionProps = {
 
 type ModelsSectionProps = SectionProps & {
   backgroundApply: (fn: () => Promise<void>) => Promise<void>;
+  initialFocus?: SettingsInitialFocus;
 };
 
 function settingsTabLabel(id: SettingsTab, t: ReturnType<typeof useT>): string {
@@ -485,6 +503,8 @@ function settingsTabLabel(id: SettingsTab, t: ReturnType<typeof useT>): string {
       return t("settings.tab.bots");
     case "mcp":
       return t("settings.tab.mcp");
+    case "remote":
+      return t("settings.tab.remote");
     case "skills":
       return t("settings.tab.skills");
     case "subagents":
@@ -524,6 +544,8 @@ function settingsTabMeta(id: SettingsTab, s: SettingsView, t: ReturnType<typeof 
       return botSettingsMeta(s.bot, t);
     case "mcp":
       return t("caps.connectorsTab");
+    case "remote":
+      return t("remote.tabHint");
     case "skills":
       return t("caps.skillsTab");
     case "subagents":
@@ -569,28 +591,58 @@ function botSettingsMeta(bot: BotSettingsView, t: ReturnType<typeof useT>): stri
   return t("settings.botConnectionCount", { n: connections });
 }
 
-function ShortcutsSection() {
+export function ShortcutsSection() {
   const t = useT();
   const [platform] = useState(() => detectShortcutPlatform());
   const [revision, setRevision] = useState(0);
   const [recording, setRecording] = useState<ShortcutAction | null>(null);
   const [conflict, setConflict] = useState<{ action: ShortcutAction; conflictAction: ShortcutAction } | null>(null);
+  const [unsupportedAction, setUnsupportedAction] = useState<ShortcutAction | null>(null);
 
   useEffect(() => onShortcutsChanged(() => setRevision((value) => value + 1)), []);
 
   const definitions = shortcutDefinitions();
   const commitShortcut = (action: ShortcutAction, event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      setConflict(null);
+      setUnsupportedAction(null);
+      setRecording(null);
+      return;
+    }
     const combo = comboFromKeyboardEvent(event.nativeEvent);
     if (!combo) return;
+    if (!shortcutAcceptsCombo(action, combo)) {
+      // Let the browser move focus before onBlur cancels recording. Updating
+      // recording state synchronously here can keep focus on the re-rendered
+      // button in WebKit.
+      if (event.key === "Tab") {
+        const recorder = event.currentTarget;
+        queueMicrotask(() => {
+          // Native Tab normally moves focus first. If this WebView does not,
+          // release focus so the recorder cannot become a keyboard trap.
+          if (document.activeElement === recorder) recorder.blur();
+        });
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      setConflict(null);
+      setUnsupportedAction(action);
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const conflictDefinition = shortcutConflict(action, combo, platform);
     if (conflictDefinition) {
+      setUnsupportedAction(null);
       setConflict({ action, conflictAction: conflictDefinition.action });
       return;
     }
     saveCustomShortcut(action, combo);
     setConflict(null);
+    setUnsupportedAction(null);
     setRecording(null);
     setRevision((value) => value + 1);
   };
@@ -608,6 +660,7 @@ function ShortcutsSection() {
           onClick={() => {
             resetCustomShortcuts();
             setConflict(null);
+            setUnsupportedAction(null);
             setRecording(null);
             setRevision((value) => value + 1);
           }}
@@ -622,6 +675,13 @@ function ShortcutsSection() {
             {t("settings.shortcutsConflict", {
               action: t(definitions.find((definition) => definition.action === conflict.action)?.labelKey ?? "settings.tab.shortcuts"),
               conflict: t(definitions.find((definition) => definition.action === conflict.conflictAction)?.labelKey ?? "settings.tab.shortcuts"),
+            })}
+          </div>
+        )}
+        {unsupportedAction && (
+          <div className="shortcuts-settings__conflict" role="alert">
+            {t("settings.shortcutsEnterOnly", {
+              action: t(definitions.find((definition) => definition.action === unsupportedAction)?.labelKey ?? "settings.tab.shortcuts"),
             })}
           </div>
         )}
@@ -641,12 +701,24 @@ function ShortcutsSection() {
                 <button
                   className={`shortcuts-settings__key${isRecording ? " shortcuts-settings__key--recording" : ""}${definition.configurable === false ? " shortcuts-settings__key--locked" : ""}`}
                   type="button"
+                  data-shortcut-action={definition.action}
                   disabled={definition.configurable === false}
                   aria-label={isRecording ? t("settings.shortcutsRecording") : display}
                   aria-pressed={isRecording}
-                  onClick={() => {
+                  onClick={(event) => {
                     setRecording(definition.action);
                     setConflict(null);
+                    setUnsupportedAction(null);
+                    // WebKit (the desktop WKWebView) does not focus buttons on
+                    // click, and the recorder listens for keys on the button —
+                    // without this the recorder never receives any keydown.
+                    event.currentTarget.focus();
+                  }}
+                  onBlur={() => {
+                    if (!isRecording) return;
+                    setConflict(null);
+                    setUnsupportedAction(null);
+                    setRecording(null);
                   }}
                   onKeyDown={(event) => isRecording && commitShortcut(definition.action, event)}
                 >
@@ -659,6 +731,7 @@ function ShortcutsSection() {
                   onClick={() => {
                     saveCustomShortcut(definition.action, null);
                     setConflict(null);
+                    setUnsupportedAction(null);
                     setRecording(null);
                     setRevision((value) => value + 1);
                   }}
@@ -706,7 +779,6 @@ const REASONING_PROTOCOLS: readonly string[] = ["", "deepseek", "openai", "none"
 const THINKING_MODES: readonly string[] = ["", "enabled", "disabled", "adaptive"];
 const PROXY_TYPES = ["http", "https", "socks5", "socks5h"] as const;
 const LANGUAGE_PREFS: LangPref[] = ["", "zh", "en"];
-const AUTO_PLAN_MODES = ["off", "on"] as const;
 const TOOL_APPROVAL_MODES = ["ask", "auto", "yolo"] as const;
 const BOT_TOOL_APPROVAL_MODES = ["", "ask", "auto", "yolo"] as const;
 const BOT_QUEUE_MODES = ["steer", "followup", "collect", "interrupt"] as const;
@@ -714,7 +786,6 @@ const BOT_QUEUE_DROPS = ["summarize", "old", "new"] as const;
 const BOT_ROUTE_CHAT_TYPES = ["", "dm", "group", "guild", "direct", "thread"] as const;
 
 type ProxyMode = (typeof PROXY_MODES)[number];
-type AutoPlanMode = (typeof AUTO_PLAN_MODES)[number];
 
 function normalizeProxyMode(mode: string): ProxyMode {
   switch (mode) {
@@ -729,10 +800,6 @@ function normalizeProxyMode(mode: string): ProxyMode {
 
 function normalizeNetworkView(network: NetworkView): NetworkView {
   return { ...network, proxyMode: normalizeProxyMode(network.proxyMode) };
-}
-
-function normalizeAutoPlan(mode: string | undefined): AutoPlanMode {
-  return mode === "ask" || mode === "on" ? "on" : "off";
 }
 
 function normalizeReasoningProtocol(protocol: string | undefined): string {
@@ -1277,7 +1344,7 @@ function normalizeSettingsView(view: SettingsView | null | undefined): SettingsV
     },
     agent,
     bot: normalizeBotSettings(view.bot),
-    autoPlan: normalizeAutoPlan(view.autoPlan),
+    autoPlan: "off",
     defaultToolApprovalMode: normalizeToolApprovalMode(view.defaultToolApprovalMode),
     autoApproveTools: Boolean(view.autoApproveTools ?? view.bypass),
     bypass: Boolean(view.autoApproveTools ?? view.bypass),
@@ -1289,6 +1356,7 @@ function normalizeSettingsView(view: SettingsView | null | undefined): SettingsV
     displayMode: normalizeDisplayMode(view.displayMode),
     statusBarStyle: normalizeStatusBarStyle(view.statusBarStyle),
     statusBarItems: normalizeStatusBarItems(view.statusBarItems),
+    conversationWidth: normalizeConversationWidth(view.conversationWidth),
     checkUpdates: view.checkUpdates !== false,
   };
 }
@@ -1435,7 +1503,6 @@ function GeneralSection({ s, busy, apply, agentRunning }: SectionProps & { agent
   useEffect(() => onDisplayModeChange((mode) => setDisplayMode(mode)), []);
   useEffect(() => onProcessFoldPreferenceChange((pref) => setProcessFold(pref)), []);
   useEffect(() => () => mouseDragCleanupRef.current?.(), []);
-  const autoPlan = normalizeAutoPlan(s.autoPlan);
   const defaultToolApprovalMode = normalizeToolApprovalMode(s.defaultToolApprovalMode);
   const languagePref = normalizeLangPref(s.desktopLanguage);
   const desktopLayoutStyle = normalizeDesktopLayoutStyle(s.desktopLayoutStyle);
@@ -1677,20 +1744,6 @@ function GeneralSection({ s, busy, apply, agentRunning }: SectionProps & { agent
               onClick={() => void apply(() => app.SetDefaultToolApprovalMode(mode))}
             >
               {t(`settings.defaultToolApprovalMode.${mode}`)}
-            </button>
-          ))}
-        </div>
-      </SettingsField>
-      <SettingsField label={t("settings.autoPlan")}>
-        <div className="set-seg">
-          {AUTO_PLAN_MODES.map((mode) => (
-            <button
-              key={mode}
-              className={`set-seg__btn${autoPlan === mode ? " set-seg__btn--on" : ""}`}
-              disabled={busy}
-              onClick={() => void apply(() => app.SetAutoPlan(mode))}
-            >
-              {t(`settings.autoPlan.${mode}`)}
             </button>
           ))}
         </div>
@@ -3935,9 +3988,11 @@ function botDraftWithDerivedGatewayState(draft: BotSettingsView): BotSettingsVie
   };
 }
 
-function ModelsSection({ s, busy, apply, backgroundApply }: ModelsSectionProps) {
+function ModelsSection({ s, busy, apply, backgroundApply, initialFocus }: ModelsSectionProps) {
   const t = useT();
-  const [subtab, setSubtab] = useState<"usage" | "access">("usage");
+  const [subtab, setSubtab] = useState<"usage" | "access">(
+    initialFocus?.target === "model-access" ? "access" : "usage",
+  );
   const autoRefreshKeyRef = useRef("");
   const refs = useMemo(() => allRefs(s), [s.providers]);
   const defaultRef = toRef(s.defaultModel, s);
@@ -5461,18 +5516,22 @@ const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker({
   candidates,
   selectedModels,
   visionModels,
+  contextWindows,
   disabled,
   onToggleModel,
   onToggleVision,
+  onContextWindowChange,
   onSelectAll,
   onClear,
 }: {
   candidates: string[];
   selectedModels: string[];
   visionModels: string[];
+  contextWindows: Record<string, string>;
   disabled: boolean;
   onToggleModel: (model: string) => void;
   onToggleVision: (model: string) => void;
+  onContextWindowChange: (model: string, value: string) => void;
   onSelectAll: () => void;
   onClear: () => void;
 }) {
@@ -5506,6 +5565,7 @@ const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker({
           </button>
         </div>
       </div>
+      <div className="provider-model-draft__context-guide">{t("settings.modelContextWindowGuide")}</div>
       {candidates.length > 8 && (
         <input
           className="mem-input provider-model-draft__search"
@@ -5538,6 +5598,28 @@ const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker({
                 />
                 <span>{t("settings.visionModel")}</span>
               </label>
+              <div className="provider-model-draft__context-field">
+                <label className="provider-model-draft__context">
+                  <span>{t("settings.modelContextWindow")}</span>
+                  <input
+                    className="mem-input provider-model-draft__context-input"
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    disabled={disabled || !enabled}
+                    placeholder={t("settings.modelContextWindowPlaceholder")}
+                    title={t("settings.modelContextWindowHint")}
+                    aria-label={t("settings.modelContextWindowAria", { model })}
+                    value={contextWindows[model] ?? ""}
+                    onChange={(event) => onContextWindowChange(model, event.target.value)}
+                  />
+                </label>
+                {enabled && providerModelContextWindowIsSmall(contextWindows[model]) && (
+                  <div className="provider-model-draft__context-warning" role="status">
+                    {t("settings.modelContextWindowSmallWarning")}
+                  </div>
+                )}
+              </div>
             </div>
           );
         }) : (
@@ -5584,9 +5666,12 @@ function ProviderEditor({
   const [authHeader, setAuthHeader] = useState(Boolean(initial?.authHeader));
   const [keyDraft, setKeyDraft] = useState("");
   const [balanceUrl, setBalanceUrl] = useState(initial?.balanceUrl ?? "");
-  // Empty when unset so the placeholder (and its "0 = default" hint) reads instead
+  // Empty when unset so the placeholder (and its "0 = disabled" hint) reads instead
   // of a bare "0"; saved back as 0.
   const [ctx, setCtx] = useState(initial?.contextWindow ? String(initial.contextWindow) : "");
+  const [modelContextWindows, setModelContextWindows] = useState<Record<string, string>>(
+    () => providerModelContextWindowDrafts(initial?.modelOverrides),
+  );
   const [reasoningProtocol, setReasoningProtocol] = useState(normalizeReasoningProtocol(initial?.reasoningProtocol));
   const [thinking, setThinking] = useState(normalizeThinkingMode(initial?.thinking));
   const [supportedEfforts] = useState<string[]>(initial?.supportedEfforts ?? []);
@@ -5662,7 +5747,7 @@ function ProviderEditor({
         thinking,
         supportedEfforts: cleanedSupportedEfforts,
         defaultEffort: cleanDefaultEffort,
-        modelOverrides: initial?.modelOverrides ?? [],
+        modelOverrides: mergeProviderModelContextWindows(initial?.modelOverrides, parseProviderListInput(models), modelContextWindows),
       });
       if (fetched.length === 0) {
         setFetchFallback(t("settings.fetchModelsManualFallbackEmpty"));
@@ -5716,7 +5801,7 @@ function ProviderEditor({
       // Clear the stored default if no levels are selected; the backend's
       // NormalizeEffort would otherwise silently ignore an unsupported value.
       defaultEffort: cleanedSupportedEfforts.length > 0 ? cleanDefaultEffort : "",
-      modelOverrides: initial?.modelOverrides ?? [],
+      modelOverrides: mergeProviderModelContextWindows(initial?.modelOverrides, ms, modelContextWindows),
     };
     try {
       await onSave(provider, keyDraft.trim() || undefined);
@@ -5804,6 +5889,10 @@ function ProviderEditor({
     else vision.add(model);
     setVisionModels(modelCandidateNames.filter((candidate) => vision.has(candidate)).join(", "));
     setVisionModelsConfigured(true);
+  };
+
+  const updateEditorModelContextWindow = (model: string, value: string) => {
+    setModelContextWindows((current) => ({ ...current, [model]: value }));
   };
 
   const selectAllEditorModels = () => {
@@ -6015,9 +6104,11 @@ function ProviderEditor({
         candidates={modelCandidateNames}
         selectedModels={modelNames}
         visionModels={visionModelNames}
+        contextWindows={modelContextWindows}
         disabled={busy || fetchingModels}
         onToggleModel={toggleEditorModel}
         onToggleVision={toggleEditorVisionModel}
+        onContextWindowChange={updateEditorModelContextWindow}
         onSelectAll={selectAllEditorModels}
         onClear={clearEditorModels}
       />

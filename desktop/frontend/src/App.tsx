@@ -14,6 +14,7 @@ import {
   Download,
   Minus,
   Search,
+  Server,
   Square,
   SquarePen,
   PanelLeft,
@@ -38,7 +39,8 @@ import { useWailsResizeFix } from "./lib/useWailsResizeFix";
 import { asArray } from "./lib/array";
 import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, t, useI18n, useT, type Translator } from "./lib/i18n";
 import { localizedNoticeText, useController, type Item, type LiveStream } from "./lib/useController";
-import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered, openExternal } from "./lib/bridge";
+import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered, onWorkbenchTarget, openExternal } from "./lib/bridge";
+import { preferredRemoteWorkspace, workbenchTargetTransitioning, type WorkbenchActiveTarget } from "./lib/workbenchTarget";
 import { generativeMusic, isGenerativeMusicEnabled } from "./lib/generative-music";
 import { clearAttentionChimeKeys, playAttentionChime, playSuccessChime, shouldPlayAttentionChimeForEvent } from "./lib/sound";
 import { NoticeCard, Transcript } from "./components/Transcript";
@@ -53,13 +55,20 @@ import { ClearContextCard } from "./components/ClearContextCard";
 /** Footer decision surface kinds. Priority: tool/plan approval > ask > clear context. */
 type DecisionSurfaceKind = "tool_approval" | "plan_approval" | "ask" | "clear_context";
 import { StatusBar } from "./components/StatusBar";
+import { RemoteHostKeyDialog } from "./components/RemoteHostKeyDialog";
+import { RemoteSecretDialog } from "./components/RemoteSecretDialog";
+import { ProviderTrustDialog } from "./components/ProviderTrustDialog";
+import { onRemoteStatus, onRemoteForwards, onRemoteServer } from "./lib/bridge";
+import { RemoteConnectionTimeoutError, useRemoteStore, waitForRemoteConnection } from "./store/remote";
 import { CommandPalette, type PaletteItem } from "./components/CommandPalette";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { UpdaterProvider } from "./lib/useUpdater";
 import { ContextPanel } from "./components/ContextPanel";
 import { WorkspacePanel } from "./components/WorkspacePanel";
 import { Tooltip } from "./components/Tooltip";
 import { StartupSplash } from "./components/StartupSplash";
 import { OnboardingOverlay } from "./components/OnboardingOverlay";
+import { dismissOnboarding, shouldOpenOnboarding } from "./lib/onboarding";
 import { AppChrome } from "./components/AppChrome";
 import { ShortcutsCheatsheet } from "./components/ShortcutsCheatsheet";
 import { ProjectTree } from "./components/ProjectTree";
@@ -71,6 +80,7 @@ import { ExternalOpener } from "./components/ExternalOpener";
 import { parseTodos } from "./lib/tools";
 import {
   dismissedTodoKeyForScope,
+  resolveTodoPanelTodos,
   scopedTodoBatchKey,
   scopedTodoDismissalKey,
   shouldShowTodoPanel,
@@ -88,6 +98,7 @@ import {
   type Mode,
   modeHasPlan,
   type ProjectNode,
+  type RemoteHostView,
   type SessionMeta,
   type SettingsView,
   type TabMeta,
@@ -96,6 +107,7 @@ import {
 } from "./lib/types";
 import type { InvocationMetadataMap, StructuredInvocationSubmit } from "./lib/invocationDisplay";
 import { formatSelectionReference, type SelectedTextInsertRequest } from "./lib/selectedTextContext";
+import { workspaceTreeVisitId } from "./lib/workspaceTreeMemory";
 import {
   composerProfileFromMeta,
   composerProfileFromTab,
@@ -166,7 +178,8 @@ import {
   readLegacyThemePreference,
   type Theme,
 } from "./lib/theme";
-import { applyThemePack, applyThemeScene, clearThemePack, setBaseAppearance } from "./lib/themePack";
+import { applyConversationWidth } from "./lib/conversationWidth";
+import { applyConfiguredBaseAppearance, applyThemePack, applyThemeScene, clearThemePack } from "./lib/themePack";
 import { ThemeBackground } from "./components/ThemeBackground";
 import { applyTextSize, DEFAULT_TEXT_SIZE, getTextSize, nextTextSize } from "./lib/textSize";
 import { useViewportHeightVar, useWindowStatePersistence } from "./lib/windowState";
@@ -210,10 +223,7 @@ function noticePreviewItems(): Item[] {
     notice(6, "info", "Context cleanup skipped for now.", "cleanup skipped: recent turn included unresolved user approval state"),
     notice(7, "info", "Automatic context cleanup paused because the context window is too small.", "configured compact threshold exceeds current model context window; auto cleanup paused for this model"),
     notice(8, "info", "Context was compacted without a generated summary.", "compaction completed after upstream summary generation returned empty content; retained transcript checkpoint"),
-    notice(9, "info", "Planning mode enabled for this multi-step task.", "auto plan detector matched implementation task with repository edits and verification steps"),
-    notice(10, "info", "Plan detection requested a plan.", "plan detector confidence=0.83; task includes multiple dependent UI/backend changes"),
-    notice(11, "info", "Plan detection was uncertain; using the fallback planner heuristic.", "plan detector confidence=0.48; fallback heuristic selected because files and tests are involved"),
-    notice(12, "info", "Goal is not ready to complete yet; continuing the remaining work.", "goal completion check found pending validation: desktop/frontend typecheck"),
+    notice(9, "info", "Goal is not ready to complete yet; continuing the remaining work.", "goal completion check found pending validation: desktop/frontend typecheck"),
     notice(13, "info", "Goal still has unfinished task state; continuing the remaining work.", "active goal has open task state: implement preview, verify browser, report result"),
     notice(14, "warn", "AutoResearch status update failed.", "autoresearch task completion update failed: write .reasonix/autoresearch/task-42/state/task_spec.json: permission denied"),
     notice(15, "warn", "AutoResearch task marked blocked.", "autoresearch task blocked: task-42\nreason: missing accepted verification evidence after three turns"),
@@ -253,6 +263,7 @@ function NoticePreviewPanel() {
 
 const HistoryPanel = lazy(() => import("./components/HistoryPanel").then((module) => ({ default: module.HistoryPanel })));
 const SettingsPanel = lazy(() => import("./components/SettingsPanel").then((module) => ({ default: module.SettingsPanel })));
+const RemotePanel = lazy(() => import("./components/RemotePanel").then((module) => ({ default: module.RemotePanel })));
 
 const CHAT_MIN_WIDTH = 400;
 const CHAT_COMFORT_MIN_WIDTH = 560;
@@ -291,25 +302,48 @@ type HistoryScopeFilter = { scope: "global" | "project"; workspaceRoot: string }
 type WorkspaceInsertTarget = "composer" | "planRevision";
 type DesktopPlatform = "darwin" | "windows" | "linux";
 
-function WindowsWindowControls() {
+function useWindowsMaximised(enabled: boolean): readonly [boolean, () => void] {
   const [maximised, setMaximised] = useState(false);
+  const syncGenerationRef = useRef(0);
 
   const syncMaximised = useCallback(() => {
+    if (!enabled) return;
+    const generation = ++syncGenerationRef.current;
     void app.IsMainWindowMaximised()
-      .then(setMaximised)
-      .catch(() => setMaximised(false));
-  }, []);
+      .then((value) => {
+        if (generation === syncGenerationRef.current) setMaximised(value);
+      })
+      .catch(() => {
+        if (generation === syncGenerationRef.current) setMaximised(false);
+      });
+  }, [enabled]);
 
   useEffect(() => {
+    if (!enabled) {
+      syncGenerationRef.current += 1;
+      setMaximised(false);
+      return;
+    }
     syncMaximised();
     window.addEventListener("resize", syncMaximised);
     window.addEventListener("focus", syncMaximised);
     return () => {
+      syncGenerationRef.current += 1;
       window.removeEventListener("resize", syncMaximised);
       window.removeEventListener("focus", syncMaximised);
     };
-  }, [syncMaximised]);
+  }, [enabled, syncMaximised]);
 
+  return [maximised, syncMaximised] as const;
+}
+
+function WindowsWindowControls({
+  maximised,
+  syncMaximised,
+}: {
+  maximised: boolean;
+  syncMaximised: () => void;
+}) {
   const toggleMaximise = useCallback(() => {
     void app.ToggleMaximiseMainWindow()
       .then(() => window.setTimeout(syncMaximised, 80))
@@ -1008,6 +1042,7 @@ export default function App() {
     notice,
     cancel,
     approve,
+    resolveRecovery,
     answerQuestion,
     setControllerMode,
     setCollaborationMode: setControllerCollaborationMode,
@@ -1062,10 +1097,10 @@ export default function App() {
   const [transcriptRevealSignal, setTranscriptRevealSignal] = useState(0);
   const startupSplashVisible = useOverlayStore((s) => s.startupSplashVisible);
   const setStartupSplashVisible = useOverlayStore((s) => s.setStartupSplashVisible);
-  // null until the mount probe resolves; true shows the overlay. Probed once —
-  // clearing the key mid-session is the Settings panel's job, not the gate's.
+  // null until the mount probe resolves; true shows the first-run guide.
   const needsOnboarding = useOverlayStore((s) => s.needsOnboarding);
   const setNeedsOnboarding = useOverlayStore((s) => s.setNeedsOnboarding);
+  const [providerSetupNeeded, setProviderSetupNeeded] = useState(false);
   const settingsTarget = useOverlayStore((s) => s.settingsTarget);
   const setSettingsTarget = useOverlayStore((s) => s.setSettingsTarget);
   const settingsFocus = useOverlayStore((s) => s.settingsFocus);
@@ -1077,11 +1112,44 @@ export default function App() {
   const [histView, setHistView] = useState<HistoryViewState | null>(null);
   const paletteOpen = useOverlayStore((s) => s.paletteOpen);
   const setPaletteOpen = useOverlayStore((s) => s.setPaletteOpen);
+  const remoteExplorerOpen = useRemoteStore((s) => s.explorerOpen);
+  const remoteExplorerHostId = useRemoteStore((s) => s.explorerHostId);
+  const remoteHosts = useRemoteStore((s) => s.hosts);
+  const remoteStatuses = useRemoteStore((s) => s.statuses);
+  const [workbenchTarget, setWorkbenchTarget] = useState<WorkbenchActiveTarget>({ kind: "local" });
+	const { showToast } = useToast();
+  const setRemoteHosts = useRemoteStore((s) => s.setHosts);
+  const hydrateRemoteStatuses = useRemoteStore((s) => s.hydrateStatuses);
+  const requestRemoteExplorer = useRemoteStore((s) => s.openExplorer);
+  const setRemoteExplorerTab = useRemoteStore((s) => s.setExplorerTab);
+  const closeRemoteExplorerRequest = useRemoteStore((s) => s.closeExplorer);
+  const applyRemoteStatus = useRemoteStore((s) => s.applyStatus);
+  const requestRemoteStatusPopover = useRemoteStore((s) => s.requestStatusPopover);
+  const setRemoteForwards = useRemoteStore((s) => s.setForwards);
+  const setRemoteServer = useRemoteStore((s) => s.setServer);
+
+  useEffect(() => {
+    let active = true;
+    void app.WorkbenchActiveTarget()
+      .then((target) => { if (active) setWorkbenchTarget(target); })
+      .catch(() => undefined);
+    const off = onWorkbenchTarget((target) => {
+		if (!active) return;
+		if (target.state === "background_activity") {
+			showToast(t("remote.backgroundActivity"), "info");
+			return;
+		}
+		setWorkbenchTarget(target);
+    });
+    return () => {
+      active = false;
+      off();
+    };
+	}, [showToast, t]);
   const shortcutsOpen = useOverlayStore((s) => s.shortcutsOpen);
   const setShortcutsOpen = useOverlayStore((s) => s.setShortcutsOpen);
   const paletteSessions = useOverlayStore((s) => s.paletteSessions);
   const setPaletteSessions = useOverlayStore((s) => s.setPaletteSessions);
-  const { showToast } = useToast();
   const [sidebarImConnections, setSidebarImConnections] = useState<SidebarImConnection[]>([]);
   const [imTopicSources, setImTopicSources] = useState<Record<string, SidebarImTopicSource>>({});
   const [sidebarImDetailConnectionId, setSidebarImDetailConnectionId] = useState("");
@@ -1181,7 +1249,9 @@ export default function App() {
   const transientOverlayDismissSignal = useOverlayStore((s) => s.transientOverlayDismissSignal);
   const setTransientOverlayDismissSignal = useOverlayStore((s) => s.setTransientOverlayDismissSignal);
   const [desktopPlatform, setDesktopPlatform] = useState<DesktopPlatform>(detectBrowserPlatform);
-  useWailsResizeFix(desktopPlatform === "windows");
+  const windowsFramelessChrome = desktopPlatform === "windows";
+  const [mainWindowMaximised, syncMainWindowMaximised] = useWindowsMaximised(windowsFramelessChrome);
+  useWailsResizeFix(windowsFramelessChrome, mainWindowMaximised);
   const [statusBarStyle, setStatusBarStyle] = useState<"icon" | "text">("text");
   const [statusBarItems, setStatusBarItems] = useState<StatusBarItemId[]>(() => [...DEFAULT_STATUS_BAR_ITEMS]);
   const [renamingTopicId, setRenamingTopicId] = useState<string | null>(null);
@@ -1313,12 +1383,11 @@ export default function App() {
   }, []);
 
   const applyDesktopPreferences = useCallback(
-    (settings: Pick<SettingsView, "desktopTheme" | "desktopThemeStyle" | "desktopLayoutStyle" | "desktopLanguage" | "checkUpdates" | "statusBarStyle" | "statusBarItems">) => {
+    (settings: Pick<SettingsView, "desktopTheme" | "desktopThemeStyle" | "desktopLayoutStyle" | "desktopLanguage" | "checkUpdates" | "statusBarStyle" | "statusBarItems" | "conversationWidth">) => {
       const nextTheme = normalizeThemePreference(settings.desktopTheme);
       const nextStyle = normalizeThemeStyleForTheme(settings.desktopThemeStyle, nextTheme);
-      applyTheme(nextTheme, nextStyle, { persist: false });
-      // Config appearance is the restore target for clearThemePack / restore-default.
-      setBaseAppearance(nextTheme, nextStyle);
+      applyConfiguredBaseAppearance(nextTheme, nextStyle);
+      applyConversationWidth(settings.conversationWidth);
       const nextLayoutStyle = normalizeDesktopLayoutStyle(settings.desktopLayoutStyle);
       setDesktopLayoutStyle(nextLayoutStyle);
       applyLayoutStyleDefaults(nextLayoutStyle);
@@ -1498,6 +1567,14 @@ export default function App() {
     state.sessionGen,
     workspaceControllerEpoch,
   ].join("\u0000");
+  // A topic may contain multiple saved sessions; the concrete session path is
+  // the runtime conversation identity, with topic/tab ids only as fallbacks.
+  const workspaceTreeMemoryKey = [
+    activeTab?.scope ?? "",
+    activeTab?.workspaceRoot ?? state.meta?.cwd ?? "",
+    activeTab?.sessionPath || state.meta?.sessionPath || activeTab?.topicId || activeTabId || "",
+  ].join("\u0000");
+  const workspaceTreeMemoryVisitId = workspaceTreeVisitId(workspaceTreeMemoryKey);
   const sidebarImDetailConnection = useMemo(
     () => sidebarImConnections.find((connection) => connection.id === sidebarImDetailConnectionId) ?? null,
     [sidebarImConnections, sidebarImDetailConnectionId],
@@ -1545,7 +1622,7 @@ export default function App() {
   const collaborationMode = displayedComposerProfileCollaborationMode(composerProfile);
   const toolApprovalMode = composerProfile.toolApprovalMode;
   const tokenMode: TokenMode = composerProfile.tokenMode;
-  const runtimeTransitioning = Boolean(activeTabId && runtimeTransitionsByTab[activeTabId]);
+  const runtimeTransitioning = Boolean(activeTabId && runtimeTransitionsByTab[activeTabId]) || workbenchTargetTransitioning(workbenchTarget);
   const controllerReady = state.meta?.ready === true && !state.backendActivationPending && !runtimeTransitioning;
   // Single footer decision surface. Composer stays mounted underneath and is
   // only visually/a11y-hidden so per-session draft caches survive.
@@ -1789,7 +1866,11 @@ export default function App() {
     return null;
   }, [state.items]);
   const todoItem = todoEntry?.item ?? null;
-  const todos = useMemo(() => (todoItem ? parseTodos(todoItem.args) : []), [todoItem]);
+  const metaTodos = state.meta?.canonicalTodos;
+  const todos = useMemo(
+    () => resolveTodoPanelTodos(metaTodos, todoItem ? parseTodos(todoItem.args) : []),
+    [metaTodos, todoItem],
+  );
   const [dismissedTodoKeys, setDismissedTodoKeys] = useState<Set<string>>(loadDismissedTodoKeys);
   const todoKey = useMemo(() => todoDismissalKey(todos), [todos]);
   const todoBatch = useMemo(() => todoBatchKey(todos), [todos]);
@@ -1848,28 +1929,46 @@ export default function App() {
       try {
         if (format === "json") {
           const path = await app.PickExportFile(`${base}.json`, "application/json");
-          if (path) await app.SaveExportFile(path, getSessionJson(), false);
+          if (path) {
+            await app.SaveExportFile(path, getSessionJson(), false);
+            showToast(t("topicBar.exportSuccess", { count: 1 }), "info");
+          }
         } else if (format === "pdf") {
           const path = await app.PickExportFile(`${base}.pdf`, "application/pdf");
           if (!path) return;
           const { blobToBase64, renderSessionPdfBlob } = await import("./lib/sessionExport");
           const blob = await renderSessionPdfBlob(getSessionMarkdown(), sessionTitle);
           await app.SaveExportFile(path, await blobToBase64(blob), true);
+          showToast(t("topicBar.exportSuccess", { count: 1 }), "info");
         } else if (format === "image") {
           const path = await app.PickExportFile(`${base}.png`, "image/png");
           if (!path) return;
-          const { blobToBase64, renderSessionImageBlob } = await import("./lib/sessionExport");
-          const blob = await renderSessionImageBlob(getSessionMarkdown());
-          await app.SaveExportFile(path, await blobToBase64(blob), true);
+          const { renderSessionImageBase64Payloads } = await import("./lib/sessionExport");
+          const payloads = await renderSessionImageBase64Payloads(getSessionMarkdown());
+          await app.SaveExportImageFiles(path, payloads);
+          showToast(
+            payloads.length > 1
+              ? t("topicBar.exportImageParts", { count: payloads.length })
+              : t("topicBar.exportSuccess", { count: 1 }),
+            "info",
+          );
         } else {
           const path = await app.PickExportFile(`${base}.md`, "text/markdown");
-          if (path) await app.SaveExportFile(path, getSessionMarkdown(), false);
+          if (path) {
+            await app.SaveExportFile(path, getSessionMarkdown(), false);
+            showToast(t("topicBar.exportSuccess", { count: 1 }), "info");
+          }
         }
       } catch (err) {
         console.error("Failed to export session", err);
+        showToast(
+          t("topicBar.exportFailed", { error: err instanceof Error ? err.message : String(err) }),
+          "error",
+          { durationMs: 8000 },
+        );
       }
     },
-    [getSessionJson, getSessionMarkdown, sessionTitle],
+    [getSessionJson, getSessionMarkdown, sessionTitle, showToast, t],
   );
 
   useEffect(() => {
@@ -2116,12 +2215,54 @@ export default function App() {
     });
   }, [refreshTabMetas]);
 
+  // Bridge remote:* events into the remote store once, app-wide, so the
+  // StatusBar chip, host manager, and explorer all see the same live state.
+  useEffect(() => {
+    const offStatus = onRemoteStatus((s) => {
+      applyRemoteStatus(s);
+      if (s.state === "stopped" && s.error) requestRemoteStatusPopover(s.hostId);
+    });
+    const offForwards = onRemoteForwards((e) => setRemoteForwards(e.hostId, e.forwards));
+    const offServer = onRemoteServer((s) => setRemoteServer(s));
+    return () => {
+      offStatus();
+      offForwards();
+      offServer();
+    };
+  }, [applyRemoteStatus, requestRemoteStatusPopover, setRemoteForwards, setRemoteServer]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void app.RemoteHosts()
+      .then((hosts) => {
+        if (!cancelled) setRemoteHosts(hosts);
+      })
+      .catch(() => {});
+    void app.RemoteConnectionStatuses()
+      .then((statuses) => {
+        if (!cancelled) hydrateRemoteStatuses(statuses);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [hydrateRemoteStatuses, setRemoteHosts]);
+
+  const refreshProviderSetupState = useCallback(async () => {
+    const needs = await app.NeedsOnboarding();
+    setProviderSetupNeeded(needs);
+    return needs;
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const needs = await app.NeedsOnboarding();
-        if (!cancelled) setNeedsOnboarding(needs);
+        if (!cancelled) {
+          setProviderSetupNeeded(needs);
+          setNeedsOnboarding(shouldOpenOnboarding(needs));
+        }
       } catch {
         // Bridge unavailable (browser dev seam) — skip the gate; a real key
         // failure still surfaces via the topbar startupError banner.
@@ -2131,7 +2272,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [setNeedsOnboarding]);
 
   useEffect(() => {
     const el = footerRef.current;
@@ -2436,6 +2577,90 @@ export default function App() {
     },
     [openWorkspacePanel],
   );
+
+  useEffect(() => {
+    if (!remoteExplorerOpen) return;
+    openRightDockMode("remote");
+    closeRemoteExplorerRequest();
+  }, [closeRemoteExplorerRequest, openRightDockMode, remoteExplorerOpen]);
+
+  useEffect(() => {
+    if (remoteHosts.length > 0 || rightDockMode !== "remote") return;
+    setRightDockMode("files");
+  }, [remoteHosts.length, rightDockMode, setRightDockMode]);
+
+  const openRemoteDock = useCallback(() => {
+    const fallback = remoteHosts.find((host) => {
+      const state = useRemoteStore.getState().statuses[host.id]?.state;
+      return state === "connected" || state === "degraded";
+    }) ?? remoteHosts[0];
+    const hostId = remoteExplorerHostId && remoteHosts.some((host) => host.id === remoteExplorerHostId)
+      ? remoteExplorerHostId
+      : fallback?.id;
+    if (hostId) requestRemoteExplorer(hostId);
+  }, [remoteExplorerHostId, remoteHosts, requestRemoteExplorer]);
+
+  const remoteWorkspaceLaunchSeq = useRef(0);
+  const launchRemoteWorkspace = useCallback(async (host: RemoteHostView, requestSeq: number) => {
+    const workspace = await preferredRemoteWorkspace(host.id, host.defaultWorkspace);
+    if (requestSeq !== remoteWorkspaceLaunchSeq.current) return;
+    if (!workspace) {
+      setRemoteExplorerTab("server");
+      requestRemoteExplorer(host.id);
+      throw new Error(t("remote.workspaceRequired"));
+    }
+    await app.OpenRemoteWorkspace(host.id, workspace);
+    if (requestSeq !== remoteWorkspaceLaunchSeq.current) return;
+    setWorkbenchTarget(await app.WorkbenchActiveTarget());
+  }, [requestRemoteExplorer, setRemoteExplorerTab, t]);
+
+  const openRemoteWorkspaceFromStatus = useCallback((host: RemoteHostView) => {
+    const requestSeq = ++remoteWorkspaceLaunchSeq.current;
+    void launchRemoteWorkspace(host, requestSeq).catch((err) => {
+      showToast(err instanceof Error ? err.message : String(err), "error", { durationMs: 6000 });
+    });
+  }, [launchRemoteWorkspace, showToast]);
+
+  const connectAndOpenRemoteWorkspace = useCallback(function connectRemoteWorkspace(host: RemoteHostView) {
+    const requestSeq = ++remoteWorkspaceLaunchSeq.current;
+    void (async () => {
+      try {
+        const status = useRemoteStore.getState().statuses[host.id]?.state;
+        if (status !== "connected" && status !== "degraded") {
+          // Clear any stale failure before the new generation starts; otherwise a
+          // previous stopped+error snapshot could make the waiter reject before
+          // the kernel's fresh connecting event reaches the frontend.
+          useRemoteStore.getState().applyStatus({ hostId: host.id, state: "connecting" });
+          await app.ConnectRemoteHost(host.id);
+          await waitForRemoteConnection(host.id);
+        }
+      } catch (err) {
+        if (err instanceof RemoteConnectionTimeoutError) {
+          showToast(t("remote.error.timeout", { host: host.label }), "error", {
+            actionLabel: t("remote.error.stopAndRetry"),
+            durationMs: 10_000,
+            onAction: () => {
+              void app.DisconnectRemoteHost(host.id)
+                .catch(() => undefined)
+                .then(() => connectRemoteWorkspace(host));
+            },
+          });
+          return;
+        }
+        // Connection failures are host-scoped. Keep the persistent error and its
+        // recovery actions beside the Remote SSH status entry instead of
+        // stretching a raw backend error across the native titlebar.
+        requestRemoteStatusPopover(host.id);
+        return;
+      }
+
+      try {
+        await launchRemoteWorkspace(host, requestSeq);
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), "error", { durationMs: 6000 });
+      }
+    })();
+  }, [launchRemoteWorkspace, requestRemoteStatusPopover, showToast, t]);
 
   const handleWorkspacePreviewModeChange = useCallback(
     (active: boolean) => {
@@ -3133,8 +3358,27 @@ export default function App() {
       badge: t(s.turns === 1 ? "history.turnOne" : "history.turnOther", { n: s.turns }),
       run: () => void onResumeSession(s),
     }));
-    return [...cmds, ...sessionItems];
-  }, [t, paletteSessions, handleNewTab, openTrash, onResumeSession]);
+    const remoteItems: PaletteItem[] = remoteHosts.map((host) => {
+      const status = remoteStatuses[host.id];
+      const connected = status?.state === "connected" || status?.state === "degraded";
+      const target = `${host.user ? `${host.user}@` : ""}${host.host}${host.port && host.port !== 22 ? `:${host.port}` : ""}`;
+      return {
+        id: `remote-${host.id}`,
+        group: t("palette.group.remote"),
+        title: connected
+          ? t("palette.remote.open", { host: host.label })
+          : t("palette.remote.connect", { host: host.label }),
+        hint: host.defaultWorkspace || target,
+        icon: <Server size={15} />,
+        keywords: ["ssh", "remote", "远程", "连接", host.label, host.host],
+        run: () => {
+          if (connected) openRemoteWorkspaceFromStatus(host);
+          else connectAndOpenRemoteWorkspace(host);
+        },
+      };
+    });
+    return [...cmds, ...remoteItems, ...sessionItems];
+  }, [t, paletteSessions, remoteHosts, remoteStatuses, handleNewTab, openTrash, onResumeSession, openRemoteWorkspaceFromStatus, connectAndOpenRemoteWorkspace]);
   // Delete / rename act on disk, then re-fetch so the panel reflects the change.
   const onDeleteSession = useCallback(
     async (path: string) => {
@@ -3322,15 +3566,16 @@ export default function App() {
   const topicbarCanRename = !sidebarImDetailConnection && Boolean(activeTab?.topicId);
   const topicbarTitleEditSize = Math.min(56, Math.max(4, topicTitleDraft.length || topicbarTitle.length || 1));
   const sidebarWorkbench = desktopLayoutStyle === "workbench";
-  const windowsFramelessChrome = desktopPlatform === "windows";
   const handleWindowsTitlebarDoubleClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
     if (!windowsFramelessChrome) return;
     const target = event.target as HTMLElement | null;
     if (!target?.closest(".app-chrome, .topicbar, .workbench-dock__tools")) return;
     if (target.closest("button, input, textarea, select, a, [role='button'], [role='tab'], .windows-window-controls")) return;
     event.preventDefault();
-    void app.ToggleMaximiseMainWindow();
-  }, [windowsFramelessChrome]);
+    void app.ToggleMaximiseMainWindow()
+      .then(() => window.setTimeout(syncMainWindowMaximised, 80))
+      .catch(() => undefined);
+  }, [syncMainWindowMaximised, windowsFramelessChrome]);
   // Creation keeps the classic sidebar/chat structure while gating chrome tweaks
   // behind its own style flag so classic/workbench remain unchanged.
   const appChromeHidden = sidebarWorkbench || sidebarCreation;
@@ -3343,6 +3588,7 @@ export default function App() {
 
   return (
     <ShellExpandProvider>
+    <UpdaterProvider>
     <ShellHotkeys />
     <TextSizeHotkeys />
       <div
@@ -3867,6 +4113,18 @@ export default function App() {
           {safeMode && (
             <div className="banner banner--warning">{t("guard.safeMode")}</div>
           )}
+          {providerSetupNeeded && !needsOnboarding && (
+            <div className="banner banner--warning banner--actionable">
+              <span className="banner__msg">{t("onboarding.inlinePrompt")}</span>
+              <span className="banner__spacer" />
+              <button type="button" className="btn btn--small" onClick={() => {
+                setSettingsFocus({ target: "model-access" });
+                setSettingsTarget("models");
+              }}>
+                {t("onboarding.configureProvider")}
+              </button>
+            </div>
+          )}
 
           <UpdateBanner
             enabled={startupUpdateChecksEnabled === true}
@@ -3961,6 +4219,9 @@ export default function App() {
                   // observes the updated state before it unblocks.
                   if (state.approval!.tool === "exit_plan_mode" && allow) await applyCollaborationMode("normal");
                   approve(state.approval!.id, allow, session, persist);
+                }}
+                onResolveRecovery={(action, feedback) => {
+                  resolveRecovery(state.approval!.id, action, feedback ?? "");
                 }}
                 onRevisePlan={(text) => {
                   if (activeTabId) {
@@ -4076,6 +4337,19 @@ export default function App() {
 	              workspacePath={state.meta?.workspacePath || state.meta?.workspaceRoot || state.meta?.cwd}
 	              workspaceName={state.meta?.workspaceName}
 	              gitBranch={state.meta?.gitBranch}
+              onConnectRemote={connectAndOpenRemoteWorkspace}
+              onDisconnectRemote={(hostId) => void app.DisconnectRemoteHost(hostId).catch(() => {})}
+              onManageRemote={() => setSettingsTarget("remote")}
+              onOpenRemote={requestRemoteExplorer}
+              onOpenRemoteWorkspace={openRemoteWorkspaceFromStatus}
+              remoteHosts={remoteHosts}
+              remoteStatuses={remoteStatuses}
+              workbenchTarget={workbenchTarget}
+              onSwitchLocal={() => {
+                void app.WorkbenchSwitchLocal()
+                  .then(setWorkbenchTarget)
+                  .catch((err) => showToast(err instanceof Error ? err.message : String(err), "error"));
+              }}
             />
           </footer>
           )}
@@ -4140,10 +4414,26 @@ export default function App() {
                   <GitBranch size={13} />
                   <span className="workbench-dock__tab-label">{t("workspace.changedTab")}</span>
                 </button>
+                {remoteHosts.length > 0 && (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={rightDockMode === "remote"}
+                    className={`workbench-dock__tab${rightDockMode === "remote" ? " workbench-dock__tab--active" : ""}`}
+                    onClick={openRemoteDock}
+                  >
+                    <Server size={13} />
+                    <span className="workbench-dock__tab-label">{t("rightDock.remote")}</span>
+                  </button>
+                )}
               </div>
             </div>
             <div className="workbench-dock__body">
-              {rightDockMode === "context" && desktopLayoutStyle !== "creation" ? (
+              {rightDockMode === "remote" ? (
+                <Suspense fallback={null}>
+                  <RemotePanel onClose={() => setWorkspacePanel(false)} />
+                </Suspense>
+              ) : rightDockMode === "context" && desktopLayoutStyle !== "creation" ? (
                 <ContextPanel
                   tabId={activeTabId}
                   context={state.context}
@@ -4165,6 +4455,8 @@ export default function App() {
                   tabId={activeTabId}
                   cwd={state.meta?.cwd}
                   workspaceScopeKey={workspaceScopeKey}
+                  workspaceMemoryKey={workspaceTreeMemoryKey}
+                  workspaceMemoryVisitId={workspaceTreeMemoryVisitId}
                   maximized={workspacePanelMaximized}
                   panelWidth={workspacePanelRenderWidth}
                   onClose={() => setWorkspacePanel(false)}
@@ -4222,6 +4514,7 @@ export default function App() {
             }}
             onChanged={(settings) => {
               void refreshMeta();
+              void refreshProviderSetupState().catch(() => {});
               if (settings) {
                 applyDesktopPreferences(settings);
                 void refreshSidebarImConnectionsFromSettings(settings).catch((e) => console.warn("bot sidebar refresh failed", e));
@@ -4235,6 +4528,10 @@ export default function App() {
           />
         </Suspense>
       )}
+
+      <RemoteHostKeyDialog />
+      <RemoteSecretDialog />
+      <ProviderTrustDialog />
 
       <CommandPalette
         open={paletteOpen}
@@ -4255,7 +4552,23 @@ export default function App() {
         <StartupSplash hold={startupSplashHold} onDone={() => setStartupSplashVisible(false)} />
       )}
 
-      {needsOnboarding && <OnboardingOverlay onComplete={() => setNeedsOnboarding(false)} />}
+      {needsOnboarding && (
+        <OnboardingOverlay
+          onComplete={() => {
+            setProviderSetupNeeded(false);
+            setNeedsOnboarding(false);
+          }}
+          onChooseProvider={() => {
+            setNeedsOnboarding(false);
+            setSettingsFocus({ target: "model-access" });
+            setSettingsTarget("models");
+          }}
+          onSkip={() => {
+            dismissOnboarding();
+            setNeedsOnboarding(false);
+          }}
+        />
+      )}
 
       <HeartbeatPanel open={heartbeatOpen} onClose={() => setHeartbeatOpen(false)} onOpenTopic={(scope, workspaceRoot, topicId) => {
         void handleOpenTopic(scope, workspaceRoot, topicId);
@@ -4265,8 +4578,14 @@ export default function App() {
         resetKey={activeTabId ?? ""}
         onAddToChat={addSelectedTextToComposer}
       />
-      {windowsFramelessChrome && <WindowsWindowControls />}
+      {windowsFramelessChrome && (
+        <WindowsWindowControls
+          maximised={mainWindowMaximised}
+          syncMaximised={syncMainWindowMaximised}
+        />
+      )}
     </div>
+    </UpdaterProvider>
     </ShellExpandProvider>
   );
 }

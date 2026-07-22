@@ -9,10 +9,11 @@
 // typecheck green by falling back to a disabled drift check below.
 import type * as GeneratedApp from "../../wailsjs/go/main/App";
 import type { InvocationRequest } from "./invocationDisplay";
+import type { ProviderTrustPrompt, WorkbenchActiveTarget, WorkbenchRemoteHint } from "./workbenchTarget";
 
 import { addBreadcrumb } from "./breadcrumbs";
 import { t } from "./i18n";
-import { providerRequiresKey } from "./providerModels";
+import { providerIsConfigured, providerRequiresKey } from "./providerModels";
 import { DEFAULT_STATUS_BAR_ITEMS, normalizeStatusBarItems } from "./statusBarItems";
 import { registerTrustedThemeBackgroundURLs } from "./themePack";
 import { modeHasAutoApproveTools, modeWithAutoApproveTools, modeWithPlan, normalizeCollaborationMode, normalizeMode, normalizeTokenMode, normalizeToolApprovalMode } from "./types";
@@ -21,6 +22,16 @@ import type {
   AutoResearchFindingView,
   AutoResearchEvidenceView,
   AutoResearchStatusView,
+  RemoteHostView,
+  RemoteHostInput,
+  RemoteConnectionStatus,
+  RemoteDirEntry,
+  RemoteFilePreview,
+  RemoteWriteResult,
+  RemoteForwardInput,
+  RemoteForwardView,
+  RemoteServerView,
+  RemoteForwardsEvent,
   BalanceInfo,
   BotConnectionDiagnostic,
   BotInstallPollResult,
@@ -46,9 +57,10 @@ import type {
   HookConfigView,
   HooksSettingsView,
   JobView,
+  MCPMarketplaceEntry,
   MCPServerInput,
-  MCPTrustInspectionView,
-  MCPCatalogRefreshView,
+  MCPInstallResult,
+  MCPMarketplaceView,
   MCPToolView,
   MemorySuggestion,
   MemorySuggestionsView,
@@ -83,6 +95,7 @@ import type {
   UpdateInfo,
   UpdateProgress,
   WireEvent,
+  WorkspaceChangeDetailView,
   WorkspaceChangesView,
   GitCommitView,
   GitCommitDetailView,
@@ -158,6 +171,13 @@ export interface AppBindings {
   CancelTab(tabID: string): Promise<void>;
   Approve(id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
   ApproveTab(tabID: string, id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
+  ResolveRecovery(id: string, action: string, feedback: string): Promise<void>;
+  ResolveRecoveryTab(tabID: string, id: string, action: string, feedback: string): Promise<void>;
+  // Legacy no-ops: Auto Guard is always built into Auto.
+  SetRecoveryCheckpointEnabled(enabled: boolean): Promise<void>;
+  SetRecoveryCheckpointEnabledTab(tabID: string, enabled: boolean): Promise<void>;
+  RecoveryCheckpointEnabled(): Promise<boolean>;
+  RecoveryCheckpointEnabledTab(tabID: string): Promise<boolean>;
   AnswerQuestion(id: string, answers: QuestionAnswer[]): Promise<void>;
   AnswerQuestionForTab(tabID: string, id: string, answers: QuestionAnswer[]): Promise<void>;
   ReplayPendingPrompts(): Promise<void>;
@@ -236,9 +256,8 @@ export interface AppBindings {
   Commands(): Promise<CommandInfo[]>;
   Capabilities(): Promise<CapabilitiesView>;
   MCPServers(): Promise<ServerView[]>;
-  InspectMCPTrust(name: string): Promise<MCPTrustInspectionView>;
-  SetMCPTrust(name: string, decision: "session" | "workspace" | "revoke"): Promise<void>;
-  RefreshMCPCatalog(): Promise<MCPCatalogRefreshView>;
+  MCPMarketplace(query: string): Promise<MCPMarketplaceView>;
+  MCPMarketplaceResolve(registryName: string): Promise<MCPMarketplaceEntry>;
   SkillsSettings(): Promise<SkillsSettingsView>;
   CapabilityDiagnostics(includeSessionRuntime: boolean): Promise<CapabilityDiagnosticsReport>;
   Plugins(): Promise<PluginView[]>;
@@ -249,8 +268,10 @@ export interface AppBindings {
   UpdatePlugin(name: string): Promise<string>;
   PluginDoctor(name: string): Promise<PluginView>;
   AddMCPServer(input: MCPServerInput): Promise<number>;
+  InstallMCPServer(input: MCPServerInput): Promise<MCPInstallResult>;
   UpdateMCPServer(name: string, input: MCPServerInput): Promise<void>;
   RemoveMCPServer(name: string): Promise<void>;
+  AuthorizeAndConnectMCPServer(name: string): Promise<void>;
   ReconnectMCPServer(name: string): Promise<void>;
   ClearMCPServerAuthentication(name: string): Promise<void>;
   PickSkillFolder(): Promise<string>;
@@ -278,6 +299,7 @@ export interface AppBindings {
   ReadFile(rel: string): Promise<FilePreview>;
   ReadFileForTab(tabID: string, rel: string): Promise<FilePreview>;
   WorkspaceChanges(tabID: string): Promise<WorkspaceChangesView>;
+  WorkspaceChangeDetail(tabID: string, path: string): Promise<WorkspaceChangeDetailView>;
   GitBranches(): Promise<string[]>;
   GitCheckout(branch: string): Promise<void>;
   WorkspaceGitHistory(tabID: string, path: string): Promise<GitCommitView[]>;
@@ -296,6 +318,7 @@ export interface AppBindings {
   SavePastedFile(name: string, dataUrl: string): Promise<string>;
   PickExportFile(defaultFilename: string, mimeType: string): Promise<string>;
   SaveExportFile(path: string, payload: string, base64Encoded: boolean): Promise<void>;
+  SaveExportImageFiles(path: string, payloads: string[]): Promise<void>;
   AttachDropped(path: string): Promise<DroppedItem>;
   AttachmentDataURL(path: string): Promise<string>;
   Models(): Promise<ModelInfo[]>;
@@ -338,6 +361,8 @@ export interface AppBindings {
   SetMaxParallelWriters(n: number): Promise<void>;
   SetAutoPlan(mode: string): Promise<void>;
   SetDefaultToolApprovalMode(mode: string): Promise<void>;
+  SetDefaultAutoRecoveryCheckpoint(enabled: boolean): Promise<void>;
+
   SaveProvider(p: ProviderView): Promise<void>;
   SaveProviderWithKey(p: ProviderView, key: string): Promise<string>;
   AddOfficialProviderAccess(kind: string, key: string): Promise<string>;
@@ -392,6 +417,7 @@ export interface AppBindings {
   SetDesktopTelemetry(enabled: boolean): Promise<void>;
   SetDesktopMetrics(enabled: boolean): Promise<void>;
   SetExpandThinking(on: boolean): Promise<void>;
+  SetDesktopConversationWidth(width: string): Promise<void>;
   MigrateDesktopPreferences(language: string, theme: string, style: string): Promise<void>;
   SetAgentParams(temperature: number, maxSteps: number, plannerMaxSteps: number, systemPrompt: string): Promise<void>;
   SetColdResumePrune(enabled: boolean): Promise<void>;
@@ -438,6 +464,41 @@ export interface AppBindings {
   // New native-feel bindings (added with the desktop native-feel plan).
   ConfirmAction(req: NativeConfirmRequest): Promise<boolean>;
   SaveWindowState(state: DesktopWindowState): Promise<void>;
+  // ── Remote (SSH) ──
+  RemoteHosts(): Promise<RemoteHostView[]>;
+  AddRemoteHost(input: RemoteHostInput): Promise<RemoteHostView>;
+  UpdateRemoteHost(id: string, input: RemoteHostInput): Promise<RemoteHostView>;
+  RemoveRemoteHost(id: string): Promise<void>;
+  ScanSSHConfig(): Promise<RemoteHostInput[]>;
+  ConnectRemoteHost(id: string): Promise<void>;
+  DisconnectRemoteHost(id: string): Promise<void>;
+  RemoteConnectionStatuses(): Promise<RemoteConnectionStatus[]>;
+  ConfirmRemoteHostKey(hostId: string, accept: boolean): Promise<void>;
+  ConfirmRemoteSecret(hostId: string, promptId: string, secret: string, accept: boolean): Promise<void>;
+  ListRemoteDir(hostId: string, path: string): Promise<RemoteDirEntry[]>;
+  ReadRemoteFile(hostId: string, path: string): Promise<RemoteFilePreview>;
+  WriteRemoteFile(hostId: string, path: string, body: string, expectMtimeUnix: number): Promise<RemoteWriteResult>;
+  MkdirRemote(hostId: string, path: string): Promise<void>;
+  RenameRemotePath(hostId: string, oldPath: string, newPath: string): Promise<void>;
+  DeleteRemotePath(hostId: string, path: string, recursive: boolean): Promise<void>;
+  RemoteForwards(hostId: string): Promise<RemoteForwardView[]>;
+  AddRemoteForward(hostId: string, input: RemoteForwardInput): Promise<RemoteForwardView>;
+  RemoveRemoteForward(hostId: string, forwardId: string): Promise<void>;
+  EnsureRemoteServer(hostId: string, workspace: string): Promise<void>;
+  OpenRemoteWorkspace(hostId: string, workspace: string): Promise<void>;
+  StopRemoteServer(hostId: string): Promise<void>;
+  RemoteServerStatus(hostId: string): Promise<RemoteServerView>;
+  RemoteServerLogs(hostId: string, tailLines: number): Promise<string>;
+  RemoteLastWorkspace(hostId: string): Promise<string>;
+  // ── Native Remote Workbench (same main window) ──
+  WorkbenchActiveTarget(): Promise<WorkbenchActiveTarget>;
+  WorkbenchLastRemoteHint(): Promise<WorkbenchRemoteHint>;
+  WorkbenchSwitchLocal(): Promise<WorkbenchActiveTarget>;
+  WorkbenchConnectRemote(hostId: string, workspace: string): Promise<void>;
+  WorkbenchDisconnectRemote(): Promise<void>;
+  WorkbenchRemoteRequest(method: string, paramsJSON: string): Promise<string>;
+  WorkbenchResolveProviderTrust(accept: boolean): Promise<void>;
+  WorkbenchPendingProviderTrust(): Promise<ProviderTrustPrompt | null>;
 }
 
 // Compile-time drift check. Exclude<A, B> extracts keys in A that are missing
@@ -674,6 +735,61 @@ export function onSessionRecoveryFailed(cb: (payload: SessionRecoveryFailedEvent
   return () => {};
 }
 
+export function onRemoteStatus(cb: (s: RemoteConnectionStatus) => void): () => void {
+  if (realApp() && typeof window !== "undefined" && window.runtime) {
+    return window.runtime.EventsOn("remote:status", (payload?: unknown) => cb((payload ?? {}) as RemoteConnectionStatus));
+  }
+  return registerMockRemoteListener("status", cb as (v: unknown) => void);
+}
+
+export function onRemoteForwards(cb: (e: RemoteForwardsEvent) => void): () => void {
+  if (realApp() && typeof window !== "undefined" && window.runtime) {
+    return window.runtime.EventsOn("remote:forwards", (payload?: unknown) => cb((payload ?? {}) as RemoteForwardsEvent));
+  }
+  return registerMockRemoteListener("forwards", cb as (v: unknown) => void);
+}
+
+export function onRemoteServer(cb: (s: RemoteServerView) => void): () => void {
+  if (realApp() && typeof window !== "undefined" && window.runtime) {
+    return window.runtime.EventsOn("remote:server", (payload?: unknown) => cb((payload ?? {}) as RemoteServerView));
+  }
+  return registerMockRemoteListener("server", cb as (v: unknown) => void);
+}
+
+/** Provider authorization is a Desktop-only prompt. The payload is deliberately
+ * secret-free; the one-shot answer returns through the typed Wails binding. */
+export function onProviderTrust(cb: (prompt: ProviderTrustPrompt) => void): () => void {
+  if (realApp() && typeof window !== "undefined" && window.runtime) {
+    return window.runtime.EventsOn("remote:provider-trust", (payload?: unknown) => cb((payload ?? {}) as ProviderTrustPrompt));
+  }
+  return () => {};
+}
+
+/** Committed Local/Remote projection changes. Generation lets consumers drop
+ * stale async hydration when the user switches targets quickly. */
+export function onWorkbenchTarget(cb: (target: WorkbenchActiveTarget) => void): () => void {
+  if (realApp() && typeof window !== "undefined" && window.runtime) {
+    return window.runtime.EventsOn("remote:workbench-target", (payload?: unknown) => cb((payload ?? { kind: "local" }) as WorkbenchActiveTarget));
+  }
+  return () => {};
+}
+
+// Mock event fan-out so browser-dev and tsx tests can drive remote:* events
+// without a Wails runtime.
+type MockRemoteChannel = "status" | "forwards" | "server";
+const mockRemoteListeners: Record<MockRemoteChannel, Set<(v: unknown) => void>> = {
+  status: new Set(),
+  forwards: new Set(),
+  server: new Set(),
+};
+function registerMockRemoteListener(ch: MockRemoteChannel, cb: (v: unknown) => void): () => void {
+  mockRemoteListeners[ch].add(cb);
+  return () => mockRemoteListeners[ch].delete(cb);
+}
+export function __emitMockRemote(ch: MockRemoteChannel, payload: unknown): void {
+  for (const cb of mockRemoteListeners[ch]) cb(payload);
+}
+
 // app proxies each call to the live binding (or the dev mock only when truly
 // outside the shell), so a late-injected window.go is picked up transparently.
 function bridgeBreadcrumb(method: string): string {
@@ -687,7 +803,7 @@ function bridgeBreadcrumb(method: string): string {
   if (/^(SaveProvider|AddOfficialProviderAccess|AddProviderPresetAccess|ResetProviderPresetAccess|RemoveProviderAccess|DeleteProvider|SaveProviderKey|SetProviderKey|ClearProviderKey|FetchProviderModels|ConnectKey)/.test(method))
     return `provider ${method}`;
   if (/^(CheckUpdate|DownloadUpdate|InstallUpdate|ApplyUpdate|OpenDownloadPage)/.test(method)) return `update ${method}`;
-  if (/^(AddMCPServer|UpdateMCPServer|RemoveMCPServer|ReconnectMCPServer|ClearMCPServerAuthentication|SetMCPServer)/.test(method))
+  if (/^(AddMCPServer|InstallMCPServer|UpdateMCPServer|RemoveMCPServer|AuthorizeAndConnectMCPServer|ReconnectMCPServer|ClearMCPServerAuthentication|SetMCPServer)/.test(method))
     return `mcp ${method}`;
   if (/^(AddSkillPath|RemoveSkillPath|RefreshSkills|SetSkillEnabled|AcceptSkillSuggestion|AvailableSubagentTools|CreateSubagentProfile|UpdateSubagentProfile|DeleteSubagentProfile|SetSubagentProfileModel|SetSubagentProfileEffort|TrySubagentProfile|CancelTrySubagentProfile)/.test(method))
     return `skill ${method}`;
@@ -1035,14 +1151,14 @@ function makeMockApp(): AppBindings {
     { id: "carbon", name: "Carbon", author: "Reasonix", baseStyle: "carbon", builtin: true, kind: "base", active: false, hasBackground: false, tokens: {}, recipes: { density: "comfortable", corners: "soft" } },
     { id: "nocturne", name: "Nocturne", author: "Reasonix", baseStyle: "nocturne", builtin: true, kind: "base", active: false, hasBackground: false, tokens: {}, recipes: { density: "comfortable", corners: "soft" } },
     { id: "amber", name: "Amber", author: "Reasonix", baseStyle: "amber", builtin: true, kind: "base", active: false, hasBackground: false, tokens: {}, recipes: { density: "comfortable", corners: "soft" } },
-    { ...mockOfficialThemeAssets["official-rose-dawn"], id: "official-rose-dawn", name: "Rose Dawn", author: "Reasonix Contributors", license: "MIT", baseStyle: "graphite", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-rose-dawn.name", descriptionKey: "settings.themes.official.official-rose-dawn.description", tokens: { light: { bg: "#FFF7F8", fg: "#3A252C", accent: "#B43F65" }, dark: { bg: "#1E1419", fg: "#FFF3F6", accent: "#E26D91" } }, recipes: { density: "comfortable", corners: "round" }, background: { focusX: 0.72, focusY: 0.43, safeArea: "left", homeOpacity: 1, taskOpacity: 0.2, overlayStrength: 0.68 } },
-    { ...mockOfficialThemeAssets["official-fortune-forge"], id: "official-fortune-forge", name: "Fortune Forge", author: "Reasonix Contributors", license: "MIT", baseStyle: "amber", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-fortune-forge.name", descriptionKey: "settings.themes.official.official-fortune-forge.description", tokens: { light: { bg: "#FFF8E8", fg: "#382116", accent: "#A92D22" }, dark: { bg: "#1D140D", fg: "#FFF2D1", accent: "#E8AD38" } }, recipes: { density: "comfortable", corners: "soft" }, background: { focusX: 0.74, focusY: 0.44, safeArea: "left", homeOpacity: 1, taskOpacity: 0.2, overlayStrength: 0.7 } },
-    { ...mockOfficialThemeAssets["official-crimson-horizon"], id: "official-crimson-horizon", name: "Crimson Horizon", author: "Reasonix Contributors", license: "MIT", baseStyle: "graphite", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-crimson-horizon.name", descriptionKey: "settings.themes.official.official-crimson-horizon.description", tokens: { light: { bg: "#FFF8F7", fg: "#301D1D", accent: "#B92B38" }, dark: { bg: "#190D11", fg: "#FFF1F2", accent: "#FF6772" } }, recipes: { density: "comfortable", corners: "soft" }, background: { focusX: 0.75, focusY: 0.45, safeArea: "left", homeOpacity: 0.98, taskOpacity: 0.22, overlayStrength: 0.66 } },
-    { ...mockOfficialThemeAssets["official-sage-breeze"], id: "official-sage-breeze", name: "Sage Breeze", author: "Reasonix Contributors", license: "MIT", baseStyle: "slate", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-sage-breeze.name", descriptionKey: "settings.themes.official.official-sage-breeze.description", tokens: { light: { bg: "#F7F7EF", fg: "#26332D", accent: "#47735F" }, dark: { bg: "#101814", fg: "#EEF6F0", accent: "#84CBA7" } }, recipes: { density: "comfortable", corners: "soft" }, background: { focusX: 0.73, focusY: 0.44, safeArea: "left", homeOpacity: 1, taskOpacity: 0.2, overlayStrength: 0.68 } },
-    { ...mockOfficialThemeAssets["official-spark-notebook"], id: "official-spark-notebook", name: "Spark Notebook", author: "Reasonix Contributors", license: "MIT", baseStyle: "aurora", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-spark-notebook.name", descriptionKey: "settings.themes.official.official-spark-notebook.description", tokens: { light: { bg: "#FFF9ED", fg: "#2B2F35", accent: "#007B78" }, dark: { bg: "#14171A", fg: "#F8F5E9", accent: "#42D1C6" } }, recipes: { density: "comfortable", corners: "round" }, background: { focusX: 0.74, focusY: 0.46, safeArea: "left", homeOpacity: 0.98, taskOpacity: 0.2, overlayStrength: 0.68 } },
-    { ...mockOfficialThemeAssets["official-violet-starlight"], id: "official-violet-starlight", name: "Violet Starlight", author: "Reasonix Contributors", license: "MIT", baseStyle: "nocturne", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-violet-starlight.name", descriptionKey: "settings.themes.official.official-violet-starlight.description", tokens: { light: { bg: "#F7F4FF", fg: "#251F3C", accent: "#6242C7" }, dark: { bg: "#0C1022", fg: "#F4F2FF", accent: "#9B86FF" } }, recipes: { density: "comfortable", corners: "round" }, background: { focusX: 0.73, focusY: 0.44, safeArea: "left", homeOpacity: 0.96, taskOpacity: 0.18, overlayStrength: 0.72 } },
-    { ...mockOfficialThemeAssets["official-cyan-stage"], id: "official-cyan-stage", name: "Cyan Stage", author: "Reasonix Contributors", license: "MIT", baseStyle: "carbon", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-cyan-stage.name", descriptionKey: "settings.themes.official.official-cyan-stage.description", tokens: { light: { bg: "#F1FCFD", fg: "#173238", accent: "#007C92" }, dark: { bg: "#07181D", fg: "#E9FCFF", accent: "#37D7E4" } }, recipes: { density: "comfortable", corners: "round" }, background: { focusX: 0.74, focusY: 0.45, safeArea: "left", homeOpacity: 0.96, taskOpacity: 0.18, overlayStrength: 0.72 } },
-    { ...mockOfficialThemeAssets["official-noir-gold"], id: "official-noir-gold", name: "Noir Gold", author: "Reasonix Contributors", license: "MIT", baseStyle: "carbon", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-noir-gold.name", descriptionKey: "settings.themes.official.official-noir-gold.description", tokens: { light: { bg: "#FCF8EE", fg: "#2A241B", accent: "#7A5A16" }, dark: { bg: "#0D0B09", fg: "#F8F1DF", accent: "#D9B45B" } }, recipes: { density: "comfortable", corners: "soft" }, background: { focusX: 0.73, focusY: 0.43, safeArea: "left", homeOpacity: 0.94, taskOpacity: 0.18, overlayStrength: 0.74 } },
+    { ...mockOfficialThemeAssets["official-rose-dawn"], id: "official-rose-dawn", name: "Rose Dawn", author: "Reasonix Contributors", license: "MIT", baseStyle: "graphite", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-rose-dawn.name", descriptionKey: "settings.themes.official.official-rose-dawn.description", tokens: { light: { bg: "#FFF7F8", fg: "#3A252C", accent: "#B43F65" }, dark: { bg: "#1E1419", fg: "#FFF3F6", accent: "#E26D91" } }, recipes: { density: "comfortable", corners: "round" }, background: { focusX: 0.72, focusY: 0.43, safeArea: "left", homeOpacity: 1, taskOpacity: 0.2, overlayStrength: 0.68, paneOpacity: 0.50 } },
+    { ...mockOfficialThemeAssets["official-fortune-forge"], id: "official-fortune-forge", name: "Fortune Forge", author: "Reasonix Contributors", license: "MIT", baseStyle: "amber", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-fortune-forge.name", descriptionKey: "settings.themes.official.official-fortune-forge.description", tokens: { light: { bg: "#FFF8E8", fg: "#382116", accent: "#A92D22" }, dark: { bg: "#1D140D", fg: "#FFF2D1", accent: "#E8AD38" } }, recipes: { density: "comfortable", corners: "soft" }, background: { focusX: 0.74, focusY: 0.44, safeArea: "left", homeOpacity: 1, taskOpacity: 0.2, overlayStrength: 0.7, paneOpacity: 0.50 } },
+    { ...mockOfficialThemeAssets["official-crimson-horizon"], id: "official-crimson-horizon", name: "Crimson Horizon", author: "Reasonix Contributors", license: "MIT", baseStyle: "graphite", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-crimson-horizon.name", descriptionKey: "settings.themes.official.official-crimson-horizon.description", tokens: { light: { bg: "#FFF8F7", fg: "#301D1D", accent: "#B92B38" }, dark: { bg: "#190D11", fg: "#FFF1F2", accent: "#FF6772" } }, recipes: { density: "comfortable", corners: "soft" }, background: { focusX: 0.75, focusY: 0.45, safeArea: "left", homeOpacity: 0.98, taskOpacity: 0.22, overlayStrength: 0.66, paneOpacity: 0.50 } },
+    { ...mockOfficialThemeAssets["official-sage-breeze"], id: "official-sage-breeze", name: "Sage Breeze", author: "Reasonix Contributors", license: "MIT", baseStyle: "slate", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-sage-breeze.name", descriptionKey: "settings.themes.official.official-sage-breeze.description", tokens: { light: { bg: "#F7F7EF", fg: "#26332D", accent: "#47735F" }, dark: { bg: "#101814", fg: "#EEF6F0", accent: "#84CBA7" } }, recipes: { density: "comfortable", corners: "soft" }, background: { focusX: 0.73, focusY: 0.44, safeArea: "left", homeOpacity: 1, taskOpacity: 0.2, overlayStrength: 0.68, paneOpacity: 0.50 } },
+    { ...mockOfficialThemeAssets["official-spark-notebook"], id: "official-spark-notebook", name: "Spark Notebook", author: "Reasonix Contributors", license: "MIT", baseStyle: "aurora", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-spark-notebook.name", descriptionKey: "settings.themes.official.official-spark-notebook.description", tokens: { light: { bg: "#FFF9ED", fg: "#2B2F35", accent: "#007B78" }, dark: { bg: "#14171A", fg: "#F8F5E9", accent: "#42D1C6" } }, recipes: { density: "comfortable", corners: "round" }, background: { focusX: 0.74, focusY: 0.46, safeArea: "left", homeOpacity: 0.98, taskOpacity: 0.2, overlayStrength: 0.68, paneOpacity: 0.50 } },
+    { ...mockOfficialThemeAssets["official-violet-starlight"], id: "official-violet-starlight", name: "Violet Starlight", author: "Reasonix Contributors", license: "MIT", baseStyle: "nocturne", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-violet-starlight.name", descriptionKey: "settings.themes.official.official-violet-starlight.description", tokens: { light: { bg: "#F7F4FF", fg: "#251F3C", accent: "#6242C7" }, dark: { bg: "#0C1022", fg: "#F4F2FF", accent: "#9B86FF" } }, recipes: { density: "comfortable", corners: "round" }, background: { focusX: 0.73, focusY: 0.44, safeArea: "left", homeOpacity: 0.96, taskOpacity: 0.18, overlayStrength: 0.72, paneOpacity: 0.50 } },
+    { ...mockOfficialThemeAssets["official-cyan-stage"], id: "official-cyan-stage", name: "Cyan Stage", author: "Reasonix Contributors", license: "MIT", baseStyle: "carbon", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-cyan-stage.name", descriptionKey: "settings.themes.official.official-cyan-stage.description", tokens: { light: { bg: "#F1FCFD", fg: "#173238", accent: "#007C92" }, dark: { bg: "#07181D", fg: "#E9FCFF", accent: "#37D7E4" } }, recipes: { density: "comfortable", corners: "round" }, background: { focusX: 0.74, focusY: 0.45, safeArea: "left", homeOpacity: 0.96, taskOpacity: 0.18, overlayStrength: 0.72, paneOpacity: 0.50 } },
+    { ...mockOfficialThemeAssets["official-noir-gold"], id: "official-noir-gold", name: "Noir Gold", author: "Reasonix Contributors", license: "MIT", baseStyle: "carbon", builtin: true, kind: "official", active: false, hasBackground: true, nameKey: "settings.themes.official.official-noir-gold.name", descriptionKey: "settings.themes.official.official-noir-gold.description", tokens: { light: { bg: "#FCF8EE", fg: "#2A241B", accent: "#7A5A16" }, dark: { bg: "#0D0B09", fg: "#F8F1DF", accent: "#D9B45B" } }, recipes: { density: "comfortable", corners: "soft" }, background: { focusX: 0.73, focusY: 0.43, safeArea: "left", homeOpacity: 0.94, taskOpacity: 0.18, overlayStrength: 0.74, paneOpacity: 0.50 } },
   ];
   const day = 86_400_000;
   const t0 = Date.now();
@@ -1060,7 +1176,6 @@ function makeMockApp(): AppBindings {
       tools: 4,
       prompts: 2,
       resources: 0,
-      trustedReadOnlyTools: ["pull_request_read"],
       toolList: [
         { name: "issue_read", description: "Read GitHub issue details and comments.", readOnlyHint: true },
         { name: "pull_request_read", description: "Read pull request metadata, files, and review threads.", readOnlyHint: true },
@@ -1373,6 +1488,7 @@ function makeMockApp(): AppBindings {
     desktopLayoutStyle: "workbench",
     desktopTheme: "auto",
     desktopThemeStyle: "graphite",
+    conversationWidth: "standard",
     closeBehavior: "background",
     displayMode: "compact",
     statusBarStyle: "text",
@@ -1961,6 +2077,45 @@ function makeMockApp(): AppBindings {
         });
         return;
       }
+      if (trimmedInput === "/recovery-preview" || trimmedInput === "recovery preview" || trimmedInput === "恢复预览") {
+        pendingApprovalPreview = true;
+        pendingApprovalPreviewPrompt = { id: "mock-recovery-preview", tool: "write_file" };
+        await delay(250);
+        if (cancelled) return;
+        emit({
+          kind: "approval_request",
+          approval: {
+            id: "mock-recovery-preview",
+            tool: "write_file",
+            subject: "internal/recovery/gate.go",
+            reason: "The proposed recovery changes the implementation method after a failing verification.",
+            fresh: true,
+            kind: "recovery",
+            recovery: {
+              source_agent: "root",
+              failed_tool: "bash",
+              failed_summary: "go test ./internal/recovery failed",
+              diagnosis: "The failure is isolated to recovery state persistence.",
+              next_tool: "write_file",
+              next_action: "Update internal/recovery/gate.go",
+              change_kind: "strategy",
+              change_rationale: "The proposed edit changes the recovery method and needs a fresh decision.",
+              plan_before: [
+                "1. Keep the existing Auto execution path [in_progress]",
+                "2. Add execution-risk approval prompts [pending]",
+                "3. Run the recovery regression suite [pending]",
+              ].join("\n"),
+              plan_after: [
+                "1. Keep the existing Auto execution path [in_progress]",
+                "2. Ask only when strategy or scope changes [pending]",
+                "3. Show the old and proposed plan before deciding [pending]",
+                "4. Run the recovery regression suite [pending]",
+              ].join("\n"),
+            },
+          },
+        });
+        return;
+      }
       if (
         trimmedInput === "/sandbox-escape-preview" ||
         trimmedInput === "sandbox escape preview" ||
@@ -2277,6 +2432,29 @@ function makeMockApp(): AppBindings {
         },
         async ApproveTab(_tabID, id, allow, session, persist) {
           await withMockTabScope(_tabID, () => this.Approve(id, allow, session, persist));
+        },
+        async ResolveRecovery(id, action, feedback) {
+          const active = mockTabs.find((tab) => tab.active);
+          await this.ResolveRecoveryTab(active?.id ?? "", id, action, feedback);
+        },
+        async ResolveRecoveryTab(_tabID, id, action, feedback) {
+          void id;
+          void feedback;
+          pendingApprovalPreview = false;
+          pendingApprovalPreviewPrompt = undefined;
+          emit({
+            kind: "message",
+            text: `recovery preview answered: ${action}`,
+          });
+          emitMockTurnDone();
+        },
+        async SetRecoveryCheckpointEnabled(_enabled) {},
+        async SetRecoveryCheckpointEnabledTab(_tabID, _enabled) {},
+        async RecoveryCheckpointEnabled() {
+          return true;
+        },
+        async RecoveryCheckpointEnabledTab(_tabID) {
+          return true;
         },
         async AnswerQuestion(_id, answers) {
       if (!pendingAskPreview) return;
@@ -2751,32 +2929,41 @@ function makeMockApp(): AppBindings {
     async MCPServers() {
       return capServers.map((s) => ({ ...s }));
     },
-    async InspectMCPTrust(name: string) {
-      const server = capServers.find((s) => s.name === name);
-      if (!server) throw new Error(`MCP server ${name} not found`);
+    async MCPMarketplace(query: string) {
+      const servers = [
+        {
+          name: "io.modelcontextprotocol/server-filesystem",
+          suggestedName: "server-filesystem",
+          title: "Filesystem",
+          description: "Secure file operations through MCP.",
+          version: "1.0.0",
+          installable: true,
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-filesystem@1.0.0"],
+        },
+        {
+          name: "io.example/manual",
+          suggestedName: "manual",
+          title: "Manual setup example",
+          description: "Requires an API key before installation.",
+          version: "1.0.0",
+          installable: false,
+          unavailableReason: "package requires environment variables or arguments",
+          args: [],
+        },
+      ];
+      const normalized = query.trim().toLowerCase();
       return {
-        name, trustState: server.trustState || "untrusted",
-        trustSource: server.trustSource, trustScope: server.trustScope,
-        isolationState: server.isolationState || (server.transport === "stdio" ? "enforced" : "not_applicable"),
-        isolationReason: server.isolationReason,
-        identityChanged: server.identityChanged, changedTools: [...(server.changedTools || [])],
-        readers: (server.toolList || []).filter((tool) => tool.readOnlyHint).map((tool) => tool.name),
-        writers: (server.toolList || []).filter((tool) => !tool.readOnlyHint && !tool.destructiveHint).map((tool) => tool.name),
-        destructive: (server.toolList || []).filter((tool) => tool.destructiveHint).map((tool) => tool.name),
-      };
+        servers: normalized ? servers.filter((entry) => [entry.name, entry.title, entry.description].join(" ").toLowerCase().includes(normalized)) : servers,
+        cached: false,
+      } as MCPMarketplaceView;
     },
-    async SetMCPTrust(name: string, decision: "session" | "workspace" | "revoke") {
-      capServers = capServers.map((server) => server.name === name ? {
-        ...server,
-        trustState: decision === "revoke" ? "untrusted" : decision,
-        trustSource: decision === "revoke" ? undefined : "user",
-        trustScope: decision === "revoke" ? undefined : decision,
-        identityChanged: false,
-        changedTools: [],
-      } : server);
-    },
-    async RefreshMCPCatalog() {
-      return { source: "bundled", sequence: 0, offline: false, stale: false };
+    async MCPMarketplaceResolve(registryName: string) {
+      const result = await this.MCPMarketplace(registryName);
+      const entry = result.servers.find((candidate) => candidate.name.toLowerCase() === registryName.trim().toLowerCase());
+      if (!entry) throw new Error(`MCP Registry has no server named ${JSON.stringify(registryName)}`);
+      return entry;
     },
     async SkillsSettings() {
       return {
@@ -2933,15 +3120,16 @@ function makeMockApp(): AppBindings {
         tools,
         prompts: 0,
         resources: 0,
-        trustState: "untrusted",
-        isolationState: input.transport === "stdio" ? "enforced" : "not_applicable",
-        changedTools: [],
         toolList: Array.from({ length: tools }, (_, i) => ({
           name: `${input.name}_tool_${i + 1}`,
           description: `Mock tool ${i + 1} exposed by ${input.name}.`,
         })),
       });
       return tools;
+    },
+    async InstallMCPServer(input: MCPServerInput) {
+      const tools = await this.AddMCPServer(input);
+      return { name: input.name, state: "ready" as const, toolCount: tools, action: "none" as const, message: `${input.name} is ready` };
     },
     async UpdateMCPServer(name: string, input: MCPServerInput) {
       capServers = capServers.map((s) => {
@@ -2958,7 +3146,6 @@ function makeMockApp(): AppBindings {
           url: input.transport === "stdio" ? "" : input.url,
           envKeys: input.env ? Object.keys(input.env).sort() : s.envKeys,
           headerKeys: input.headers ? Object.keys(input.headers).sort() : s.headerKeys,
-          trustedReadOnlyTools: input.trustedReadOnlyTools ?? s.trustedReadOnlyTools,
           tools: nextTools,
           error: undefined,
           authStatus: nextStatus !== "connected" && input.transport !== "stdio" ? "possible" : undefined,
@@ -2968,6 +3155,20 @@ function makeMockApp(): AppBindings {
     },
     async RemoveMCPServer(name: string) {
       capServers = capServers.filter((s) => s.name !== name);
+    },
+    async AuthorizeAndConnectMCPServer(name: string) {
+      capServers = capServers.map((s) =>
+        s.name === name
+          ? {
+              ...s,
+              status: "connected",
+              runtimeState: "ready",
+              tools: s.tools || 4,
+              error: undefined,
+              requiresLaunchApproval: false,
+            }
+          : s,
+      );
     },
     async ReconnectMCPServer(name: string) {
       capServers = capServers.map((s) =>
@@ -3208,6 +3409,14 @@ function makeMockApp(): AppBindings {
         ],
       };
     },
+    async WorkspaceChangeDetail(_tabID: string, path: string) {
+      return {
+        source: "git" as const,
+        added: 2,
+        removed: 1,
+        diff: `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1,2 +1,3 @@\n-old line\n+new line\n context\n+another line`,
+      };
+    },
     async GitBranches() {
       return ["main", "dev", "feature/branch-switcher"];
     },
@@ -3288,6 +3497,20 @@ function makeMockApp(): AppBindings {
       a.click();
       a.remove();
       if (!base64Encoded) URL.revokeObjectURL(url);
+    },
+    async SaveExportImageFiles(path: string, payloads: string[]) {
+      if (payloads.length === 0) throw new Error("No image payloads to export");
+      const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+      const dot = path.lastIndexOf(".");
+      const extensionStart = dot > slash ? dot : path.length;
+      const stem = path.slice(0, extensionStart);
+      const extension = path.slice(extensionStart);
+      for (let index = 0; index < payloads.length; index++) {
+        const partPath = payloads.length > 1
+          ? `${stem}-${index + 1}-of-${payloads.length}${extension}`
+          : path;
+        await this.SaveExportFile(partPath, payloads[index], true);
+      }
     },
     async AttachDropped(path: string) {
       const name = path.split(/[/\\]/).filter(Boolean).pop() ?? path;
@@ -3452,7 +3675,7 @@ function makeMockApp(): AppBindings {
       return this.SaveDoc(path, body);
     },
     async DesktopStartupSettings() {
-      const { bot, desktopLanguage, desktopLayoutStyle, desktopTheme, desktopThemeStyle, displayMode, statusBarStyle, statusBarItems, checkUpdates } = settings;
+      const { bot, desktopLanguage, desktopLayoutStyle, desktopTheme, desktopThemeStyle, displayMode, statusBarStyle, statusBarItems, checkUpdates, conversationWidth } = settings;
       return JSON.parse(JSON.stringify({
         bot,
         desktopLanguage,
@@ -3463,6 +3686,7 @@ function makeMockApp(): AppBindings {
         statusBarStyle,
         statusBarItems,
         checkUpdates,
+        conversationWidth,
       })) as DesktopStartupSettingsView;
     },
     async Settings() {
@@ -3514,10 +3738,14 @@ function makeMockApp(): AppBindings {
       settings.agent = { ...settings.agent, maxParallelWriters: writers };
     },
     async SetAutoPlan(mode: string) {
-      settings.autoPlan = mode;
+      if (mode !== "off") throw new Error("Automatic plan mode has been retired; use Plan Mode explicitly.");
+      settings.autoPlan = "off";
     },
     async SetDefaultToolApprovalMode(mode: string) {
       settings.defaultToolApprovalMode = normalizeToolApprovalMode(mode);
+    },
+    async SetDefaultAutoRecoveryCheckpoint(_enabled: boolean) {
+      // Legacy no-op; Auto Guard is always built into Auto.
     },
     async SaveProvider(p: ProviderView) {
       p.added = true;
@@ -3891,6 +4119,9 @@ function makeMockApp(): AppBindings {
         async SetDesktopMetrics(enabled: boolean) {
           settings.metrics = enabled;
         },
+        async SetDesktopConversationWidth(width: string) {
+          settings.conversationWidth = width;
+        },
         async SetExpandThinking(_on: boolean) {},
         async MigrateDesktopPreferences(language: string, theme: string, style: string) {
           if (!settings.desktopLanguage) settings.desktopLanguage = language === "en" || language === "zh" || language === "zh-TW" ? language : "";
@@ -3969,15 +4200,18 @@ function makeMockApp(): AppBindings {
         window.open("https://reasonix.io/?download=desktop#start", "_blank", "noopener");
       }
     },
-    // Dev seam: drives the overlay flow in the browser until ConnectKey sets the
-    // key. Matches ConnectKey on apiKeyEnv so the two stay in sync.
+    // Dev seam: match the backend's provider-agnostic onboarding predicate.
     async NeedsOnboarding() {
-      return !settings.providers.find((p) => p.apiKeyEnv === "DEEPSEEK_API_KEY")?.keySet;
+      return !settings.providers.some((p) => p.models.length > 0 && providerIsConfigured(p));
     },
     async ConnectKey(apiKey: string) {
       if (!apiKey.trim()) throw new Error("key is required");
       settings.providers.forEach((p) => {
-        if (p.apiKeyEnv === "DEEPSEEK_API_KEY") p.keySet = true;
+        if (p.apiKeyEnv === "DEEPSEEK_API_KEY") {
+          p.added = true;
+          p.keySet = true;
+          p.configured = true;
+        }
       });
       await delay(300);
       return "";
@@ -4333,5 +4567,156 @@ function makeMockApp(): AppBindings {
         ],
       };
     },
+
+    // ── Remote (SSH) mock ──
+    async RemoteHosts() {
+      return mockRemoteHosts.slice();
+    },
+    async AddRemoteHost(input) {
+      const view = mockRemoteHostView(input.label, input);
+      mockRemoteHosts = [...mockRemoteHosts.filter((h) => h.id !== view.id), view];
+      return view;
+    },
+    async UpdateRemoteHost(id, input) {
+      const previous = mockRemoteHosts.find((h) => h.id === id);
+      const view = mockRemoteHostView(id, input, previous);
+      mockRemoteHosts = mockRemoteHosts.map((h) => (h.id === id ? view : h));
+      return view;
+    },
+    async RemoveRemoteHost(id) {
+      mockRemoteHosts = mockRemoteHosts.filter((h) => h.id !== id);
+      delete mockRemoteConn[id];
+    },
+    async ScanSSHConfig() {
+      return [
+        { label: "gpu-box", host: "gpu-box", port: 0, user: "", identityFile: "", proxyJump: "", defaultWorkspace: "", serveInstall: "auto", useSSHConfig: true, preserveExistingSettings: true },
+      ];
+    },
+    async ConnectRemoteHost(id) {
+      mockRemoteConn[id] = "connecting";
+      __emitMockRemote("status", { hostId: id, state: "connecting" });
+      setTimeout(() => {
+        mockRemoteConn[id] = "connected";
+        __emitMockRemote("status", { hostId: id, state: "connected" });
+      }, 300);
+    },
+    async DisconnectRemoteHost(id) {
+      mockRemoteConn[id] = "stopped";
+      __emitMockRemote("status", { hostId: id, state: "stopped" });
+    },
+    async RemoteConnectionStatuses() {
+      return Object.entries(mockRemoteConn).map(([hostId, state]) => ({ hostId, state: state as RemoteConnectionStatus["state"] }));
+    },
+    async ConfirmRemoteHostKey(hostId, accept) {
+      mockRemoteConn[hostId] = accept ? "connected" : "stopped";
+      __emitMockRemote("status", { hostId, state: mockRemoteConn[hostId] });
+    },
+    async ConfirmRemoteSecret(hostId, _promptId, _secret, accept) {
+      mockRemoteConn[hostId] = accept ? "connected" : "stopped";
+      __emitMockRemote("status", { hostId, state: mockRemoteConn[hostId] });
+    },
+    async ListRemoteDir(_hostId, path) {
+      const base = path.replace(/\/$/, "");
+      return [
+        { name: "src", path: `${base}/src`, isDir: true, size: 0, mtimeUnix: 1_700_000_000, symlink: false },
+        { name: "README.md", path: `${base}/README.md`, isDir: false, size: 1024, mtimeUnix: 1_700_000_500, symlink: false },
+      ];
+    },
+    async ReadRemoteFile(_hostId, path) {
+      return { path, body: `# Mock remote file\n${path}\n`, size: 40, mtimeUnix: 1_700_000_500, truncated: false, binary: false };
+    },
+    async WriteRemoteFile(_hostId, _path, _body, _expectMtimeUnix) {
+      return { ok: true, conflict: false, newMtimeUnix: 1_700_000_900 };
+    },
+    async MkdirRemote() {},
+    async RenameRemotePath() {},
+    async DeleteRemotePath() {},
+    async RemoteForwards(hostId) {
+      return mockRemoteForwards[hostId] ?? [];
+    },
+    async AddRemoteForward(hostId, input) {
+      const view: RemoteForwardView = { id: `L:${input.localPort}`, hostId, ...input, state: "active" };
+      mockRemoteForwards[hostId] = [...(mockRemoteForwards[hostId] ?? []), view];
+      __emitMockRemote("forwards", { hostId, forwards: mockRemoteForwards[hostId] });
+      return view;
+    },
+    async RemoveRemoteForward(hostId, forwardId) {
+      mockRemoteForwards[hostId] = (mockRemoteForwards[hostId] ?? []).filter((f) => f.id !== forwardId);
+      __emitMockRemote("forwards", { hostId, forwards: mockRemoteForwards[hostId] });
+    },
+    async EnsureRemoteServer(hostId, workspace) {
+      for (const state of ["starting", "detect", "launch", "ready"] as const) {
+        __emitMockRemote("server", { hostId, workspace, state, localUrl: state === "ready" ? "http://127.0.0.1:44321/" : "" });
+      }
+    },
+    async OpenRemoteWorkspace() {},
+    async StopRemoteServer(hostId) {
+      __emitMockRemote("server", { hostId, workspace: "", state: "stopped" });
+    },
+    async RemoteServerStatus(hostId) {
+      return { hostId, workspace: "~/app", state: "stopped" };
+    },
+    async RemoteServerLogs() {
+      return "mock serve log line 1\nmock serve log line 2\n";
+    },
+    async RemoteLastWorkspace() {
+      return "~/app";
+    },
+    async WorkbenchActiveTarget() {
+      return { ...mockWorkbenchTarget };
+    },
+    async WorkbenchLastRemoteHint() {
+      return mockWorkbenchTarget.kind === "ssh"
+        ? { hostId: mockWorkbenchTarget.hostId, workspace: mockWorkbenchTarget.workspace, label: mockWorkbenchTarget.hostId }
+        : {};
+    },
+    async WorkbenchSwitchLocal() {
+      mockWorkbenchTarget = { kind: "local", identityGen: (mockWorkbenchTarget.identityGen ?? 0) + 1, requestSeq: 1 };
+      return { ...mockWorkbenchTarget };
+    },
+    async WorkbenchConnectRemote(hostId, workspace) {
+      mockWorkbenchTarget = {
+        kind: "ssh",
+        hostId,
+        workspace,
+        identityGen: (mockWorkbenchTarget.identityGen ?? 0) + 1,
+        requestSeq: 1,
+      };
+    },
+    async WorkbenchDisconnectRemote() {
+      mockWorkbenchTarget = { kind: "local", identityGen: (mockWorkbenchTarget.identityGen ?? 0) + 1, requestSeq: 1 };
+    },
+    async WorkbenchRemoteRequest(_method, _paramsJSON) {
+      return "{}";
+    },
+    async WorkbenchResolveProviderTrust() {},
+    async WorkbenchPendingProviderTrust() {
+      return null;
+    },
   };
 }
+
+// Mock remote state, module-scoped so it survives across mock method calls.
+function mockRemoteHostView(id: string, input: RemoteHostInput, previous?: RemoteHostView): RemoteHostView {
+  return {
+    id,
+    label: input.label,
+    host: input.host,
+    port: input.port,
+    user: input.user,
+    identityFile: input.identityFile,
+    proxyJump: input.proxyJump,
+    defaultWorkspace: input.defaultWorkspace,
+    serveInstall: input.serveInstall,
+    useSSHConfig: input.useSSHConfig,
+    passwordSet: input.password ? true : input.clearPassword ? false : previous?.passwordSet,
+    keyPassphraseSet: input.keyPassphrase ? true : input.clearPassphrase ? false : previous?.keyPassphraseSet,
+  };
+}
+
+let mockRemoteHosts: RemoteHostView[] = [
+  { id: "demo", label: "demo", host: "192.168.1.10", port: 22, user: "dev", identityFile: "", proxyJump: "", defaultWorkspace: "~/app", serveInstall: "auto", useSSHConfig: false },
+];
+const mockRemoteConn: Record<string, RemoteConnectionStatus["state"]> = {};
+const mockRemoteForwards: Record<string, RemoteForwardView[]> = {};
+let mockWorkbenchTarget: WorkbenchActiveTarget = { kind: "local", identityGen: 1, requestSeq: 1 };

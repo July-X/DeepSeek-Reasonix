@@ -34,6 +34,7 @@ import (
 	"reasonix/internal/permission"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
+	"reasonix/internal/recovery"
 	"reasonix/internal/sandbox"
 	"reasonix/internal/skill"
 	"reasonix/internal/tool"
@@ -894,6 +895,15 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the mouse: copy an active selection, otherwise paste clipboard text into
 		// the visible composer. Left-press begins a selection unless it lands on
 		// the transcript scrollbar or a shell-output hint line.
+		// Middle-click pastes tmux's current buffer when tmux owns the pane;
+		// otherwise it follows the X11/Wayland PRIMARY-selection convention.
+		if msg.Button == tea.MouseMiddle {
+			if m.hideComposer() {
+				return m, nil
+			}
+			cmds = append(cmds, pasteMiddleClick())
+			return m, finalize(m, cmds)
+		}
 		if msg.Button == tea.MouseRight && m.validComposerSelection() && !m.composerSel.empty() {
 			cmds = append(cmds, m.copySelectionWithNotice(m.selectedComposerText()))
 			return m, finalize(m, cmds)
@@ -1476,11 +1486,6 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			sentLine := m.expandPastedBlocks(line)
 			m.input.Reset()
-			if goal, ok := m.ctrl.AutoStartResearchGoal(sentLine); ok {
-				m.pastedBlocks = nil
-				cmds = append(cmds, m.startTurnWithRaw("Start pursuing the active goal now.", line, line, goal))
-				return m, finalize(m, cmds)
-			}
 
 			// @references (local files / MCP resources, including inline image
 			// attachments) are resolved off the event loop by the controller; the turn
@@ -1490,9 +1495,8 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, finalize(m, cmds)
 			}
 
-			// `raw` is the un-resolved user prompt used for auto-plan scoring. It must
-			// be the EXPANDED paste content (sentLine), not the folded label (line), so
-			// downstream consumers of the raw turn never see just the placeholder label.
+			// Keep the expanded paste content as the raw turn, not the folded label,
+			// so downstream consumers never see just the placeholder label.
 			cmds = append(cmds, m.startTurnWithRaw(sentLine, sentLine, line, sentLine))
 			return m, finalize(m, cmds)
 		}
@@ -2547,6 +2551,14 @@ func approvalChoices(a *event.Approval) []approvalChoice {
 	var decisions []approvalChoice
 	fresh := a.Fresh || control.RequiresFreshHumanApprovalTool(a.Tool)
 	switch {
+	case isRecoveryApprovalEvent(a):
+		if a.Recovery != nil && a.Recovery.CanGrantTask {
+			// allowForSession is reused only as a local UI marker. The recovery
+			// handler maps it to a task-scoped semantic grant, never a session rule.
+			decisions = []approvalChoice{{allow: true}, {allow: true, allowForSession: true}, {}}
+		} else {
+			decisions = []approvalChoice{{allow: true}, {}}
+		}
 	case a.Tool == planApprovalTool:
 		decisions = []approvalChoice{{allow: true}, {}}
 	case fresh && freshApprovalAllowsSession(a.Tool):
@@ -2573,7 +2585,16 @@ func approvalChoices(a *event.Approval) []approvalChoice {
 func approvalChoiceLabels(a *event.Approval) []string {
 	choices := i18n.M.FreshHumanApprovalChoices
 	fresh := a.Fresh || control.RequiresFreshHumanApprovalTool(a.Tool)
-	if a.Tool == planApprovalTool {
+	if isRecoveryApprovalEvent(a) {
+		if isRecoveryPlanChangeApproval(a) {
+			choices = i18n.M.RecoveryPlanChangeChoices
+		} else {
+			choices = i18n.M.RecoveryApprovalChoices
+		}
+		if !isRecoveryPlanChangeApproval(a) && a.Recovery != nil && a.Recovery.CanGrantTask {
+			choices = i18n.M.RecoveryTaskGrantChoices
+		}
+	} else if a.Tool == planApprovalTool {
 		choices = i18n.M.FreshHumanApprovalChoices
 	} else if !fresh {
 		exactSessionRule := permission.SessionGrantRuleForScope(a.Tool, a.Subject)
@@ -2601,6 +2622,11 @@ func approvalChoiceLabels(a *event.Approval) []string {
 		}
 		labels = append(labels, strings.TrimSpace(line[2:]))
 	}
+	if isRecoveryApprovalEvent(a) && a.Recovery != nil && a.Recovery.CanGrantTask && len(labels) > 1 {
+		if scope := strings.TrimSpace(a.Recovery.TaskGrantScope); scope != "" {
+			labels[1] += " — " + scope
+		}
+	}
 	return labels
 }
 
@@ -2616,6 +2642,18 @@ func (m chatTUI) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	choices := approvalChoices(m.pendingApproval)
 	answer := func(choice approvalChoice) (tea.Model, tea.Cmd) {
 		allow, session, persist := choice.allow, choice.allowForSession, choice.persistToConfig
+		if isRecoveryApprovalEvent(m.pendingApproval) {
+			action := agent.RecoveryActionRevise
+			if allow {
+				action = agent.RecoveryActionContinue
+				if session {
+					action = agent.RecoveryActionContinueTask
+				}
+			}
+			_ = m.ctrl.ResolveRecovery(m.pendingApproval.ID, action, "")
+			m.pendingApproval = nil
+			return m, nil
+		}
 		if allow && m.pendingApproval.Tool == planApprovalTool {
 			m.planMode = false
 		}
@@ -2628,7 +2666,9 @@ func (m chatTUI) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.ctrl.Cancel()
 		return answer(approvalChoice{})
 	case "up", "k", "ctrl+p":
-		if m.approvalSelection > 0 {
+		if m.approvalSelection < 0 && len(choices) > 0 {
+			m.approvalSelection = 0
+		} else if m.approvalSelection > 0 {
 			m.approvalSelection--
 		}
 		return m, nil
@@ -2680,6 +2720,22 @@ func (m chatTUI) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return answer(approvalChoice{})
 	}
 	return m, nil
+}
+
+func isRecoveryApprovalEvent(a *event.Approval) bool {
+	return a != nil && (a.Kind == recovery.ApprovalKindRecovery || a.Recovery != nil)
+}
+
+func isRecoveryPlanChangeApproval(a *event.Approval) bool {
+	if !isRecoveryApprovalEvent(a) || a.Recovery == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(a.Recovery.ChangeKind)) {
+	case string(recovery.ChangeStrategy), string(recovery.ChangeScope):
+		return true
+	default:
+		return false
+	}
 }
 
 func freshApprovalAllowsSession(toolName string) bool {
@@ -3072,8 +3128,19 @@ func (m chatTUI) renderApprovalBanner() string {
 		return ""
 	}
 	var text string
+	var planDetails []string
 	if m.pendingApproval.Tool == planApprovalTool {
 		text = i18n.M.PlanApprovalPrompt
+	} else if isRecoveryPlanChangeApproval(m.pendingApproval) {
+		text = i18n.M.RecoveryPlanDecisionPrompt
+		if rec := m.pendingApproval.Recovery; rec != nil {
+			if before := compactApprovalPlan(rec.PlanBefore); before != "" {
+				planDetails = append(planDetails, fmt.Sprintf(i18n.M.RecoveryPlanBeforeFmt, truncateSubject(before, w)))
+			}
+			if after := compactApprovalPlan(rec.PlanAfter); after != "" {
+				planDetails = append(planDetails, fmt.Sprintf(i18n.M.RecoveryPlanAfterFmt, truncateSubject(after, w)))
+			}
+		}
 	} else {
 		name, detail := approvalToolDetails(m.pendingApproval.Tool)
 		subj := strings.TrimSpace(m.pendingApproval.Subject)
@@ -3085,6 +3152,9 @@ func (m chatTUI) renderApprovalBanner() string {
 	if reason := strings.TrimSpace(m.pendingApproval.Reason); reason != "" {
 		text += " · " + truncateSubject(reason, w)
 	}
+	if len(planDetails) > 0 {
+		text += "\n" + strings.Join(planDetails, "\n")
+	}
 	var b strings.Builder
 	b.WriteString("⏸ " + text + "\n")
 	for i, choice := range approvalChoices(m.pendingApproval) {
@@ -3092,6 +3162,10 @@ func (m chatTUI) renderApprovalBanner() string {
 	}
 	b.WriteString(dim("↑/↓ navigate · Enter select · y/a/p/n shortcuts"))
 	return choicePanelStyle.Width(w).Render(b.String())
+}
+
+func compactApprovalPlan(plan string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(strings.TrimSpace(plan), "\n", " · ")), " ")
 }
 
 // approvalToolDetails turns provider-visible tool IDs into user-facing labels.
@@ -3504,9 +3578,9 @@ func (m *chatTUI) startTurn(sent, displayed, restore string) tea.Cmd {
 	return m.startTurnWithRaw(sent, displayed, restore, sent)
 }
 
-// startTurnWithRaw is startTurn plus an explicit `raw` (the un-resolved user
-// prompt) used only for the controller's auto-plan scoring, so resolved
-// @-reference payloads can't inflate the complexity signal.
+// startTurnWithRaw is startTurn plus an explicit unresolved user prompt. This
+// keeps reference-expanded model input separate from the text shown/restored by
+// the frontend.
 func (m *chatTUI) startTurnWithRaw(sent, displayed, restore, raw string) tea.Cmd {
 	return m.startControllerTurn(displayed, restore, func() { m.ctrl.SendWithRaw(sent, raw) })
 }
@@ -3749,6 +3823,11 @@ func (m *chatTUI) ingestEvent(e event.Event) {
 		a := e.Approval
 		m.pendingApproval = &a
 		m.approvalSelection = 0
+		if isRecoveryPlanChangeApproval(&a) {
+			// A plan decision must start neutral: Enter alone cannot make Auto's
+			// strategy/scope choice for the user.
+			m.approvalSelection = -1
+		}
 
 	case event.AskRequest:
 		// The `ask` tool raised a question card; the run goroutine blocks until
@@ -3868,9 +3947,6 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 	case "/work-mode", "/profile":
 		m.echoLocalCommand(input)
 		return m.runWorkModeCommand(input)
-	case "/auto-plan":
-		m.echoLocalCommand(input)
-		m.runAutoPlanCommand(input)
 	case "/reasoning-language":
 		m.echoLocalCommand(input)
 		m.runReasoningLanguageCommand(input)
@@ -3889,6 +3965,9 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 	case "/mcp":
 		m.echoLocalCommand(input)
 		m.runMCPSubcommand(input)
+	case "/remote":
+		m.echoLocalCommand(input)
+		m.showRemoteHosts()
 	case "/plugin", "/plugins":
 		m.echoLocalCommand(input)
 		m.runPluginSubcommand(input)
@@ -4392,6 +4471,34 @@ func (m *chatTUI) notice(note string) {
 	m.commitLine(dim("  · " + note))
 }
 
+// showRemoteHosts renders a read-only summary of configured remote hosts. The
+// remote session lives in a `reasonix serve` on the remote host, so connecting
+// happens from a terminal (`reasonix remote connect`), not inside this chat.
+func (m *chatTUI) showRemoteHosts() {
+	cfg, err := config.Load()
+	if err != nil {
+		m.notice(err.Error())
+		return
+	}
+	if len(cfg.Remote.Hosts) == 0 {
+		m.notice(i18n.M.RemoteNoHostsHint)
+		return
+	}
+	var b strings.Builder
+	for _, h := range cfg.Remote.Hosts {
+		target := h.Host
+		if h.User != "" {
+			target = h.User + "@" + target
+		}
+		if h.Port != 0 && h.Port != 22 {
+			target = fmt.Sprintf("%s:%d", target, h.Port)
+		}
+		fmt.Fprintf(&b, "  · %s  %s\n", h.Name, target)
+	}
+	fmt.Fprintf(&b, "  run `reasonix remote connect <name>` in a terminal to open the remote workspace")
+	m.commitLine(dim(b.String()))
+}
+
 // resolveRefs resolves a line's @references off the event loop via the
 // controller, delivering a refsResolvedMsg with the tagged context block.
 func (m *chatTUI) resolveRefs(sent, display, restore string) tea.Cmd {
@@ -4414,12 +4521,27 @@ func (m *chatTUI) runMCPPrompt(input string) tea.Cmd {
 	}
 }
 
-// replaySectionsFor turns a loaded session into scrollback blocks: user bubbles
-// and assistant markdown. Tool messages are dropped — needed in session state
-// but noise in the visible transcript on resume.
+// replaySectionsFor turns a loaded session into scrollback blocks. Normal tool
+// results remain quiet, while interrupted-turn reasoning and tool cards replay
+// from provider-excluded LocalOnly records so restart matches the live view.
 func replaySectionsFor(history []provider.Message, width int) []string {
 	var out []string
 	for _, m := range history {
+		if m.LocalOnly {
+			if reasoning := strings.TrimSpace(m.ReasoningContent); reasoning != "" {
+				out = append(out, dim("  ▎ "+i18n.M.ChatThinking)+"\n"+reasoningBlock(reasoning, width, 0)+"\n\n")
+			}
+			if body := strings.TrimSpace(m.Content); body != "" {
+				out = append(out, renderAssistantMarkdown(body, width)+"\n\n")
+			}
+			for _, call := range m.ToolCalls {
+				out = append(out, toolCard(call.Name, "", width)+"\n\n")
+			}
+			if m.InterruptedTurn != nil {
+				out = append(out, fmt.Sprintf("  · %s\n\n", interruptedTurnDisplayNotice()))
+			}
+			continue
+		}
 		switch m.Role {
 		case provider.RoleUser:
 			// Steer messages are surfaced as a notice line, not a user bubble.
@@ -4430,14 +4552,23 @@ func replaySectionsFor(history []provider.Message, width int) []string {
 			content := control.StripComposePrefixes(m.Content)
 			out = append(out, renderUserBubble(content, width, false)+"\n\n")
 		case provider.RoleAssistant:
-			body := strings.TrimSpace(m.Content)
-			if body == "" {
-				continue
+			if reasoning := strings.TrimSpace(m.ReasoningContent); reasoning != "" {
+				out = append(out, dim("  ▎ "+i18n.M.ChatThinking)+"\n"+reasoningBlock(reasoning, width, 0)+"\n\n")
 			}
-			out = append(out, renderAssistantMarkdown(body, width)+"\n\n")
+			body := strings.TrimSpace(m.Content)
+			if body != "" {
+				out = append(out, renderAssistantMarkdown(body, width)+"\n\n")
+			}
+			for _, call := range m.ToolCalls {
+				out = append(out, toolCard(call.Name, call.Arguments, width)+"\n\n")
+			}
 		}
 	}
 	return out
+}
+
+func interruptedTurnDisplayNotice() string {
+	return i18n.M.InterruptedRecovery
 }
 
 // renderTUIBanner is the title + tip + optional missing-key warning printed once

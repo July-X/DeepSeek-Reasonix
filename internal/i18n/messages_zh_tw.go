@@ -25,11 +25,12 @@ var ChineseTraditional = Messages{
 	StepRunDesc:    "執行單次任務",
 	HelpFooter:     "reasonix help · 檢視全部命令",
 
-	ChatTip:           "對話上下文將跨輪保留。輸入 'exit' 或按 Ctrl-D 退出。",
-	TurnCancelled:     "已取消 — 回到提示符",
-	NoSessionToResume: "沒有可恢復的會話 — 用 `reasonix` 開一個新的",
-	ResumeRequiresTTY: "--resume 需要互動式終端；用 --continue 直接恢復最近一次",
-	PickSessionLabel:  "恢復哪個會話？",
+	ChatTip:             "對話上下文將跨輪保留。輸入 'exit' 或按 Ctrl-D 退出。",
+	TurnCancelled:       "已取消 — 回到提示符",
+	InterruptedRecovery: "本輪已中斷。部分輸出會永久保留供查看；只有完整工具呼叫及結果和有界恢復摘要會進入模型下一輪。繼續或回復前請先檢查目前工作區。",
+	NoSessionToResume:   "沒有可恢復的會話 — 用 `reasonix` 開一個新的",
+	ResumeRequiresTTY:   "--resume 需要互動式終端；用 --continue 直接恢復最近一次",
+	PickSessionLabel:    "恢復哪個會話？",
 
 	ResumeListHeader:    "會話（/resume <n> 切換）",
 	ResumeBusy:          "請先完成或取消當前這一輪再恢復會話",
@@ -76,6 +77,12 @@ var ChineseTraditional = Messages{
 	BashPrefixChoices:                      "1. 本次允許\n2. 本會話允許 %s\n3. 總是允許 %s（儲存到設定）\n4. 拒絕\n選擇 [1/2/3/4]（相容 y/a/p/n）",
 	PlanModeReadOnlyCommandChoices:         "1. 本次信任\n2. 本會話信任此前綴\n3. 總是在計劃模式信任此前綴（儲存到設定）\n4. 拒絕\n選擇 [1/2/3/4]（相容 y/a/p/n）",
 	FreshHumanApprovalChoices:              "1. 本次允許\n2. 拒絕\n選擇 [1/2]（相容 y/n）",
+	RecoveryApprovalChoices:                "1. 繼續一次\n2. 換個方案",
+	RecoveryPlanChangeChoices:              "1. 採用新計畫並繼續\n2. 不採用，讓 Auto 調整",
+	RecoveryPlanDecisionPrompt:             "執行計畫需要你的決定",
+	RecoveryPlanBeforeFmt:                  "原計畫：%s",
+	RecoveryPlanAfterFmt:                   "新計畫：%s",
+	RecoveryTaskGrantChoices:               "1. 繼續一次\n2. 繼續，並在本任務內允許同類操作\n3. 換個方案",
 	SandboxEscapeApprovalChoices:           "1. 允許一次\n2. 本會話使用真實環境\n3. 拒絕\n選擇 [1/2/3]（相容 y/a/n）",
 	ApprovalNeededFmt:                      "需要核准：%s",
 	ApprovalNeededWithSubjectFmt:           "需要核准：%s %s",
@@ -96,11 +103,6 @@ var ChineseTraditional = Messages{
 	MemoryApprovalSaveUpdate:               "儲存/更新記憶",
 	MemoryApprovalBodyLabel:                "正文",
 	MemoryApprovalArchiveFmt:               "封存記憶 %q",
-	MCPDestructiveSubjectFmt:               "MCP %s 宣告包含破壞性副作用",
-	MCPDestructiveReason:                   "這個已安裝的 MCP 工具宣告包含破壞性副作用。允許前請核對目標和參數；自動/YOLO 核准不能代答這個決定。",
-	MCPDestructiveDeclined:                 "使用者拒絕了這個破壞性 MCP 工具呼叫；不要重試，請詢問使用者希望如何繼續。",
-	MCPReviewerUnavailableReason:           "設定的自動核准 reviewer 不可用或未給出結論。這次呼叫需要使用者當場決定；自動/YOLO 核准與工作階段授權不能代答。",
-	MCPReviewerUnavailableDeclined:         "自動 reviewer 不可用後，使用者拒絕了這個 MCP 工具呼叫；不要重試，請詢問使用者希望如何繼續。",
 	PlanModeBashTrustSubjectFmt:            "在計劃模式中信任 %q 為唯讀命令前綴\n命令：%s",
 	PlanModeBashTrustReason:                "這條 bash 命令不在 Reasonix 內建唯讀集合中。只有在確認這個精確前綴用於計劃和研究時是唯讀的，才應核准。自動/YOLO 核准不能回答這個信任提示。",
 	PlanModeBashTrustDeclined:              "使用者拒絕將這條 bash 命令信任為計劃模式唯讀命令；不要重試它，請繼續使用其他已信任的唯讀工具，或詢問使用者希望如何繼續。",
@@ -200,7 +202,7 @@ var ChineseTraditional = Messages{
 	MouseCopiedHint:              "已複製到剪貼簿",
 	ClipboardCopyOSC52Hint:       "已透過 OSC 52 請求複製 — 可能需要終端授權",
 	ClipboardCopyFallbackHint:    "系統剪貼簿無法使用 — 已改用 OSC 52",
-	ClipboardTextPasteRemoteHint: "SSH 下右鍵貼上無法讀取本機剪貼簿 — 請使用終端貼上快捷鍵或 /mouse",
+	ClipboardTextPasteRemoteHint: "SSH 下滑鼠貼上無法讀取本機剪貼簿或 PRIMARY 選取區 — 請使用終端貼上快捷鍵或 /mouse",
 	ClipboardTextPasteFailedFmt:  "貼上文字失敗：%v",
 	ClipboardImagePastingHint:    "正在貼上圖片…",
 	ClipboardImagePasteFailedFmt: "貼上圖片失敗：%v",
@@ -229,6 +231,7 @@ var ChineseTraditional = Messages{
 	CmdRemember:         "儲存一條記憶",
 	CmdForget:           "刪除一條已存記憶",
 	CmdMcp:              "MCP 伺服器",
+	CmdRemote:           "遠端 SSH 主機",
 	CmdHooks:            "管理 hooks",
 	CmdPlugins:          "管理插件包",
 	CmdPasteImage:       "貼上剪貼簿圖片",
@@ -241,7 +244,6 @@ var ChineseTraditional = Messages{
 	CmdSandbox:          "檢視沙箱狀態",
 	CmdEffort:           "設定推理強度",
 	CmdMouse:            "切換滑鼠接管（關閉後由終端原生處理選取/右鍵）",
-	CmdAutoPlan:         "設定自動計畫模式",
 	CmdReasonLang:       "設定可見思考語言",
 	CmdHelp:             "檢視命令列表",
 	CmdTodo:             "清除任務清單",
@@ -419,6 +421,18 @@ var ChineseTraditional = Messages{
 	AnthropicFetchModelsFailedFmt:  "取得 %s 模型失敗: %v",
 	AnthropicSelectModelsLabel:     "選擇要啟用的 %s 模型",
 
+	RemoteConnectingFmt:       "正在連線 %s…",
+	RemoteConnectedFmt:        "已連線到 %s",
+	RemoteReconnectingFmt:     "正在重新連線 %s(第 %d 次)…",
+	RemoteDegradedFmt:         "已連線到 %s,但部分連接埠轉送未建立",
+	RemoteDisconnected:        "已中斷(遠端 serve 仍在執行)",
+	RemoteServeReadyFmt:       "遠端 serve 就緒:%s",
+	RemoteHostKeyPromptFmt:    "未知的主機金鑰 %s\n  類型:  %s\n  指紋:  %s",
+	RemotePassphrasePromptFmt: "%s 的金鑰通關密語:",
+	RemotePasswordPromptFmt:   "%s 的登入密碼:",
+	RemoteBootstrapStepFmt:    "遠端 serve:%s %s",
+	RemoteNoHostsHint:         "尚未設定遠端主機;用 `reasonix remote add <名稱> [user@]host` 新增",
+
 	UnknownCommandFmt:         "未知命令 %q",
 	UsageRunHint:              "用法：reasonix -p [--model NAME] <task>",
 	ErrorPrefix:               "錯誤：",
@@ -430,6 +444,8 @@ var ChineseTraditional = Messages{
 	ProviderErrAuth:                "認證失敗 (HTTP 401)：API key 缺失、錯誤或已過期。請檢查 .env 中的金鑰，或執行 `reasonix setup`。",
 	ProviderErrInsufficientBalance: "餘額不足 (HTTP 402)：帳戶餘額不足，請前往儲值後重試。",
 	ProviderErrUnprocessable:       "參數錯誤 (HTTP 422)：某個請求參數被拒絕，通常是程式缺陷。若持續出現請回報。",
+	ProviderErrInputSensitive:      "輸入被 MiniMax 內容審查拒絕（錯誤碼 1026）。審查對象可能包含對話歷史和工具結果；請調整相關內容，或建立新對話只保留必要上下文。原樣重試通常無效。",
+	ProviderErrOutputSensitive:     "MiniMax 產生的內容被內容審查拒絕（錯誤碼 1027）。請調整請求內容後重試；若持續出現，可改用其他服務商。",
 	ProviderErrRateLimited:         "請求速率達到上限 (HTTP 429)：請求過於頻繁 (TPM/RPM)。已退避重試，請放慢速率或稍後再試。",
 	ProviderErrServer:              "伺服器故障 (HTTP 500)：服務端內部錯誤。已退避重試；若持續失敗請稍後再試。",
 	ProviderErrServerBusy:          "伺服器繁忙 (HTTP 503)：服務端負載過高。已退避重試，請稍後再試。",
@@ -447,7 +463,6 @@ var ChineseTraditional = Messages{
   reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  透過 HTTP+SSE 提供服務（支援可選認證）
   reasonix acp [--model NAME]                           透過 stdio 提供 Agent Client Protocol（也可用：reasonix --acp）
   reasonix setup [path]                                 互動式設定精靈；生成 reasonix.toml（及 .env）
-  reasonix config auto-plan [off|on]                    設定自動計畫模式
   reasonix config reasoning-language [auto|zh|en]        設定可見思考語言
   reasonix mcp <add|remove|list|import>                 管理 reasonix.toml 裡的 MCP 伺服器
   reasonix subagent <list|create|edit|delete|try|run>   管理和執行隔離子智慧體 profile

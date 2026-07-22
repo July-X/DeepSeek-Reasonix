@@ -5,10 +5,10 @@ import { asArray } from "../lib/array";
 import { filterAtMatches } from "../lib/atMatches";
 import { DedupIndex, sha256 } from "../lib/attachDedup";
 import { app, onFilesDropped } from "../lib/bridge";
-import { canUsePromptHistory, isFnKeyEvent, promptHistoryDirectionFromEvent } from "../lib/composerKeyboard";
+import { canUsePromptHistory, composerEnterAction, insertComposerNewline, isFnKeyEvent, promptHistoryDirectionFromEvent } from "../lib/composerKeyboard";
 import { cacheGeneration, loadOlder } from "../lib/composerHistory";
 import { SPINNER_WORDS, useI18n } from "../lib/i18n";
-import { detectShortcutPlatform, formatShortcutCombo, matchesShortcut } from "../lib/keyboardShortcuts";
+import { detectShortcutPlatform, formatShortcutCombo, matchesShortcut, useShortcutComboLabel } from "../lib/keyboardShortcuts";
 import { fallbackCopyText } from "../lib/clipboard";
 import {
   commandUsesStructuredInvocation,
@@ -36,6 +36,8 @@ import { EffortSwitcher } from "./EffortSwitcher";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { Tooltip } from "./Tooltip";
 import { ComposerContextCard } from "./ComposerContextCard";
+import { Markdown } from "./Markdown";
+import { CodeViewer } from "./CodeViewer";
 import { ContextWindowRing } from "./ContextWindowRing";
 import { ImageViewer } from "./ImageViewer";
 import {
@@ -50,6 +52,8 @@ import { activeRefTokenRe, escapeRefPath, unescapeRefPath } from "../lib/refToke
 import { ContextMenu, contextMenuPointFromEvent, type ContextMenuItem, type ContextMenuPoint } from "./ContextMenu";
 import {
   formatSelectedTextContext,
+  formatSelectionLabel,
+  languageFor,
   normalizeSelectedText,
   selectedTextSnippet,
   type SelectedTextInsertRequest,
@@ -619,6 +623,7 @@ export function Composer({
   const { t, locale } = useI18n();
   const { showToast } = useToast();
   const shortcutPlatform = useMemo(() => detectShortcutPlatform(), []);
+  const sendComboLabel = useShortcutComboLabel("composer.send");
   const draftKey = sessionKey || tabId || DEFAULT_COMPOSER_DRAFT_KEY;
   const now = useTick(running);
   const [text, setText] = useState("");
@@ -1325,6 +1330,16 @@ export function Composer({
     lastSelectionRef.current = { start: ta.selectionStart ?? text.length, end: ta.selectionEnd ?? text.length };
   };
 
+  const insertNewlineAtCaret = () => {
+    const selection = getComposerSelection();
+    const updated = insertComposerNewline(textRef.current, invocationsRef.current, selection);
+    textRef.current = updated.text;
+    invocationsRef.current = updated.invocations;
+    setText(updated.text);
+    setInvocations(updated.invocations);
+    setComposerSelection(selection.start + 1);
+  };
+
   const insertTextAtCaret = (snippet: string) => {
     const selection = getComposerSelection();
     const start = selection.start;
@@ -1666,6 +1681,7 @@ export function Composer({
       const displayRefs = [
         ...currentWorkspaceRefs.map((ref) => formatWorkspaceReference(ref.displayPath || ref.path, ref.isDir)),
         ...orderedAttachments.map(formatAttachmentDisplayReference),
+        ...selectedTextRefsRef.current.map(formatSelectionLabel),
       ].join(" ");
       const displayText = [trimmedText, displayRefs].filter(Boolean).join(trimmedText && displayRefs ? " " : "");
       // PR-B: when past:chats refs are attached, prepend their formatted transcript
@@ -2726,10 +2742,27 @@ export function Composer({
       }
     }
 
-    // Enter sends; Shift+Enter newline. `composing` guards IME confirms.
-    if (e.key === "Enter" && !e.shiftKey && !composing) {
-      e.preventDefault();
-      submit();
+    // The send chord (default Enter) sends and the newline chord (default
+    // Shift+Enter) breaks the line — both configurable in Settings →
+    // Shortcuts. The default send layout retains legacy modified-Enter send
+    // aliases; explicit custom bindings are exact. `composing` guards IME confirms.
+    if (e.key === "Enter" && !composing) {
+      const enterAction = composerEnterAction(e.nativeEvent, shortcutPlatform);
+      if (enterAction === "newline-insert") {
+        e.preventDefault();
+        insertNewlineAtCaret();
+        return;
+      }
+      if (enterAction === "send") {
+        e.preventDefault();
+        submit();
+        return;
+      }
+      if (enterAction !== "newline-native") {
+        e.preventDefault();
+        return;
+      }
+      // "newline-native" falls through so the input inserts the break itself.
     }
     // Esc interrupts the in-flight turn (matches the Stop button's hint), and
     // restores the text if the server hadn't replied yet.
@@ -2930,13 +2963,15 @@ export function Composer({
   const submitEmpty = !text.trim() && attachments.length === 0 && workspaceRefs.length === 0 &&
     !invocations.some((invocation) => invocation.command.kind === "skill");
   const submitBlocked = submitting || pendingPaste > 0 || (submitEmpty && !(goalModeOn && !activeGoal)) || disabled || (!running && submitDisabled) || readOnly;
-  const submitTooltip = running ? t("composer.queueGuidance") : t("composer.send");
+  const submitTooltip = running
+    ? t("composer.queueGuidance", { combo: sendComboLabel })
+    : t("composer.send", { combo: sendComboLabel });
   const composerPlaceholder = readOnly
     ? t("composer.readOnlyChannel")
     : disabled
       ? t("common.loading")
       : running
-        ? t("composer.steerPlaceholder")
+        ? t("composer.steerPlaceholder", { combo: sendComboLabel })
         : goalModeOn && !activeGoal
           ? t("composer.goalInputPlaceholder")
           : t("composer.placeholder");
@@ -3450,7 +3485,9 @@ export function Composer({
             <ComposerContextCard
               key={reference.id}
               variant="selection"
-              tooltipLabel={reference.text}
+              tooltipLabel={reference.path
+                ? <CodeViewer value={reference.text} language={languageFor(reference.path)} maxHeight={240} />
+                : <Markdown text={reference.text} />}
               removeLabel={t("composer.removeSelectedText")}
               onRemove={() => {
                 const next = selectedTextRefsRef.current.filter((item) => item.id !== reference.id);

@@ -159,34 +159,36 @@ type FileDiff struct {
 // Approval identifies a pending tool-call approval for an ApprovalRequest
 // event. ID correlates the request with the controller's Approve(ID, …) reply.
 type Approval struct {
-	ID       string
-	Tool     string
-	Subject  string
-	Reason   string    // optional annotation explaining why approval is needed
-	Fresh    bool      // current human decision required; do not offer remembered grants
-	MCPTrust *MCPTrust // host-local MCP safety summary; nil for non-MCP approvals
-}
-
-// MCPTrust is the credential-free safety snapshot attached to an MCP tool
-// approval. It is a local UI/event payload only: provider requests never see it.
-type MCPTrust struct {
-	Server          string
-	TrustState      string
-	TrustSource     string
-	TrustScope      string
-	IsolationState  string
-	IsolationReason string
-	IdentityChanged bool
-	ChangedTools    []string
-	ToolChanges     []MCPToolChange
-	Readers         []string
-	Writers         []string
-	Destructive     []string
-}
-
-type MCPToolChange struct {
-	Name string
+	ID      string
+	Tool    string
+	Subject string
+	Reason  string // optional annotation explaining why approval is needed
+	Fresh   bool   // current human decision required; do not offer remembered grants
+	// Kind classifies the approval surface: "tool" (default), "plan", or
+	// "recovery". Empty means ordinary tool permission for backward compat.
 	Kind string
+	// Recovery carries Auto Guard card fields when Kind is "recovery".
+	// Old frontends ignore it and still render a one-shot fresh approval.
+	Recovery *RecoveryApproval
+}
+
+// RecoveryApproval is the backward-compatible structured payload for Auto
+// Guard decisions. All fields are plain strings/bools so wire JSON stays simple
+// and old clients can ignore unknown nested objects safely.
+type RecoveryApproval struct {
+	SourceAgent     string // agent that proposed the next mutation
+	FailedTool      string // tool that failed; empty for pre-action boundaries
+	FailedSummary   string // short failure/error summary; optional
+	Diagnosis       string // agent/host diagnosis when failure recovery is active
+	NextTool        string // tool about to run
+	NextAction      string // concrete next command/file change/MCP action
+	ChangeKind      string // same_strategy | strategy | scope | risk | uncertain
+	ChangeRationale string // what changed vs the original approach
+	ReviewRationale string // why the host/reviewer needs confirmation
+	PlanBefore      string // active structured plan before a material transition
+	PlanAfter       string // proposed structured plan after a material transition
+	CanGrantTask    bool   // offer a semantic grant scoped to the current task
+	TaskGrantScope  string // concise host-classified operation + exact target
 }
 
 // AskOption is one choice the user can pick for an AskQuestion.
@@ -276,6 +278,7 @@ const (
 	UsageSourceClassifier       = "classifier"
 	UsageSourceTitle            = "title"
 	UsageSourceCapabilityRouter = "capability-router"
+	UsageSourceRecoveryReviewer = "recovery-reviewer"
 )
 
 // Event is one increment in a turn's event stream. Read the field(s) documented
