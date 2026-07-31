@@ -477,6 +477,21 @@ func (s *Session) checkSnapshotWrite(path string, next []provider.Message, nextD
 			repairPending = false
 		}
 	}
+	if !appendShaped && baseState.ok && baseState.revisionKnown &&
+		baseState.revision == currentRevision && !contentUnchanged {
+		// Revision equality alone is not ownership proof: another writer can
+		// land transcript/event-log bytes and crash before advancing the
+		// ledger. Require the current bytes to still match this Session's
+		// persisted digest (or its pre-normalization raw form) before treating
+		// an internally reshaped snapshot as a safe full rewrite.
+		owned := s.ownsPersistedState(path, existingDigest, currentRevision, currentLedgerDigest, nextVersion)
+		if !owned && rawDiffers {
+			owned = s.ownsPersistedState(path, rawDigest, currentRevision, currentLedgerDigest, nextVersion)
+		}
+		if owned {
+			appendShaped = true
+		}
+	}
 	if appendShaped {
 		// An unknown-revision baseline (meta sidecar unreadable at load) cannot
 		// vouch for revision equality; the digest/prefix checks above already
@@ -1308,6 +1323,7 @@ func loadSessionUnlocked(path string) (*Session, error) {
 	// slice headers: when NormalizeSession allocated a new backing array, the
 	// session is marked dirty so the next Save persists the fix.
 	normalized := NormalizeSession(s.Messages)
+	normalized = migrateLegacyProviderContent(normalized)
 	if len(normalized) != len(s.Messages) || (len(s.Messages) > 0 && &normalized[0] != &s.Messages[0]) {
 		s.normalizedDirty = true
 		// Keep the pre-repair transcript: checkSnapshotWrite must be able to
@@ -2007,10 +2023,10 @@ func SessionPreviewFromMessages(msgs []provider.Message) (string, int) {
 	first := ""
 	turns := 0
 	for _, m := range msgs {
-		if m.Role == provider.RoleUser && IsUserAuthoredTurn(m.Content) {
+		if m.Role == provider.RoleUser && IsUserAuthoredTurn(UserMessageText(m)) {
 			turns++
 			if first == "" {
-				first = truncatePreview(UserPreviewText(m.Content))
+				first = truncatePreview(UserMessageText(m))
 			}
 		}
 	}
@@ -2028,10 +2044,10 @@ func previewSession(path string) (string, int) {
 	first := ""
 	turns := 0
 	for _, m := range msgs {
-		if m.Role == provider.RoleUser && IsUserAuthoredTurn(m.Content) {
+		if m.Role == provider.RoleUser && IsUserAuthoredTurn(UserMessageText(m)) {
 			turns++
 			if first == "" {
-				first = truncatePreview(UserPreviewText(m.Content))
+				first = truncatePreview(UserMessageText(m))
 			}
 		}
 	}
