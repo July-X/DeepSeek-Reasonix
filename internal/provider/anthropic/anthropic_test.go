@@ -99,6 +99,30 @@ func TestBuildRequestNoSystem(t *testing.T) {
 	}
 }
 
+func TestConfiguredMaxOutputTokensRespectsMandatoryAnthropicFallback(t *testing.T) {
+	configured, err := New(provider.Config{
+		Name: "anthropic", Model: "claude-opus-4-8",
+		Extra: map[string]any{"max_output_tokens": 8192},
+	})
+	if err != nil {
+		t.Fatalf("New configured provider: %v", err)
+	}
+	if got := configured.(*client).buildRequest(provider.Request{}).MaxTokens; got != 8192 {
+		t.Fatalf("configured max_tokens = %d, want 8192", got)
+	}
+
+	disabled, err := New(provider.Config{
+		Name: "anthropic", Model: "claude-opus-4-8",
+		Extra: map[string]any{"max_output_tokens": -1},
+	})
+	if err != nil {
+		t.Fatalf("New disabled provider: %v", err)
+	}
+	if got := disabled.(*client).buildRequest(provider.Request{}).MaxTokens; got != defaultMaxTokens {
+		t.Fatalf("mandatory max_tokens fallback = %d, want %d", got, defaultMaxTokens)
+	}
+}
+
 func TestStreamAnnotatesIndexedToolSchemaError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -458,6 +482,19 @@ func TestBuildRequestDeepSeekThinking(t *testing.T) {
 				t.Fatalf("DeepSeek message block unexpectedly carries cache_control: %+v", block)
 			}
 		}
+	}
+}
+
+func TestMissingToolCallReasoningWarningFingerprintTracksAnthropicConfiguration(t *testing.T) {
+	first := &client{name: "deepseek", baseURL: "https://api.deepseek.com/anthropic", model: "deepseek-v4-pro", deepseek: true, thinking: "enabled", effort: "high"}
+	same := &client{name: "deepseek", baseURL: "https://api.deepseek.com/anthropic", model: "deepseek-v4-pro", deepseek: true, thinking: "enabled", effort: "high"}
+	flash := &client{name: "deepseek", baseURL: "https://api.deepseek.com/anthropic", model: "deepseek-v4-flash", deepseek: true, thinking: "enabled", effort: "high"}
+	got := provider.MissingToolCallReasoningWarningFingerprint(first)
+	if got != provider.MissingToolCallReasoningWarningFingerprint(same) {
+		t.Fatal("equivalent Anthropic configurations produced different fingerprints")
+	}
+	if got == provider.MissingToolCallReasoningWarningFingerprint(flash) {
+		t.Fatal("Anthropic model change did not re-key the warning fingerprint")
 	}
 }
 

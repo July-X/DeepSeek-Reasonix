@@ -639,6 +639,63 @@ ok(
   "maximized workbench dock keeps a draggable title region while tabs remain clickable",
 );
 
+ok(
+  finalDeclaration(":root[data-theme-style] .workbench-dock__tab--active::after", "bottom") === "1px",
+  "active dock underline stays inside the visible dock edge",
+);
+
+for (const selector of [
+  ".app--classic .workbench-dock__tab + .workbench-dock__tab::before",
+  ".app--workbench .workbench-dock__tab + .workbench-dock__tab::before",
+]) {
+  ok(
+    finalDeclaration(selector, "width") === "1px" &&
+      finalDeclaration(selector, "height") === "16px" &&
+      finalDeclaration(selector, "background")?.includes("--border-soft"),
+    `${selector} renders a restrained divider between right-dock tabs`,
+  );
+}
+
+ok(
+  finalDeclaration(".app--creation .workbench-dock__tab + .workbench-dock__tab::before", "content") === undefined,
+  "Creation right-dock tabs keep their equal-column treatment without dividers",
+);
+
+for (const selector of [
+  ".app--windows-frameless.app--workbench .workbench-dock__tools",
+  ":root[data-theme-style] .app--windows-frameless.app--workbench .workbench-dock__tools",
+]) {
+  const padding = finalDeclaration(selector, "padding") ?? "";
+  ok(
+    finalDeclaration(selector, "height") === "calc(40px + var(--windows-window-controls-height))" &&
+      padding === "var(--windows-window-controls-height) 12px 0" &&
+      !padding.includes("--windows-window-controls-safe"),
+    `${selector} keeps dock tabs on a full-width row below Windows controls`,
+  );
+}
+
+for (const selector of [
+  ".app--windows-frameless.app--workbench .workbench-dock__tools::before",
+  ":root[data-theme-style] .app--windows-frameless.app--workbench .workbench-dock__tools::before",
+]) {
+  ok(
+    finalDeclaration(selector, "top") === "calc(var(--windows-window-controls-height) - 1px)" &&
+      finalDeclaration(selector, "height") === "1px",
+    `${selector} separates the Windows title row from the dock tabs`,
+  );
+}
+
+ok(
+  finalDeclaration(".app--windows-frameless:not(.app--workbench) .workbench-dock__tools", "padding-right") === undefined &&
+    finalDeclaration(":root[data-theme-style] .app--windows-frameless:not(.app--workbench) .workbench-dock__tools", "padding-right") === undefined,
+  "classic dock tabs do not reserve native window-control space on their separate chrome row",
+);
+
+ok(
+  /@container \(max-width: 420px\) \{[\s\S]*?\.app--classic \.workbench-dock__tab,[\s\S]*?\.app--workbench \.workbench-dock__tab,[\s\S]*?padding-left:\s*10px;[\s\S]*?padding-right:\s*10px;[\s\S]*?gap:\s*4px;/.test(stylesSource),
+  "classic and workbench share the same compact four-tab spacing at narrow dock widths",
+);
+
 for (const selector of [
   ":root[data-theme-style] .layout--workbench-chrome-hidden .topicbar",
   ":root[data-theme-style] .layout--workbench-chrome-hidden .topicbar__chrome-btn",

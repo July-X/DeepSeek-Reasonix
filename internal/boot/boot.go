@@ -193,20 +193,10 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// One-time import of v1/v0.5 legacy config — runs before Load so the freshly
 	// written config + ~/.env are picked up this same boot. CLI Run also calls this
 	// before config-only commands; this call stays as the shared frontend fallback.
-	var migrated *config.MigrationResult
-	var migErr error
-	var stepLimitsMigrated bool
-	var stepLimitMigErr error
-	var redactToolOutputMigrated bool
-	var redactToolOutputMigErr error
-	var memoryCompilerMigrated bool
-	var memoryCompilerMigErr error
-	if !config.SafeModeRequested() {
-		migrated, migErr = config.MigrateLegacyIfNeededForRoot(root)
-		stepLimitsMigrated, stepLimitMigErr = config.MigrateLegacyAgentStepLimitsForRoot(root)
-		redactToolOutputMigrated, redactToolOutputMigErr = config.MigrateLegacyRedactToolOutputForRoot(root)
-		memoryCompilerMigrated, memoryCompilerMigErr = config.MigrateLegacyMemoryCompilerForRoot(root)
-	}
+	migrated, migErr := config.MigrateLegacyIfNeededForRoot(root)
+	stepLimitsMigrated, stepLimitMigErr := config.MigrateLegacyAgentStepLimitsForRoot(root)
+	redactToolOutputMigrated, redactToolOutputMigErr := config.MigrateLegacyRedactToolOutputForRoot(root)
+	memoryCompilerMigrated, memoryCompilerMigErr := config.MigrateLegacyMemoryCompilerForRoot(root)
 	cfg, err := config.LoadForRoot(root)
 	if err != nil {
 		return nil, err
@@ -308,13 +298,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		}
 		sink.Emit(event.Event{Kind: event.Notice, Level: level, Text: text, Detail: detail})
 	}
-	// Safe Mode is a recovery boundary: it must not rewrite memory or session
-	// state that a crash may have corrupted, so the legacy-store imports run
-	// only on normal boots (matching the config migration gate above).
-	if !cfg.SafeMode() {
-		migration.MigrateLegacyMemorySources(sink)
-		migration.MigrateLegacySessionSources(sink)
-	}
+	migration.MigrateLegacyMemorySources(sink)
+	migration.MigrateLegacySessionSources(sink)
 	if ignored := cfg.IgnoredProjectDefaultModel(); ignored != "" {
 		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "Ignored the project config's default_model.", Detail: fmt.Sprintf("./reasonix.toml sets default_model = %q but no configured provider serves it; using %q from your user config instead. Edit or remove that default_model line to silence this notice.", ignored, cfg.DefaultModel)})
 	}
@@ -354,12 +339,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if reconcileCleanupPending == nil {
 		reconcileCleanupPending = control.ReconcileCleanupPending
 	}
-	// Skipped in Safe Mode: reconciliation physically deletes session artifacts,
-	// and a recovery boot must leave possibly-corrupt session state untouched.
-	if !cfg.SafeMode() {
-		if err := reconcileCleanupPending(sessionDir); err != nil {
-			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "cleanup-pending reconciliation failed: " + err.Error()})
-		}
+	if err := reconcileCleanupPending(sessionDir); err != nil {
+		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "cleanup-pending reconciliation failed: " + err.Error()})
 	}
 
 	proxySpec := cfg.NetworkProxySpec()
@@ -426,13 +407,10 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// durable, cache-stable prefix every turn reuses, so memory costs nothing per
 	// turn. Mid-session changes never touch this prefix — they ride the
 	// controller's transient turn-injection and fold in on the next session.
-	mem := &memory.Set{CWD: root}
-	if !cfg.SafeMode() {
-		if _, err := memory.StoreFor(config.MemoryUserDir(), root).MigrateV2(); err != nil {
-			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "Memory metadata migration did not complete.", Detail: err.Error()})
-		}
-		mem = memory.Load(memory.Options{CWD: root, UserDir: config.MemoryUserDir()})
+	if _, err := memory.StoreFor(config.MemoryUserDir(), root).MigrateV2(); err != nil {
+		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "Memory metadata migration did not complete.", Detail: err.Error()})
 	}
+	mem := memory.Load(memory.Options{CWD: root, UserDir: config.MemoryUserDir()})
 	projectChecks := instruction.ExtractHostChecks(mem.Docs)
 	sysPrompt = memory.Compose(sysPrompt, mem)
 
@@ -448,7 +426,6 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		ExcludedPaths:    cfg.SkillExcludedPaths(),
 		DisabledNames:    cfg.DisabledSkillNames(),
 		MaxDepth:         cfg.SkillMaxDepth(),
-		DisableDiscovery: cfg.SafeMode(),
 		Stderr:           opts.Stderr,
 	})
 	// Install the static profile filter before building the prompt index and
@@ -456,12 +433,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// registry/plugin host has been assembled below.
 	skillStore.ConfigureInvocationPolicy(string(runtimeProfile), nil)
 	skills := skillStore.List()
-	allSkillStore := skillStore
-	if !cfg.SafeMode() {
-		allSkillStore = skill.New(skill.Options{ProjectRoot: root, CustomPaths: cfg.SkillCustomPaths(), PluginPaths: cfg.PluginPackageSkillOwners(), PluginAgentPaths: cfg.PluginPackageAgentOwners(), ExcludedPaths: cfg.SkillExcludedPaths(), MaxDepth: cfg.SkillMaxDepth(), Stderr: io.Discard})
-	}
+	allSkillStore := skill.New(skill.Options{ProjectRoot: root, CustomPaths: cfg.SkillCustomPaths(), PluginPaths: cfg.PluginPackageSkillOwners(), PluginAgentPaths: cfg.PluginPackageAgentOwners(), ExcludedPaths: cfg.SkillExcludedPaths(), MaxDepth: cfg.SkillMaxDepth(), Stderr: io.Discard})
 	allSkills := allSkillStore.List()
-	if !tokenEconomy && !cfg.SafeMode() {
+	if !tokenEconomy {
 		sysPrompt = skill.ApplyIndex(sysPrompt, skills)
 	}
 
@@ -528,14 +502,15 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// a single background catalog discovery. First real tool call uses
 	// EnsureConnected so parent/child/tab runtimes share one process.
 	pluginSpecOptions := PluginSpecOptions{
-		DefaultCallTimeout: time.Duration(cfg.MCPCallTimeoutSeconds()) * time.Second,
-		LaunchManager:      mcplaunch.ForWorkspace(config.ReasonixHomeDir(), root),
-		ConfigSource:       "workspace_config",
-		StateHome:          config.ReasonixHomeDir(),
-		WriterRoots:        writeRoots,
-		ForbidReadRoots:    forbidReadRoots,
-		Network:            networkEnabled,
-		PackageOwners:      pluginPackageOwners(cfg),
+		DefaultStartupTimeout: time.Duration(cfg.MCPStartupTimeoutSeconds()) * time.Second,
+		DefaultCallTimeout:    time.Duration(cfg.MCPCallTimeoutSeconds()) * time.Second,
+		LaunchManager:         mcplaunch.ForWorkspace(config.ReasonixHomeDir(), root),
+		ConfigSource:          "workspace_config",
+		StateHome:             config.ReasonixHomeDir(),
+		WriterRoots:           writeRoots,
+		ForbidReadRoots:       forbidReadRoots,
+		Network:               networkEnabled,
+		PackageOwners:         pluginPackageOwners(cfg),
 	}
 	autoStartEntries := cfg.EnabledPlugins(root, config.DefaultMCPActivationStore())
 	enabledMCPNames := make(map[string]bool, len(autoStartEntries))
@@ -548,16 +523,12 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// but no longer change process start timing. Keep the partition only so
 	// demotion notices remain meaningful for chronically slow eager configs.
 	eagerEntries, bgEntries := partitionByTier(autoStartEntries)
-	extraPlugins := opts.ExtraPlugins
-	if cfg.SafeMode() {
-		// Safe Mode boots without external integrations: host-supplied MCP
-		// servers (e.g. ACP session servers) are dropped like config-declared
-		// plugins, so a recovery boot never starts external processes.
-		extraPlugins = nil
-	}
-	extraSpecs := applyDefaultMCPCallTimeout(
-		applyKnownPluginOverrides(extraPlugins, root),
-		pluginSpecOptions.DefaultCallTimeout,
+	extraSpecs := applyDefaultMCPStartupTimeout(
+		applyDefaultMCPCallTimeout(
+			applyKnownPluginOverrides(opts.ExtraPlugins, root),
+			pluginSpecOptions.DefaultCallTimeout,
+		),
+		pluginSpecOptions.DefaultStartupTimeout,
 	)
 	for i := range extraSpecs {
 		if strings.TrimSpace(extraSpecs[i].WorkspaceRoot) == "" {
@@ -773,10 +744,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// output is surfaced to the user as a Notice through the shared sink. The
 	// runner fires PreToolUse/PostToolUse in the agent loop and
 	// PermissionRequest/UserPromptSubmit/Stop at the controller boundary.
-	var resolvedHooks []hook.ResolvedHook
-	if !cfg.SafeMode() {
-		resolvedHooks = hook.Load(hook.LoadOptions{ProjectRoot: root})
-	}
+	resolvedHooks := hook.Load(hook.LoadOptions{ProjectRoot: root})
 	hookRuntime := hook.RuntimeOptions{}
 	if shell.Kind == sandbox.ShellBash {
 		hookRuntime.BashPath = shell.Path
@@ -1207,10 +1175,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 	// Custom slash commands (.reasonix/commands + user dir). Best-effort: a malformed
 	// file is skipped, and a load error never blocks the session.
-	cmds := []command.Command{}
-	if !cfg.SafeMode() {
-		cmds, _ = command.LoadRoots(config.CommandRootsForRoot(root)...)
-	}
+	cmds, _ := command.LoadRoots(config.CommandRootsForRoot(root)...)
 	slashCommandAdded := false
 	slashCommandIncludesSkills := false
 	addSlashCommandTool := func(includeSkills bool) string {
@@ -1336,18 +1301,11 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		addSlashCommandTool(true)
 		return "enabled skills. Use run_skill/read_skill/read_only_skill or the dedicated skill tools on the next model request.\n\n" + skill.IndexBlock(skills)
 	}
-	if cfg.SafeMode() {
-		// Safe Mode keeps the boot surface built-in only: no install_source, no
-		// skill tools, and no Economy tool-source connector below — the connector
-		// would let a session re-expose skills, commands, memory, and MCP that
-		// Safe Mode exists to keep out of a recovery boot. slash_command is still
-		// registered (with an empty list) so the tool surface stays predictable.
-		addSlashCommandTool(false)
-	} else if !tokenEconomy {
+	if !tokenEconomy {
 		addInstallSourceTool()
 		addSkillTools()
 	}
-	if tokenEconomy && !cfg.SafeMode() {
+	if tokenEconomy {
 		addBuiltinSourceTools := func(source string, names ...string) string {
 			var missing []string
 			for _, name := range names {
@@ -1592,25 +1550,26 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		Jobs:        jm,
 		// Parent write reservation at the executor entry covers all writers
 		// (including late Economy/MCP adds) without wrapping tool schemas.
-		WriteScheduler:           subagentScheduler,
-		WriteWorkspaceRoot:       root,
-		ProjectChecks:            projectChecks,
-		DeliveryProfile:          tokenDelivery,
-		WorkspaceLease:           workspaceLease,
-		CapabilityLedger:         capLedger,
-		CapabilityAudit:          capAudit,
-		ContextWindow:            entry.ContextWindow,
-		SoftCompactRatio:         cfg.Agent.SoftCompactRatio,
-		ToolResultSnipRatio:      cfg.Agent.ToolResultSnipRatio,
-		CompactRatio:             cfg.Agent.CompactRatio,
-		CompactForceRatio:        cfg.Agent.CompactForceRatio,
-		RecentKeep:               cfg.Agent.RecentKeep,
-		ArchiveDir:               config.ArchiveDir(),
-		KeepPolicy:               keepPolicy,
-		ReasoningLanguage:        cfg.ReasoningLanguage(),
-		PlanModeReadOnlyCommands: cfg.Agent.PlanModeReadOnlyCommands,
-		SubagentDepth:            0,
-		MaxSubagentDepth:         maxSubagentDepth,
+		WriteScheduler:               subagentScheduler,
+		WriteWorkspaceRoot:           root,
+		ProjectChecks:                projectChecks,
+		DeliveryProfile:              tokenDelivery,
+		WorkspaceLease:               workspaceLease,
+		CapabilityLedger:             capLedger,
+		CapabilityAudit:              capAudit,
+		ContextWindow:                entry.ContextWindow,
+		SoftCompactRatio:             cfg.Agent.SoftCompactRatio,
+		ToolResultSnipRatio:          cfg.Agent.ToolResultSnipRatio,
+		CompactRatio:                 cfg.Agent.CompactRatio,
+		CompactForceRatio:            cfg.Agent.CompactForceRatio,
+		RecentKeep:                   cfg.Agent.RecentKeep,
+		ArchiveDir:                   config.ArchiveDir(),
+		KeepPolicy:                   keepPolicy,
+		ReasoningLanguage:            cfg.ReasoningLanguage(),
+		PlanModeReadOnlyCommands:     cfg.Agent.PlanModeReadOnlyCommands,
+		SubagentDepth:                0,
+		MaxSubagentDepth:             maxSubagentDepth,
+		MissingReasoningWarnStateDir: config.MissingReasoningWarnStateDir(),
 	}, sink)
 
 	var runner agent.Runner = executor
@@ -1644,20 +1603,21 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				plannerTools.Add(capRuntime.NewFrontend(plannerLedger, plannerAudit))
 			}
 			plannerOpts := agent.Options{
-				MaxSteps:                 0,
-				Gate:                     headlessGate,
-				ContextWindow:            pe.ContextWindow,
-				SoftCompactRatio:         cfg.Agent.SoftCompactRatio,
-				ToolResultSnipRatio:      cfg.Agent.ToolResultSnipRatio,
-				CompactRatio:             cfg.Agent.CompactRatio,
-				CompactForceRatio:        cfg.Agent.CompactForceRatio,
-				RecentKeep:               cfg.Agent.RecentKeep,
-				ArchiveDir:               config.ArchiveDir(),
-				KeepPolicy:               keepPolicy,
-				ReasoningLanguage:        cfg.ReasoningLanguage(),
-				PlanModeReadOnlyCommands: cfg.Agent.PlanModeReadOnlyCommands,
-				CapabilityLedger:         plannerLedger,
-				CapabilityAudit:          plannerAudit,
+				MaxSteps:                     0,
+				Gate:                         headlessGate,
+				ContextWindow:                pe.ContextWindow,
+				SoftCompactRatio:             cfg.Agent.SoftCompactRatio,
+				ToolResultSnipRatio:          cfg.Agent.ToolResultSnipRatio,
+				CompactRatio:                 cfg.Agent.CompactRatio,
+				CompactForceRatio:            cfg.Agent.CompactForceRatio,
+				RecentKeep:                   cfg.Agent.RecentKeep,
+				ArchiveDir:                   config.ArchiveDir(),
+				KeepPolicy:                   keepPolicy,
+				ReasoningLanguage:            cfg.ReasoningLanguage(),
+				PlanModeReadOnlyCommands:     cfg.Agent.PlanModeReadOnlyCommands,
+				CapabilityLedger:             plannerLedger,
+				CapabilityAudit:              plannerAudit,
+				MissingReasoningWarnStateDir: config.MissingReasoningWarnStateDir(),
 			}
 			runner = agent.NewCoordinatorWithPlannerPolicy(plannerProv, plannerSess, pe.Price, plannerTools, plannerOpts, executor, cfg.Agent.Temperature, sink, control.NewPlannerPolicy())
 			label = entry.Model + " + planner " + pe.Model
@@ -1690,6 +1650,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		BalanceKey:            entry.APIKey(),
 		BalanceClient:         balanceClient,
 		Jobs:                  jm,
+		WorkspaceLease:        workspaceLease,
 		Registry:              reg,
 		PluginCtx:             ctx,
 		MCPDefaultCallTimeout: pluginSpecOptions.DefaultCallTimeout,
@@ -1700,6 +1661,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			spec.LaunchManager = pluginSpecOptions.LaunchManager
 			if strings.TrimSpace(spec.ConfigSource) == "" {
 				spec.ConfigSource = pluginSpecOptions.ConfigSource
+			}
+			if spec.DefaultStartupTimeout <= 0 {
+				spec.DefaultStartupTimeout = pluginSpecOptions.DefaultStartupTimeout
 			}
 			applyMCPIsolation(spec, root, pluginSpecOptions)
 		},
@@ -2250,6 +2214,7 @@ func NewProviderWithProxy(e *config.ProviderEntry, proxy netclient.ProxySpec) (p
 			"effort":                config.EffectiveEffort(e),
 			"supported_efforts":     e.SupportedEfforts,
 			"reasoning_protocol":    config.ReasoningProtocolForEntry(e),
+			"max_output_tokens":     e.MaxOutputTokens,
 			"chat_url":              e.ChatURL,
 			"headers":               e.Headers,
 			"extra_body":            e.ExtraBody,
@@ -2363,14 +2328,15 @@ func PluginSpecsForRoot(entries []config.PluginEntry, workspaceRoot string) []pl
 // PluginSpecOptions carries runtime policy that is not stored on each plugin
 // entry but still needs to reach plugin.Spec.
 type PluginSpecOptions struct {
-	DefaultCallTimeout time.Duration
-	LaunchManager      *mcplaunch.Manager
-	ConfigSource       string
-	StateHome          string
-	WriterRoots        []string
-	ForbidReadRoots    []string
-	Network            bool
-	PackageOwners      map[string]string
+	DefaultStartupTimeout time.Duration
+	DefaultCallTimeout    time.Duration
+	LaunchManager         *mcplaunch.Manager
+	ConfigSource          string
+	StateHome             string
+	WriterRoots           []string
+	ForbidReadRoots       []string
+	Network               bool
+	PackageOwners         map[string]string
 }
 
 // PluginSpecsForRootWithOptions maps configured plugin entries to plugin.Spec
@@ -2390,21 +2356,23 @@ func pluginSpecFromEntryWithOptions(e config.PluginEntry, workspaceRoot string, 
 		configSource = opts.ConfigSource
 	}
 	spec := plugin.ApplyKnownOverrides(plugin.Spec{
-		Name:               e.Name,
-		Package:            strings.TrimSpace(opts.PackageOwners[e.Name]),
-		Type:               e.Type,
-		Command:            e.Command,
-		Args:               e.Args,
-		Env:                e.Env,
-		URL:                e.URL,
-		Headers:            e.Headers,
-		DefaultCallTimeout: opts.DefaultCallTimeout,
-		CallTimeout:        secondsDuration(e.CallTimeoutSeconds),
-		ToolTimeouts:       toolTimeoutDurations(e.ToolTimeoutSeconds),
-		WorkspaceRoot:      strings.TrimSpace(workspaceRoot),
-		LaunchManager:      opts.LaunchManager,
-		ConfigSource:       configSource,
-		Authorized:         e.Source.UserAuthorized(),
+		Name:                  e.Name,
+		Package:               strings.TrimSpace(opts.PackageOwners[e.Name]),
+		Type:                  e.Type,
+		Command:               e.Command,
+		Args:                  e.Args,
+		Env:                   e.Env,
+		URL:                   e.URL,
+		Headers:               e.Headers,
+		DefaultStartupTimeout: opts.DefaultStartupTimeout,
+		StartupTimeout:        secondsDuration(e.StartupTimeoutSeconds),
+		DefaultCallTimeout:    opts.DefaultCallTimeout,
+		CallTimeout:           secondsDuration(e.CallTimeoutSeconds),
+		ToolTimeouts:          toolTimeoutDurations(e.ToolTimeoutSeconds),
+		WorkspaceRoot:         strings.TrimSpace(workspaceRoot),
+		LaunchManager:         opts.LaunchManager,
+		ConfigSource:          configSource,
+		Authorized:            e.Source.UserAuthorized(),
 	}, workspaceRoot)
 	if e.Source.ProjectScoped() && strings.TrimSpace(spec.Dir) == "" {
 		spec.Dir = workspaceRoot
@@ -2540,6 +2508,20 @@ func applyDefaultMCPCallTimeout(specs []plugin.Spec, timeout time.Duration) []pl
 		out[i] = spec
 		if out[i].DefaultCallTimeout <= 0 {
 			out[i].DefaultCallTimeout = timeout
+		}
+	}
+	return out
+}
+
+func applyDefaultMCPStartupTimeout(specs []plugin.Spec, timeout time.Duration) []plugin.Spec {
+	if len(specs) == 0 || timeout <= 0 {
+		return specs
+	}
+	out := make([]plugin.Spec, len(specs))
+	for i, spec := range specs {
+		out[i] = spec
+		if out[i].DefaultStartupTimeout <= 0 {
+			out[i].DefaultStartupTimeout = timeout
 		}
 	}
 	return out

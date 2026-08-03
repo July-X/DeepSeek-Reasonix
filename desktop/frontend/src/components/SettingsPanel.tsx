@@ -6,7 +6,7 @@ import { app, openExternal } from "../lib/bridge";
 import { normalizeLangPref, useI18n, useT, type DictKey, type LangPref } from "../lib/i18n";
 import { apiKeyEnvFromProviderName, inferredVisionModels, mergedFetchedProviderModels, mergeProviderModelContextWindows, providerApiKeyEnvForSave, providerDefaultModel, providerIsConfigured, providerModelCandidates, providerModelContextWindowDrafts, providerModelContextWindowIsSmall, providerRequiresKey } from "../lib/providerModels";
 import { cachedFetchProviderModels, invalidateProviderCacheByAPIKeyEnv, shouldSkipAutoRefresh } from "../lib/providerModelCache";
-import { switchUpdaterChannel, useUpdater } from "../lib/useUpdater";
+import { useUpdater } from "../lib/useUpdater";
 import {
   applyTheme,
   getTheme,
@@ -352,7 +352,6 @@ export function SettingsPanel({
                     <UpdatesSection
                       configPath={s.configPath}
                       checkUpdates={s.checkUpdates}
-                      updateChannel={s.updateChannel}
                       telemetry={s.telemetry !== false}
                       metrics={s.metrics !== false}
                       settingsBusy={busy}
@@ -781,7 +780,7 @@ const PROXY_MODES = ["auto", "custom", "off"] as const;
 // The settings UI uses it for subagent defaults; provider-specific levels are
 // inferred by the backend or edited in TOML for rare gateways.
 export const EFFORT_PRESETS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
-const REASONING_PROTOCOLS: readonly string[] = ["", "deepseek", "openai", "none"];
+const REASONING_PROTOCOLS: readonly string[] = ["", "deepseek", "glm", "openai", "none"];
 const THINKING_MODES: readonly string[] = ["", "enabled", "disabled", "adaptive"];
 const PROXY_TYPES = ["http", "https", "socks5", "socks5h"] as const;
 const LANGUAGE_PREFS: LangPref[] = ["", "zh", "en"];
@@ -1254,11 +1253,13 @@ function normalizeExtraBodyMap(value: unknown): Record<string, unknown> {
   return out;
 }
 
-function normalizeProviderView(p: ProviderView): ProviderView {
+export function normalizeProviderView(p: ProviderView): ProviderView {
   const visionModels = asArray(p.visionModels);
   const requiresKey = providerRequiresKey(p);
   return {
     ...p,
+    name: String(p.name ?? ""),
+    baseUrl: String(p.baseUrl ?? ""),
     builtIn: Boolean(p.builtIn),
     added: Boolean(p.added),
     chatUrl: p.chatUrl ?? "",
@@ -1366,7 +1367,7 @@ function normalizeSettingsView(view: SettingsView | null | undefined): SettingsV
     statusBarItems: normalizeStatusBarItems(view.statusBarItems),
     conversationWidth: normalizeConversationWidth(view.conversationWidth),
     checkUpdates: view.checkUpdates !== false,
-    updateChannel: view.updateChannel === "preview" ? "preview" : "stable",
+    updateChannel: "stable",
   };
 }
 
@@ -1480,6 +1481,8 @@ function reasoningProtocolLabel(protocol: string, t: ReturnType<typeof useT>): s
   switch (protocol) {
     case "deepseek":
       return t("settings.reasoningProtocol.deepseek");
+    case "glm":
+      return t("settings.reasoningProtocol.glm");
     case "openai":
       return t("settings.reasoningProtocol.openai");
     case "none":
@@ -4906,6 +4909,8 @@ function providerPresetDescription(preset: ProviderPresetView, t: ReturnType<typ
       return t("settings.addProvider.preset.longcatOpenAIDesc");
     case "longcat-anthropic":
       return t("settings.addProvider.preset.longcatAnthropicDesc");
+    case "token-rhythm":
+      return t("settings.addProvider.preset.tokenRhythmDesc");
     case "kimi-cn":
       return t("settings.addProvider.preset.kimiCnDesc");
     case "kimi-global":
@@ -4989,6 +4994,11 @@ function providerPresetDescription(preset: ProviderPresetView, t: ReturnType<typ
   }
 }
 
+function providerPresetLabel(preset: ProviderPresetView, t: ReturnType<typeof useT>): string {
+  if (preset.id === "token-rhythm") return t("settings.addProvider.preset.tokenRhythmLabel");
+  return preset.label;
+}
+
 function AddProviderPanel({
   mode,
   kinds,
@@ -5030,7 +5040,7 @@ function AddProviderPanel({
       id: `preset:${preset.id}`,
       source: "preset" as const,
       presetID: preset.id,
-      label: preset.label,
+      label: providerPresetLabel(preset, t),
       description: providerPresetDescription(preset, t),
       keyEnv: preset.keyEnv,
       added: preset.added,
@@ -5616,7 +5626,7 @@ function parseBotListInput(value: string): string[] {
     .filter(Boolean));
 }
 
-const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker({
+export const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker({
   candidates,
   selectedModels,
   visionModels,
@@ -5646,14 +5656,14 @@ const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker({
     const timer = setTimeout(() => setDebouncedQuery(query), 150);
     return () => clearTimeout(timer);
   }, [query]);
-  if (candidates.length === 0) return null;
-  const selected = new Set(selectedModels);
-  const vision = new Set(visionModels);
   const q = debouncedQuery.trim().toLowerCase();
   const visibleCandidates = q
     ? candidates.filter((model) => model.toLowerCase().includes(q))
     : candidates;
   const deferredCandidates = useDeferredValue(visibleCandidates);
+  if (candidates.length === 0) return null;
+  const selected = new Set(selectedModels);
+  const vision = new Set(visionModels);
   return (
     <div className="provider-model-draft provider-model-draft--inline">
       <div className="provider-model-draft__head">
@@ -5735,7 +5745,7 @@ const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker({
   );
 });
 
-function ProviderEditor({
+export function ProviderEditor({
   initial,
   kinds,
   busy,
@@ -5806,6 +5816,18 @@ function ProviderEditor({
   const effectiveExtraBody = extraBodyParse.value;
   const extraBodyInvalid = Boolean(extraBodyDraft.trim() && extraBodyParse.error);
   const previewChatUrl = providerChatURLPreview(baseUrl, chatUrl, fullChatUrl);
+  const modelNames = useMemo(
+    () => parseProviderListInput(models),
+    [models],
+  );
+  const modelCandidateNames = useMemo(
+    () => uniqueStrings([...modelCandidates, ...modelNames]),
+    [modelCandidates, modelNames],
+  );
+  const visionModelNames = useMemo(
+    () => parseProviderListInput(visionModels).filter((model) => modelNames.includes(model)),
+    [modelNames, visionModels],
+  );
 
   // Empty supportedEfforts means "use protocol defaults". The simplified
   // provider flow no longer edits these levels directly, but it preserves
@@ -5952,18 +5974,6 @@ function ProviderEditor({
     );
   }
 
-  const modelNames = useMemo(
-    () => parseProviderListInput(models),
-    [models],
-  );
-  const modelCandidateNames = useMemo(
-    () => uniqueStrings([...modelCandidates, ...modelNames]),
-    [modelCandidates, modelNames],
-  );
-  const visionModelNames = useMemo(
-    () => parseProviderListInput(visionModels).filter((model) => modelNames.includes(model)),
-    [modelNames, visionModels],
-  );
   const canFetch = Boolean(name.trim() && effectiveBaseUrl);
 
   const setModelsFromList = (nextModels: string[]) => {
@@ -6770,12 +6780,11 @@ const mb = (n: number) => (n / MB).toFixed(1);
 
 // UpdatesSection is the manual side of the auto-updater: it shows the startup
 // check preference, running version, and a Check button, then the same state
-// machine the top banner uses (useUpdater) — available → download → install, with
-// progress and errors inline.
+// machine the top banner uses (useUpdater) — a single "update and restart"
+// action with inline progress and errors.
 function UpdatesSection({
   configPath,
   checkUpdates,
-  updateChannel,
   telemetry,
   metrics,
   settingsBusy,
@@ -6783,15 +6792,13 @@ function UpdatesSection({
 }: {
   configPath: string;
   checkUpdates: boolean;
-  updateChannel: string;
   telemetry: boolean;
   metrics: boolean;
   settingsBusy: boolean;
   applySettings: (fn: () => Promise<void>) => Promise<boolean>;
 }) {
   const t = useT();
-  const { status, check, download: downloadUpdate, install: installUpdate, openDownload, reset: resetUpdater } = useUpdater();
-  const selectedChannel = updateChannel === "preview" ? "preview" : "stable";
+  const { status, check, apply: applyUpdate, openDownload } = useUpdater();
   const [version, setVersion] = useState("");
   useEffect(() => {
     app.Version().then(setVersion).catch(() => {});
@@ -6802,7 +6809,8 @@ function UpdatesSection({
     status.kind === "downloading" ||
     status.kind === "verifying" ||
     status.kind === "authorizing" ||
-    status.kind === "installing";
+    status.kind === "installing" ||
+    status.kind === "relaunching";
   const updateStatus =
     status.kind === "checking" ? t("updater.checking") :
     status.kind === "upToDate" ? t("updater.upToDate") :
@@ -6813,21 +6821,20 @@ function UpdatesSection({
       pct: status.total > 0 ? Math.round((status.received / status.total) * 100) : 0,
     }) :
     status.kind === "verifying" ? t("updater.verifying") :
-    status.kind === "downloaded" ? t("updater.downloaded", { v: status.info.latest }) :
     status.kind === "authorizing" ? t("updater.authorizing") :
     status.kind === "installing" ? (
       status.info?.requiresElevation || status.info?.installMode === "deb"
         ? t("updater.installingPackage")
         : t("updater.installing")
     ) :
-    status.kind === "done" ? t("updater.done") :
+    status.kind === "relaunching" || status.kind === "done" ? t("updater.done") :
     status.kind === "error" ? t("updater.failed", { msg: status.message }) :
     "";
   const updateStatusTone =
     status.kind === "error" ? "error" :
     status.kind === "available" ? "available" :
+    status.kind === "upToDate" || status.kind === "done" || status.kind === "relaunching" ? "success" :
     status.kind === "checking" || updaterBusy ? "busy" :
-    status.kind === "upToDate" || status.kind === "done" ? "success" :
     "neutral";
 
   return (
@@ -6852,35 +6859,13 @@ function UpdatesSection({
         }
       >
         <div className="updates-control__controls">
-          <div className="provider-add-segmented" role="group" aria-label={t("updater.channelSettingLabel")}>
-            {(["stable", "preview"] as const).map((nextChannel) => (
-              <button
-                key={nextChannel}
-                type="button"
-                disabled={settingsBusy || updaterBusy}
-                className={selectedChannel === nextChannel ? "provider-add-segmented__item provider-add-segmented__item--active" : "provider-add-segmented__item"}
-                aria-pressed={selectedChannel === nextChannel}
-                onClick={() => {
-                  if (nextChannel === selectedChannel) return;
-                  void switchUpdaterChannel(
-                    nextChannel,
-                    resetUpdater,
-                    () => applySettings(() => app.SetDesktopUpdateChannel(nextChannel)),
-                    check,
-                  );
-                }}
-              >
-                {nextChannel === "stable" ? t("updater.channelStable") : t("updater.channelPreview")}
-              </button>
-            ))}
-          </div>
           <Tooltip label={t("updater.checkButton")}>
             <button
               className="chip chip--icon"
               type="button"
               disabled={settingsBusy || updaterBusy}
               aria-label={t("updater.checkButton")}
-              onClick={() => void check(selectedChannel)}
+              onClick={() => void check()}
             >
               <RefreshCw className={status.kind === "checking" ? "updates-control__spinner" : undefined} size={14} aria-hidden="true" />
             </button>
@@ -6888,41 +6873,31 @@ function UpdatesSection({
         </div>
       </SettingsField>
       <div className="updates-control__hint">
-        <div>{t("updater.channelSettingHint")}</div>
-        <div>{t("updater.channelAutoCheckHint")}</div>
+        <div>{t("updater.officialReleaseHint")}</div>
       </div>
-      {(status.kind === "available" || status.kind === "downloaded") && (
+      {status.kind === "available" && (
         <div className="updates-control__action">
           <div className="updates-control__action-copy">
-            {status.kind === "available" && (
-              <div>
-                {t("updater.channelLabel", {
-                  channel: status.info.channel === "preview" ? t("updater.channelPreview") : t("updater.channelStable"),
-                })}
-              </div>
-            )}
-            {status.kind === "available" && !status.info.canSelfUpdate && <div>{status.info.manualReason || t("updater.macHint")}</div>}
+            {!status.info.canSelfUpdate && <div>{status.info.manualReason || t("updater.macHint")}</div>}
           </div>
-          {status.kind === "available" && (
-            <button
-              className="btn btn--primary btn--small"
-              disabled={settingsBusy || updaterBusy}
-              onClick={() => downloadUpdate(status.info)}
-            >
-              {status.info.canSelfUpdate ? t("updater.downloadUpdate") : t("updater.goToDownload")}
-            </button>
-          )}
-          {status.kind === "downloaded" && (
-            <button
-              className="btn btn--primary btn--small"
-              disabled={settingsBusy || updaterBusy}
-              onClick={installUpdate}
-            >
-              {status.info.requiresElevation || status.info.installMode === "deb"
-                ? t("updater.authorizeInstall")
-                : t("updater.restartInstall")}
-            </button>
-          )}
+          <button
+            className="btn btn--primary btn--small"
+            disabled={settingsBusy || updaterBusy}
+            onClick={() => applyUpdate(status.info)}
+          >
+            {status.info.canSelfUpdate ? t("updater.updateAndRestart") : t("updater.goToDownload")}
+          </button>
+        </div>
+      )}
+      {status.kind === "error" && status.info && (
+        <div className="updates-control__action">
+          <button
+            className="btn btn--primary btn--small"
+            disabled={settingsBusy || updaterBusy}
+            onClick={() => applyUpdate(status.info!)}
+          >
+            {t("updater.retry")}
+          </button>
         </div>
       )}
       <SettingsField
