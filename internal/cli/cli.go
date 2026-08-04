@@ -13,12 +13,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,6 +37,7 @@ import (
 	"reasonix/internal/provider"
 	"reasonix/internal/provider/openai"
 	"reasonix/internal/serve"
+	"reasonix/internal/stats"
 	"reasonix/internal/telemetry"
 
 	tea "charm.land/bubbletea/v2"
@@ -49,6 +52,13 @@ var (
 
 // Run is the CLI entry point; it returns a process exit code.
 func Run(args []string, version string) int {
+	// Usage recording is asynchronous so provider/UI paths never wait on disk.
+	// Drain records accepted by this process before a normal CLI exit.
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = stats.Flush(flushCtx, config.StatsDir())
+	}()
 	// Pick the UI language up front so even pre-config paths (the first-run
 	// welcome banner) come through localized. Env-only first; if a config
 	// exists and pins a language, that wins.
@@ -272,6 +282,7 @@ func cliProfileBuildOptions(modelName string, maxStepsOverride int, requireKey b
 		AdditionalDirs:       overrides.AdditionalDirs,
 		HeadlessApprovalMode: overrides.HeadlessApprovalMode,
 		AutoPricingCurrency:  cliAutoPricingCurrency(),
+		StatsSource:          "cli",
 		Stderr:               overrides.Stderr,
 		OnSessionRecovered:   overrides.OnSessionRecovered,
 	}
@@ -466,8 +477,8 @@ func runAgent(args []string, version string) int {
 	var allowedToolValues []string
 	fs.StringArrayVar(&allowedToolValues, "allowed-tools", nil, "comma or space-separated permission rules to allow")
 	fs.StringArrayVar(&allowedToolValues, "allowedTools", nil, "alias for --allowed-tools")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	if code, ok := parseCommandFlags(fs, args); !ok {
+		return code
 	}
 	resolvedPermissionMode, err := resolveRunPermissionMode(*permissionMode, *autoApprove, fs.Changed("permission-mode"))
 	if err != nil {
@@ -755,8 +766,8 @@ func runServe(args []string) int {
 	portFile := fs.String("port-file", "", "write the actual bound listen address (host:port) to this file after binding")
 	tokenFile := fs.String("token-file", "", "read the auth=token pre-shared token from this file (overrides --token; keeps the secret out of argv)")
 	pidFile := fs.String("pid-file", "", "write the server process id to this file")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	if code, ok := parseCommandFlags(fs, args); !ok {
+		return code
 	}
 	profile, err := parseRuntimeProfile(*profileFlag)
 	if err != nil {
@@ -973,8 +984,8 @@ func chatREPL(args []string, version string) int {
 	var allowedToolValues []string
 	fs.StringArrayVar(&allowedToolValues, "allowed-tools", nil, "comma or space-separated permission rules to allow")
 	fs.StringArrayVar(&allowedToolValues, "allowedTools", nil, "alias for --allowed-tools")
-	if err := fs.Parse(normalizeOptionalResumeArg(args)); err != nil {
-		return 2
+	if code, ok := parseCommandFlags(fs, normalizeOptionalResumeArg(args)); !ok {
+		return code
 	}
 	allowedTools, err := splitAllowedToolRules(allowedToolValues)
 	if err != nil {
@@ -2255,6 +2266,8 @@ func configCommand(args []string) int {
 		return configAutoPlanCompatibilityCommand(args[1:])
 	case "reasoning-language":
 		return configReasoningLanguageCommand(args[1:])
+	case "compact-ratio":
+		return configCompactRatioCommand(args[1:])
 	case "currency":
 		return configCurrencyCommand(args[1:])
 	case "telemetry":
@@ -2268,8 +2281,8 @@ func configCommand(args []string) int {
 func configCurrencyCommand(args []string) int {
 	fs := flag.NewFlagSet("config currency", flag.ContinueOnError)
 	local := fs.Bool("local", false, "unsupported; pricing currency is user-level only")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	if code, ok := parseCommandFlags(fs, args); !ok {
+		return code
 	}
 	if *local {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "currency is user-level only; --local is not supported")
@@ -2342,8 +2355,8 @@ var (
 
 func configTelemetryCommand(args []string) int {
 	fs := flag.NewFlagSet("config telemetry", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
-		return 2
+	if code, ok := parseCommandFlags(fs, args); !ok {
+		return code
 	}
 	rest := fs.Args()
 	if len(rest) > 1 {
@@ -2391,8 +2404,8 @@ func configTelemetryCommand(args []string) int {
 func configAutoPlanCompatibilityCommand(args []string) int {
 	fs := flag.NewFlagSet("config auto-plan", flag.ContinueOnError)
 	local := fs.Bool("local", false, "unsupported; automatic plan mode is retired")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	if code, ok := parseCommandFlags(fs, args); !ok {
+		return code
 	}
 	if *local {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "auto-plan is user-level only; --local is not supported")
@@ -2419,8 +2432,8 @@ func configAutoPlanCompatibilityCommand(args []string) int {
 func configReasoningLanguageCommand(args []string) int {
 	fs := flag.NewFlagSet("config reasoning-language", flag.ContinueOnError)
 	local := fs.Bool("local", false, "write ./reasonix.toml instead of the user config")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	if code, ok := parseCommandFlags(fs, args); !ok {
+		return code
 	}
 	rest := fs.Args()
 	if len(rest) > 1 {
@@ -2486,9 +2499,98 @@ func configReasoningLanguageCommand(args []string) int {
 	return 0
 }
 
+func configCompactRatioCommand(args []string) int {
+	fs := flag.NewFlagSet("config compact-ratio", flag.ContinueOnError)
+	local := fs.Bool("local", false, "write ./reasonix.toml instead of the user config")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	rest := fs.Args()
+	if len(rest) > 1 {
+		configCompactRatioUsage()
+		return 2
+	}
+	if len(rest) == 0 {
+		cfg, err := config.LoadForRootReadOnly(".")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		fmt.Printf("compact_ratio = %s (%s)\n", formatCompactRatioPercent(cfg.Agent.CompactRatio), compactRatioSource())
+		return 0
+	}
+	percent, err := strconv.ParseFloat(strings.TrimSpace(rest[0]), 64)
+	if err != nil || math.IsNaN(percent) || math.IsInf(percent, 0) || percent < 65 || percent > 85 {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "compact ratio must be a percentage between 65 and 85")
+		return 2
+	}
+	ratio := percent / 100
+	path := config.UserConfigPath()
+	scope := "user"
+	if *local {
+		path = "reasonix.toml"
+		scope = "project"
+	}
+	if path == "" {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "cannot resolve config path")
+		return 1
+	}
+	unlock, err := config.LockConfigFileEdits(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+		return 1
+	}
+	defer unlock()
+	if *local {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			saved, err := config.SaveMinimalProjectCompactRatio(path, ratio)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+				return 1
+			}
+			fmt.Printf("compact_ratio = %s (%s: %s)\n", formatCompactRatioPercent(saved), scope, displayPath(path))
+			return 0
+		} else if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+	}
+	cfg, err := config.LoadForEditReadOnlyStrict(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+		return 1
+	}
+	if err := cfg.SetCompactRatio(ratio); err != nil {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+		return 2
+	}
+	if err := cfg.SaveTo(path); err != nil {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+		return 1
+	}
+	fmt.Printf("compact_ratio = %s (%s: %s)\n", formatCompactRatioPercent(cfg.Agent.CompactRatio), scope, displayPath(path))
+	return 0
+}
+
+func compactRatioSource() string {
+	if config.ConfigFileDefinesCompactRatio("reasonix.toml") {
+		return "project: " + displayPath("reasonix.toml")
+	}
+	if path := config.UserConfigPath(); path != "" && config.ConfigFileDefinesCompactRatio(path) {
+		return "user: " + displayPath(path)
+	}
+	return "built-in default"
+}
+
+func formatCompactRatioPercent(ratio float64) string {
+	value := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", ratio*100), "0"), ".")
+	return value + "%"
+}
+
 func configUsage() {
 	fmt.Print(`Usage:
   reasonix config reasoning-language [--local] [auto|zh|en]
+  reasonix config compact-ratio [--local] [65..85]
   reasonix config currency [auto|CNY|USD]
   reasonix config telemetry [auto|on|off]
 `)
@@ -2497,6 +2599,12 @@ func configUsage() {
 func configTelemetryUsage() {
 	fmt.Print(`Usage:
   reasonix config telemetry [auto|on|off]
+`)
+}
+
+func configCompactRatioUsage() {
+	fmt.Print(`Usage:
+  reasonix config compact-ratio [--local] [65..85]
 `)
 }
 
