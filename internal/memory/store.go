@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"reasonix/internal/config"
 	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/frontmatter"
@@ -77,16 +75,22 @@ func NormalizeFactScope(s string) FactScope {
 
 // Memory is one stored fact.
 type Memory struct {
-	ID          string // immutable identity; Name may change without changing ID
-	Revision    int    // monotonic content revision, starting at 1
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	Name        string // kebab-case slug; also the file stem (<name>.md)
-	Title       string // human-readable index label; falls back to a de-kebabed Name
-	Description string // one-line summary used for the index and recall
-	Type        Type
-	Scope       FactScope // project by default; global only when explicitly requested
-	Body        string    // the fact itself (Markdown)
+	ID             string // immutable identity; Name may change without changing ID
+	Revision       int    // monotonic content revision, starting at 1
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	Name           string // kebab-case slug; also the file stem (<name>.md)
+	Title          string // human-readable index label; falls back to a de-kebabed Name
+	Description    string // one-line summary used for the index and recall
+	Type           Type
+	Scope          FactScope  // project by default; global only when explicitly requested
+	Activation     Activation // persisted choice; "" = unset, resolved by ResolveActivation
+	Volatility     Volatility // how fast the fact ages; "" = unset, type default applies
+	SubjectKey     string     // which question the fact answers (project.package_manager); one active value per scope+subject
+	ExpiresAt      time.Time  // hard freshness boundary; zero = never expires
+	LastVerifiedAt time.Time  // last explicit confirmation; renews the freshness clock
+	Keywords       string     // search aliases (bilingual synonyms, related commands); recall-only, never rendered into the index
+	Body           string     // the fact itself (Markdown)
 }
 
 // ArchivedMemory is a saved fact that has been removed from active memory but
@@ -380,78 +384,6 @@ func repairOwnerWrite(root *os.Root, path string, dir bool) {
 	_ = root.Chmod(path, info.Mode().Perm()|need)
 }
 
-// memoryFrontmatter is the YAML shape render emits, mirroring the auto-memory
-// shape (name / description / metadata.type) so the files are interchangeable
-// with that ecosystem and re-readable by loadMemory. Marshaled by yaml.v3 so a
-// title or description containing ": ", '#', or quotes is escaped instead of
-// corrupting the block — frontmatter.Split returns an EMPTY map for
-// unparseable YAML, which would silently drop the memory's name/title/type on
-// the next load. Plain values render byte-identically to the previous
-// hand-built format.
-type memoryFrontmatter struct {
-	ID        string `yaml:"id,omitempty"`
-	Revision  int    `yaml:"revision,omitempty"`
-	CreatedAt string `yaml:"created_at,omitempty"`
-	UpdatedAt string `yaml:"updated_at,omitempty"`
-	Name      string `yaml:"name"`
-	Title     string `yaml:"title,omitempty"`
-	Desc      string `yaml:"description"`
-	Metadata  struct {
-		Type     string `yaml:"type"`
-		FactType string `yaml:"fact_type,omitempty"`
-		Scope    string `yaml:"scope"`
-	} `yaml:"metadata"`
-}
-
-// render serializes a memory to frontmatter + body.
-func render(m Memory, name string) string {
-	fm := memoryFrontmatter{
-		ID: m.ID, Revision: m.Revision, Name: name, Title: oneLine(m.Title), Desc: oneLine(m.Description),
-	}
-	if !m.CreatedAt.IsZero() {
-		fm.CreatedAt = m.CreatedAt.UTC().Format(time.RFC3339Nano)
-	}
-	if !m.UpdatedAt.IsZero() {
-		fm.UpdatedAt = m.UpdatedAt.UTC().Format(time.RFC3339Nano)
-	}
-	actualType := NormalizeType(string(m.Type))
-	scope := NormalizeFactScope(string(m.Scope))
-	compatType := previousReleaseRoutingType(actualType, scope)
-	fm.Metadata.Type = string(compatType)
-	if compatType != actualType {
-		fm.Metadata.FactType = string(actualType)
-	}
-	fm.Metadata.Scope = string(scope)
-	var b strings.Builder
-	b.WriteString("---\n")
-	enc := yaml.NewEncoder(&b)
-	enc.SetIndent(2)
-	// Encoding a flat struct of strings cannot fail.
-	_ = enc.Encode(fm)
-	_ = enc.Close()
-	b.WriteString("---\n\n")
-	b.WriteString(strings.TrimSpace(m.Body))
-	b.WriteString("\n")
-	return b.String()
-}
-
-// previousReleaseRoutingType keeps scope safe when an older Reasonix binary
-// shares the same state directory. Previous releases routed user/feedback to
-// GlobalDir and project/reference to Dir, so metadata.type remains a compatible
-// routing hint while metadata.fact_type preserves the independent new category.
-func previousReleaseRoutingType(actual Type, scope FactScope) Type {
-	if scope == FactScopeGlobal {
-		if actual == TypeUser || actual == TypeFeedback {
-			return actual
-		}
-		return TypeUser
-	}
-	if actual == TypeProject || actual == TypeReference {
-		return actual
-	}
-	return TypeProject
-}
-
 // indexLineRe matches a managed index line so reindex/Delete can target the line
 // for one memory by its filename without disturbing the rest of a hand-edited
 // MEMORY.md.
@@ -462,7 +394,7 @@ var indexLineRe = regexp.MustCompile(`(?m)^\s*-\s\[.+?\]\(([^)]+)\.md\)\s*—\s.
 func indexLinesExceptIn(dir, name string) map[string]string {
 	existing, _ := fileencoding.ReadFileUTF8(filepath.Join(dir, indexFile))
 	keep := map[string]string{}
-	for _, line := range strings.Split(string(existing), "\n") {
+	for line := range strings.SplitSeq(string(existing), "\n") {
 		if mt := indexLineRe.FindStringSubmatch(line); mt != nil && mt[1] != name {
 			keep[mt[1]] = strings.TrimRight(line, "\r")
 		}
@@ -475,7 +407,7 @@ func indexContainsIn(dir, name string) bool {
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(string(existing), "\n") {
+	for line := range strings.SplitSeq(string(existing), "\n") {
 		if mt := indexLineRe.FindStringSubmatch(line); mt != nil && mt[1] == name {
 			return true
 		}
@@ -492,7 +424,7 @@ func flushIndexIn(dir string, lines map[string]string) error {
 	processed := map[string]bool{}
 	var preserved strings.Builder
 	preservedEmpty := true
-	for _, line := range strings.Split(string(existing), "\n") {
+	for line := range strings.SplitSeq(string(existing), "\n") {
 		trimmed := strings.TrimRight(line, "\r")
 		if mt := indexLineRe.FindStringSubmatch(trimmed); mt != nil {
 			name := mt[1]
@@ -545,9 +477,13 @@ func reindexIn(dir, name string, m Memory) error {
 }
 
 func renderIndexLine(name string, m Memory) string {
-	return fmt.Sprintf("- [%s](%s.md) — [%s/%s] %s",
+	marker := ""
+	if ResolveActivation(m) == ActivationPinned {
+		marker = " pinned" // the body already rides the prefix; no need to read it
+	}
+	return fmt.Sprintf("- [%s](%s.md) — [%s/%s%s] %s",
 		displayTitle(m.Title, name), name,
-		NormalizeFactScope(string(m.Scope)), NormalizeType(string(m.Type)), oneLine(m.Description))
+		NormalizeFactScope(string(m.Scope)), NormalizeType(string(m.Type)), marker, oneLine(m.Description))
 }
 
 // List returns the saved memories parsed from their files, sorted by name. Used
@@ -629,46 +565,58 @@ func (s Store) ListAll() []Memory {
 	return out
 }
 
-// globalGuidance snapshots global user preferences and working feedback for the
-// stable session prefix. These categories were globally routed before explicit
-// scopes existed, so loading their bodies preserves the established first-turn
-// behavior without promoting project facts or references into instructions.
-func (s Store) globalGuidance() []Memory {
-	if s.GlobalDir == "" {
-		return nil
-	}
-	entries, err := os.ReadDir(s.GlobalDir)
-	if err != nil {
-		return nil
-	}
+// PinnedGuidanceBudgetChars caps the total pinned-body runes the stable prefix
+// carries. Guidance that must always hold belongs in REASONIX.md/AGENTS.md
+// instructions; pinned memory is the bounded middle tier between instructions
+// and retrieval-only facts, and the cap is enforced at write time so the
+// prefix always equals exactly what the user curated.
+const PinnedGuidanceBudgetChars = 1500
+
+// pinnedGuidance snapshots explicitly pinned facts (plus legacy global
+// user/feedback, which ResolveActivation keeps pinned for compatibility) for
+// the stable session prefix, most recently updated first.
+func (s Store) pinnedGuidance() []Memory {
 	var out []Memory
-	for _, e := range entries {
-		if e.IsDir() || e.Name() == indexFile || !strings.HasSuffix(e.Name(), ".md") {
+	for _, dir := range s.dirs() {
+		if dir == "" {
 			continue
 		}
-		m, ok := loadMemory(filepath.Join(s.GlobalDir, e.Name()))
-		if !ok {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
 			continue
 		}
-		if m.Scope == "" {
-			m.Scope = FactScopeGlobal
+		for _, e := range entries {
+			if e.IsDir() || e.Name() == indexFile || !strings.HasSuffix(e.Name(), ".md") {
+				continue
+			}
+			m, ok := loadMemory(filepath.Join(dir, e.Name()))
+			if !ok {
+				continue
+			}
+			if m.Scope == "" {
+				m.Scope = s.scopeForDir(dir)
+			}
+			if ResolveActivation(m) != ActivationPinned || strings.TrimSpace(m.Body) == "" {
+				continue
+			}
+			out = append(out, m)
 		}
-		if NormalizeFactScope(string(m.Scope)) != FactScopeGlobal ||
-			(m.Type != TypeUser && m.Type != TypeFeedback) || strings.TrimSpace(m.Body) == "" {
-			continue
-		}
-		out = append(out, m)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].UpdatedAt.After(out[j].UpdatedAt)
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 
-// globalGuidanceForProject removes global guidance shadowed by an equivalent
+// pinnedGuidanceForProject removes pinned guidance shadowed by an equivalent
 // project fact before the stable session prefix is built. This makes the
 // documented project-over-global rule deterministic on the first turn instead
 // of depending on whether automatic recall happens to match the request.
-func (s Store) globalGuidanceForProject() []Memory {
-	guidance := s.globalGuidance()
+func (s Store) pinnedGuidanceForProject() []Memory {
+	guidance := s.pinnedGuidance()
 	if len(guidance) == 0 || s.Dir == "" {
 		return guidance
 	}
@@ -689,11 +637,15 @@ func (s Store) globalGuidanceForProject() []Memory {
 	}
 	out := guidance[:0]
 	for _, fact := range guidance {
+		// Project pinned facts always stay: the shadow rule only suppresses a
+		// GLOBAL fact that an equivalent project fact overrides.
 		shadowed := false
-		for _, key := range recallIdentityKeys(fact) {
-			if projectKeys[key] {
-				shadowed = true
-				break
+		if NormalizeFactScope(string(fact.Scope)) == FactScopeGlobal {
+			for _, key := range recallIdentityKeys(fact) {
+				if projectKeys[key] {
+					shadowed = true
+					break
+				}
 			}
 		}
 		if !shadowed {
@@ -776,16 +728,22 @@ func loadMemory(path string) (Memory, bool) {
 	}
 	fm, body := splitFrontmatter(string(b))
 	m := Memory{
-		ID:          fm["id"],
-		Revision:    parsePositiveInt(fm["revision"]),
-		CreatedAt:   parseMemoryTime(fm["created_at"]),
-		UpdatedAt:   parseMemoryTime(fm["updated_at"]),
-		Name:        fm["name"],
-		Title:       fm["title"],
-		Description: fm["description"],
-		Type:        persistedFactType(fm),
-		Scope:       factScopeFromFrontmatter(fm["scope"]),
-		Body:        strings.TrimSpace(body),
+		ID:             fm["id"],
+		Revision:       parsePositiveInt(fm["revision"]),
+		CreatedAt:      parseMemoryTime(fm["created_at"]),
+		UpdatedAt:      parseMemoryTime(fm["updated_at"]),
+		Name:           fm["name"],
+		Title:          fm["title"],
+		Description:    fm["description"],
+		Keywords:       fm["keywords"],
+		Activation:     NormalizeActivation(fm["activation"]),
+		Volatility:     NormalizeVolatility(fm["volatility"]),
+		SubjectKey:     NormalizeSubjectKey(fm["subject_key"]),
+		ExpiresAt:      parseMemoryTime(fm["expires_at"]),
+		LastVerifiedAt: parseMemoryTime(fm["last_verified_at"]),
+		Type:           persistedFactType(fm),
+		Scope:          factScopeFromFrontmatter(fm["scope"]),
+		Body:           strings.TrimSpace(body),
 	}
 	if m.Name == "" {
 		m.Name = strings.TrimSuffix(filepath.Base(path), ".md")

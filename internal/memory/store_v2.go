@@ -7,17 +7,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type SaveOptions struct {
 	ExpectedRevision        int
 	RequireExpectedRevision bool
 	RequireCreate           bool
+	ClearExpiry             bool // drop an inherited expires_at instead of preserving it
 }
 
 type SaveResult struct {
@@ -87,6 +90,67 @@ func (s Store) MigrateV2() (MigrationReport, error) {
 	return report, nil
 }
 
+// inheritOnUpdate keeps the update-omittable fields of an existing revision:
+// an update that leaves scope, activation, volatility, expiry, verification,
+// or keywords empty preserves them, it does not clear them. ClearExpiry is
+// the explicit exception — dropping a boundary must be a stated intent.
+func inheritOnUpdate(m Memory, existing Memory, clearExpiry bool) Memory {
+	if strings.TrimSpace(string(m.Scope)) == "" {
+		m.Scope = existing.Scope
+	}
+	if NormalizeActivation(string(m.Activation)) == "" {
+		m.Activation = existing.Activation
+	}
+	if NormalizeVolatility(string(m.Volatility)) == "" {
+		m.Volatility = existing.Volatility
+	}
+	if NormalizeSubjectKey(m.SubjectKey) == "" {
+		m.SubjectKey = existing.SubjectKey
+	}
+	if clearExpiry {
+		m.ExpiresAt = time.Time{}
+	} else if m.ExpiresAt.IsZero() {
+		m.ExpiresAt = existing.ExpiresAt
+	}
+	if m.LastVerifiedAt.IsZero() {
+		m.LastVerifiedAt = existing.LastVerifiedAt
+	}
+	if strings.TrimSpace(m.Keywords) == "" {
+		m.Keywords = existing.Keywords
+	}
+	return m
+}
+
+// validateSave runs the cross-fact invariants once identity, scope, and
+// inheritance are resolved: the pinned budget and subject uniqueness.
+func (s Store) validateSave(m Memory) error {
+	if err := s.validatePinnedBudget(m); err != nil {
+		return err
+	}
+	return s.validateSubjectKey(m)
+}
+
+// validatePinnedBudget rejects a save that would push the total pinned-body
+// runes over PinnedGuidanceBudgetChars. Legacy virtually-pinned guidance
+// counts — it occupies the same prefix — so an over-budget store forces
+// curation before anything new can be pinned.
+func (s Store) validatePinnedBudget(m Memory) error {
+	if ResolveActivation(m) != ActivationPinned {
+		return nil
+	}
+	total := utf8.RuneCountInString(strings.TrimSpace(m.Body))
+	for _, pinned := range s.pinnedGuidance() {
+		if pinned.ID == m.ID || (m.ID == "" && pinned.Name == m.Name) {
+			continue
+		}
+		total += utf8.RuneCountInString(strings.TrimSpace(pinned.Body))
+	}
+	if total <= PinnedGuidanceBudgetChars {
+		return nil
+	}
+	return fmt.Errorf("pinning this fact would put pinned guidance at %d chars, over the %d budget: rules that must always hold belong in REASONIX.md/AGENTS.md instructions; unpin or consolidate existing pinned facts first", total, PinnedGuidanceBudgetChars)
+}
+
 func (s Store) SaveWithOptions(m Memory, opts SaveOptions) (SaveResult, error) {
 	memoryStoreMutationMu.Lock()
 	defer memoryStoreMutationMu.Unlock()
@@ -140,12 +204,8 @@ func (s Store) SaveWithOptions(m Memory, opts SaveOptions) (SaveResult, error) {
 	}
 	now := time.Now().UTC()
 	if exists {
-		m.ID = existing.ID
-		m.Revision = existing.Revision + 1
-		m.CreatedAt = existing.CreatedAt
-		if strings.TrimSpace(string(m.Scope)) == "" {
-			m.Scope = existing.Scope
-		}
+		m.ID, m.Revision, m.CreatedAt = existing.ID, existing.Revision+1, existing.CreatedAt
+		m = inheritOnUpdate(m, existing, opts.ClearExpiry)
 	} else {
 		m.ID = newMemoryID(m.Name, now)
 		m.Revision = 1
@@ -164,6 +224,9 @@ func (s Store) SaveWithOptions(m Memory, opts SaveOptions) (SaveResult, error) {
 		}
 	} else {
 		m.Scope = NormalizeFactScope(string(m.Scope))
+	}
+	if err := s.validateSave(m); err != nil {
+		return SaveResult{}, err
 	}
 
 	dir := s.DirFor(m.Scope)
@@ -240,8 +303,8 @@ func (s Store) findActive(ref string) (Memory, string, bool) {
 	if parsed.qualified {
 		return s.findActiveInDir(s.DirFor(parsed.scope), parsed.raw)
 	}
-	for i := len(s.dirs()) - 1; i >= 0; i-- {
-		dir := s.dirs()[i]
+	for _, v := range slices.Backward(s.dirs()) {
+		dir := v
 		if memory, path, ok := s.findActiveInDir(dir, parsed.raw); ok {
 			return memory, path, true
 		}

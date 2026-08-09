@@ -3,9 +3,11 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -278,9 +280,7 @@ func cloneStringMap(in map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
+	maps.Copy(out, in)
 	return out
 }
 
@@ -332,6 +332,19 @@ func tomlFileDefinesKey(path string, key ...string) bool {
 // current project.
 func ConfigFileDefinesCompactRatio(path string) bool {
 	return tomlFileDefinesKey(path, "agent", "compact_ratio")
+}
+
+// ConfigFileDefinesSkillKey reports whether a project or user TOML file
+// explicitly owns one of the supported [skills] settings. Desktop settings use
+// this narrow provenance check to edit the file that wins at runtime instead
+// of persisting a shadowed value to the global config.
+func ConfigFileDefinesSkillKey(path, key string) bool {
+	switch strings.TrimSpace(key) {
+	case "paths", "excluded_paths", "disabled_skills", "disable_implicit_invocation", "max_depth":
+		return tomlFileDefinesKey(path, "skills", key)
+	default:
+		return false
+	}
 }
 
 // backfillDeepSeekPro restores deepseek-pro for configs the pre-fix setup wizard
@@ -390,6 +403,7 @@ func backfillDeepSeekOfficialPrices(c *Config) {
 		if officialProviderKind(p) != "deepseek" {
 			continue
 		}
+		backfillDeepSeekOfficialEndpointDefaults(p)
 		currency := c.DeepSeekOfficialPricingCurrency()
 		if c.DesktopCurrency() == "" && p.persistedOfficialCurrency != "" {
 			currency = p.persistedOfficialCurrency
@@ -407,6 +421,25 @@ func backfillDeepSeekOfficialPrices(c *Config) {
 			}
 		}
 	}
+}
+
+// backfillDeepSeekOfficialEndpointDefaults restores the two official-endpoint
+// fields a config may legitimately omit. Both are safe to infer here precisely
+// because the caller already matched api.deepseek.com: the wallet endpoint is
+// the vendor's own, and 1M is that vendor's real window. Values the file
+// declares are never overwritten.
+//
+// This is keyed on the endpoint rather than on list position, so it cannot leak
+// onto a custom provider the way the previous positional decode overlay did
+// (#7357, #7358).
+func backfillDeepSeekOfficialEndpointDefaults(p *ProviderEntry) {
+	if p == nil {
+		return
+	}
+	if strings.TrimSpace(p.BalanceURL) == "" {
+		p.BalanceURL = "https://api.deepseek.com/user/balance"
+	}
+	backfillOfficialContextWindow(p, 1_000_000)
 }
 
 func officialProviderKind(p *ProviderEntry) string {
@@ -545,6 +578,7 @@ func mergeTOMLProviderAccess(paths []string) ([]string, bool, error) {
 	var merged []string
 	seen := map[string]bool{}
 	saw := false
+	userDeclared := false
 	for _, path := range paths {
 		_, exists, err := statConfigPath(path)
 		if err != nil {
@@ -568,6 +602,9 @@ func mergeTOMLProviderAccess(paths []string) ([]string, bool, error) {
 			merged = []string{}
 		}
 		saw = true
+		if isUserConfigPath(path) {
+			userDeclared = true
+		}
 		for _, name := range f.Desktop.ProviderAccess {
 			name = strings.TrimSpace(name)
 			if name == "" || seen[name] {
@@ -576,6 +613,11 @@ func mergeTOMLProviderAccess(paths []string) ([]string, bool, error) {
 			seen[name] = true
 			merged = append(merged, name)
 		}
+	}
+	// An undeclared user list means "allow all"; a union with a project-only
+	// list would silently narrow that to whatever the project happens to name.
+	if saw && !userDeclared {
+		return nil, false, nil
 	}
 	return merged, saw, nil
 }
@@ -706,9 +748,11 @@ func loadForEditStrict(path string, loadCredentials, persistMigrations bool) (*C
 		loadDotEnvForEditPath(path)
 	}
 	cfg := Default()
-	if err := mergeFile(cfg, path); err != nil {
+	meta, err := mergeFileSnapshot(cfg, path)
+	if err != nil {
 		return nil, err
 	}
+	markExplicitDefaultProjectSkillKeys(cfg, path, meta)
 	changed := normalizeConfigForEdit(cfg)
 	if persistMigrations && changed && strings.TrimSpace(path) != "" {
 		if _, err := os.Stat(path); err == nil {
@@ -718,6 +762,25 @@ func loadForEditStrict(path string, loadCredentials, persistMigrations bool) (*C
 		}
 	}
 	return cfg, nil
+}
+
+// markExplicitDefaultProjectSkillKeys preserves project skill fields that are
+// explicitly present in a file but equal the built-in default. Without this
+// transient provenance, saving an unrelated project setting would mistake an
+// intentional `false`/empty override for a stale delta and remove it.
+func markExplicitDefaultProjectSkillKeys(c *Config, path string, meta toml.MetaData) {
+	if c == nil || isUserConfigPath(path) {
+		return
+	}
+	for _, key := range projectSkillKeys {
+		if !meta.IsDefined("skills", key) || !projectSkillKeyIsDefault(c, key) {
+			continue
+		}
+		if c.explicitProjectSkillKeys == nil {
+			c.explicitProjectSkillKeys = make(map[string]bool)
+		}
+		c.explicitProjectSkillKeys[key] = true
+	}
 }
 
 func normalizeConfigForEdit(cfg *Config) bool {
@@ -1917,15 +1980,11 @@ func mergeModelLists(primary, extra []string) []string {
 
 func firstKnownModel(current string, models []string, fallback string) string {
 	current = strings.TrimSpace(current)
-	for _, model := range models {
-		if model == current {
-			return current
-		}
+	if slices.Contains(models, current) {
+		return current
 	}
-	for _, model := range models {
-		if model == fallback {
-			return fallback
-		}
+	if slices.Contains(models, fallback) {
+		return fallback
 	}
 	if len(models) > 0 {
 		return models[0]

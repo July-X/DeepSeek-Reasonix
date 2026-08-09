@@ -905,9 +905,9 @@ func (p *bootSubagentTestProvider) requestsSnapshot() []provider.Request {
 }
 
 func bootLastUser(req provider.Request) string {
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if req.Messages[i].Role == provider.RoleUser {
-			return req.Messages[i].Content
+	for _, v := range slices.Backward(req.Messages) {
+		if v.Role == provider.RoleUser {
+			return v.Content
 		}
 	}
 	return ""
@@ -919,9 +919,9 @@ func subagentRefFromHistory(t *testing.T, msgs []provider.Message) string {
 		if msg.Role != provider.RoleTool {
 			continue
 		}
-		for _, line := range strings.Split(msg.Content, "\n") {
-			if strings.HasPrefix(line, "Subagent reference: ") {
-				return strings.TrimSpace(strings.TrimPrefix(line, "Subagent reference: "))
+		for line := range strings.SplitSeq(msg.Content, "\n") {
+			if after, ok := strings.CutPrefix(line, "Subagent reference: "); ok {
+				return strings.TrimSpace(after)
 			}
 		}
 	}
@@ -967,20 +967,20 @@ model = "x"
 		t.Fatalf("headless run should keep an empty session path, got %q", got)
 	}
 
-	var toolContent string
+	var toolContent strings.Builder
 	for _, msg := range ctrl.History() {
 		if msg.Role == provider.RoleTool {
-			toolContent += "\n" + msg.Content
+			toolContent.WriteString("\n" + msg.Content)
 		}
 	}
-	if strings.Contains(toolContent, "parent session is required") {
-		t.Fatalf("task subagent failed in headless run mode: %s", toolContent)
+	if strings.Contains(toolContent.String(), "parent session is required") {
+		t.Fatalf("task subagent failed in headless run mode: %s", toolContent.String())
 	}
-	if !strings.Contains(toolContent, "subagent answer") {
-		t.Fatalf("task tool result = %q, want sub-agent answer", toolContent)
+	if !strings.Contains(toolContent.String(), "subagent answer") {
+		t.Fatalf("task tool result = %q, want sub-agent answer", toolContent.String())
 	}
-	if strings.Contains(toolContent, "Subagent reference") {
-		t.Fatalf("ephemeral headless run should not persist a transcript reference: %s", toolContent)
+	if strings.Contains(toolContent.String(), "Subagent reference") {
+		t.Fatalf("ephemeral headless run should not persist a transcript reference: %s", toolContent.String())
 	}
 }
 
@@ -2049,83 +2049,6 @@ model = "x"
 	}
 }
 
-func TestBootToolContractMatchesProviderVisibleSurface(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		tokenMode string
-	}{
-		{name: "default", tokenMode: ""},
-		{name: "economy", tokenMode: TokenModeEconomy},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			isolateConfigHome(t)
-			dir := robustTempDir(t)
-			t.Chdir(dir)
-			writeFile(t, dir, "reasonix.toml", `
-default_model = "test-model"
-
-[agent]
-system_prompt = "BASE"
-
-[[providers]]
-name = "test-model"
-kind = "boot-token-profile-test"
-model = "x"
-`)
-
-			req, entries := captureTokenProfileSurface(t, tc.tokenMode)
-			wantNames := defaultFullBootToolNames()
-			if tc.tokenMode == TokenModeEconomy {
-				wantNames = economyBootToolNames()
-			}
-			if got := toolSchemaNames(req.Tools); !reflect.DeepEqual(got, wantNames) {
-				t.Fatalf("%s provider-visible tool surface changed\ngot  %v\nwant %v", tc.name, got, wantNames)
-			}
-			if len(entries) != len(req.Tools) {
-				t.Fatalf("contract entries = %d, provider tools = %d\ncontract=%v\nprovider=%v", len(entries), len(req.Tools), contractEntryNames(entries), toolSchemaNames(req.Tools))
-			}
-			for i, e := range entries {
-				s := req.Tools[i]
-				if e.Name != s.Name {
-					t.Fatalf("tool[%d] name = %q, want %q\ncontract=%v\nprovider=%v", i, e.Name, s.Name, contractEntryNames(entries), toolSchemaNames(req.Tools))
-				}
-				if e.Description != strings.TrimSpace(s.Description) {
-					t.Fatalf("%s description drift\ncontract=%q\nprovider=%q", e.Name, e.Description, s.Description)
-				}
-				if !json.Valid(e.Schema) {
-					t.Fatalf("%s contract schema is invalid JSON: %s", e.Name, e.Schema)
-				}
-				if got := string(provider.CanonicalizeSchema(e.Schema)); got != string(e.Schema) {
-					t.Fatalf("%s contract schema is not canonical", e.Name)
-				}
-				if string(e.Schema) != string(s.Parameters) {
-					t.Fatalf("%s schema drift\ncontract=%s\nprovider=%s", e.Name, e.Schema, s.Parameters)
-				}
-			}
-			readOnly := map[string]bool{}
-			for _, e := range entries {
-				readOnly[e.Name] = e.ReadOnly
-			}
-			for name, want := range map[string]bool{
-				"bash":                false,
-				"read_file":           true,
-				"connect_tool_source": tc.tokenMode == TokenModeEconomy,
-			} {
-				got, ok := readOnly[name]
-				if !ok {
-					if name == "connect_tool_source" && tc.tokenMode != TokenModeEconomy {
-						continue
-					}
-					t.Fatalf("contract missing %s; tools=%v", name, contractEntryNames(entries))
-				}
-				if got != want {
-					t.Fatalf("%s ReadOnly = %v, want %v", name, got, want)
-				}
-			}
-		})
-	}
-}
-
 func TestToolContractDocCoversDefaultBootSurfaces(t *testing.T) {
 	pkgDir, err := os.Getwd()
 	if err != nil {
@@ -2183,9 +2106,10 @@ func defaultFullBootToolNames() []string {
 		"bash",
 		"bash_output",
 		"code_index",
-		"complete_step",
+		"complete_step", "compress",
 		"delete_range",
 		"delete_symbol",
+		"docs",
 		"edit_file",
 		"explore",
 		"fleet",
@@ -2212,6 +2136,7 @@ func defaultFullBootToolNames() []string {
 		"read_only_task",
 		"read_session",
 		"read_skill",
+		"read_subagent_result",
 		"remember",
 		"research",
 		"review",
@@ -2220,6 +2145,7 @@ func defaultFullBootToolNames() []string {
 		"slash_command",
 		"task",
 		"todo_write",
+		"update_goal",
 		"wait",
 		"web_fetch",
 		"write_file",
@@ -2230,11 +2156,12 @@ func economyBootToolNames() []string {
 	return []string{
 		"ask",
 		"bash",
-		"bash_output",
+		"bash_output", "compress",
 		"connect_tool_source",
 		"edit_file",
 		"kill_shell",
 		"read_file",
+		"update_goal",
 		"wait",
 		"write_file",
 	}
@@ -2281,18 +2208,19 @@ command = "reasonix-missing-mockmcp"
 	wantTools := []string{
 		"ask",
 		"bash",
-		"bash_output",
+		"bash_output", "compress",
 		"connect_tool_source",
 		"edit_file",
 		"kill_shell",
 		"read_file",
+		"update_goal",
 		"wait",
 		"write_file",
 	}
 	if got := toolSchemaNames(req.Tools); !reflect.DeepEqual(got, wantTools) {
 		t.Fatalf("economy first request tool order changed\ngot  %v\nwant %v", got, wantTools)
 	}
-	for _, want := range []string{"connect_tool_source", "read_file", "edit_file", "write_file", "bash", "ask"} {
+	for _, want := range []string{"compress", "connect_tool_source", "read_file", "edit_file", "write_file", "bash", "ask"} {
 		if !requestHasTool(req, want) {
 			t.Fatalf("economy first request missing tool %q; tools=%v", want, toolSchemaNames(req.Tools))
 		}
@@ -2302,7 +2230,7 @@ command = "reasonix-missing-mockmcp"
 		"explore", "research", "review", "security_review",
 		"lsp_definition", "lsp_references", "lsp_hover", "lsp_diagnostics",
 		"code_index", "complete_step", "glob", "grep", "ls", "move_file", "multi_edit", "todo_write",
-		"history", "list_sessions", "read_session", "memory", "remember", "forget", "slash_command",
+		"docs", "history", "list_sessions", "read_session", "memory", "remember", "forget", "slash_command",
 	} {
 		if requestHasTool(req, forbidden) {
 			t.Fatalf("economy first request should hide %q; tools=%v", forbidden, toolSchemaNames(req.Tools))
@@ -2328,6 +2256,7 @@ func TestBuildTokenEconomyConnectsOptionalSourcesOnDemand(t *testing.T) {
 		{source: "search", tools: []string{"code_index", "glob", "grep", "ls"}},
 		{source: "files", tools: []string{"delete_range", "delete_symbol", "move_file", "multi_edit", "notebook_edit"}},
 		{source: "workflow", tools: []string{"complete_step", "todo_write"}},
+		{source: "docs", tools: []string{"docs"}},
 		{source: "sessions", tools: []string{"history", "list_sessions", "read_session"}},
 		{source: "memory", tools: []string{"forget", "memory", "remember"}},
 		{source: "commands", tools: []string{"slash_command"}},
@@ -2734,17 +2663,17 @@ READ ONLY SKILL BODY`)
 			t.Fatalf("read_only_skill child request should hide %q; tools=%v", forbidden, toolSchemaNames(subReq.Tools))
 		}
 	}
-	var toolOutput string
+	var toolOutput strings.Builder
 	for _, msg := range ctrl.History() {
 		if msg.Role == provider.RoleTool && msg.Name == "connect_tool_source" {
-			toolOutput += msg.Content
+			toolOutput.WriteString(msg.Content)
 			if strings.Contains(msg.Content, "blocked:") {
 				t.Fatalf("connect_tool_source should not block read_only_skill in plan mode, got:\n%s", msg.Content)
 			}
 		}
 	}
-	if !strings.Contains(toolOutput, "readonlydig") || !strings.Contains(toolOutput, "# Skills") {
-		t.Fatalf("read_only_skill source result should include the skill index, got:\n%s", toolOutput)
+	if !strings.Contains(toolOutput.String(), "readonlydig") || !strings.Contains(toolOutput.String(), "# Skills") {
+		t.Fatalf("read_only_skill source result should include the skill index, got:\n%s", toolOutput.String())
 	}
 }
 
@@ -2948,17 +2877,17 @@ command = "reasonix-missing-mockmcp"
 			if len(reqs) != 2 {
 				t.Fatalf("requests = %d, want 2", len(reqs))
 			}
-			var toolOutput string
+			var toolOutput strings.Builder
 			for _, msg := range ctrl.History() {
 				if msg.Role == provider.RoleTool && msg.Name == "connect_tool_source" {
-					toolOutput += msg.Content
+					toolOutput.WriteString(msg.Content)
 				}
 			}
-			if strings.TrimSpace(toolOutput) == "" {
+			if strings.TrimSpace(toolOutput.String()) == "" {
 				t.Fatalf("connect_tool_source(%s) returned empty tool output", tt.source)
 			}
-			if strings.Contains(toolOutput, "blocked:") {
-				t.Fatalf("connect_tool_source(%s) should load capability metadata in Plan, got %q", tt.source, toolOutput)
+			if strings.Contains(toolOutput.String(), "blocked:") {
+				t.Fatalf("connect_tool_source(%s) should load capability metadata in Plan, got %q", tt.source, toolOutput.String())
 			}
 			for _, enabled := range tt.enabledTools {
 				if !requestHasTool(reqs[1], enabled) {
@@ -3018,17 +2947,17 @@ model = "x"
 	if requestHasTool(reqs[1], "complete_step") {
 		t.Fatalf("plan-mode workflow connect must not expose complete_step; tools=%v", toolSchemaNames(reqs[1].Tools))
 	}
-	var planConnectOutput string
+	var planConnectOutput strings.Builder
 	for _, msg := range ctrl.History() {
 		if msg.Role == provider.RoleTool && msg.Name == "connect_tool_source" {
-			planConnectOutput += msg.Content
+			planConnectOutput.WriteString(msg.Content)
 		}
 	}
-	if strings.Contains(planConnectOutput, "blocked:") {
-		t.Fatalf("workflow source should not be blocked in plan mode, got:\n%s", planConnectOutput)
+	if strings.Contains(planConnectOutput.String(), "blocked:") {
+		t.Fatalf("workflow source should not be blocked in plan mode, got:\n%s", planConnectOutput.String())
 	}
-	if !strings.Contains(planConnectOutput, "complete_step stays blocked in plan mode") {
-		t.Fatalf("plan-mode workflow connect should explain the deferred complete_step, got:\n%s", planConnectOutput)
+	if !strings.Contains(planConnectOutput.String(), "complete_step stays blocked in plan mode") {
+		t.Fatalf("plan-mode workflow connect should explain the deferred complete_step, got:\n%s", planConnectOutput.String())
 	}
 
 	ctrl.SetPlanMode(false)
@@ -3131,14 +3060,14 @@ model = "x"
 	if requestHasTool(reqs[1], "web_fetch") {
 		t.Fatalf("disabled web_fetch should not be exposed after connect_tool_source; tools=%v", toolSchemaNames(reqs[1].Tools))
 	}
-	var toolOutput string
+	var toolOutput strings.Builder
 	for _, msg := range ctrl.History() {
 		if msg.Role == provider.RoleTool && msg.Name == "connect_tool_source" {
-			toolOutput += msg.Content
+			toolOutput.WriteString(msg.Content)
 		}
 	}
-	if !strings.Contains(toolOutput, "web_fetch is disabled by [tools].enabled") {
-		t.Fatalf("connector should explain disabled web_fetch, got:\n%s", toolOutput)
+	if !strings.Contains(toolOutput.String(), "web_fetch is disabled by [tools].enabled") {
+		t.Fatalf("connector should explain disabled web_fetch, got:\n%s", toolOutput.String())
 	}
 }
 
@@ -3188,21 +3117,21 @@ model = "x"
 			t.Fatalf("second request should expose %q after connect_tool_source; tools=%v", name, toolSchemaNames(reqs[1].Tools))
 		}
 	}
-	var toolOutput string
+	var toolOutput strings.Builder
 	for _, msg := range ctrl.History() {
 		if msg.Role == provider.RoleTool && msg.Name == "connect_tool_source" {
-			toolOutput += msg.Content
+			toolOutput.WriteString(msg.Content)
 		}
 	}
-	if !strings.Contains(toolOutput, "projskill") || !strings.Contains(toolOutput, "# Skills") {
-		t.Fatalf("skills source result should include the skill index, got:\n%s", toolOutput)
+	if !strings.Contains(toolOutput.String(), "projskill") || !strings.Contains(toolOutput.String(), "# Skills") {
+		t.Fatalf("skills source result should include the skill index, got:\n%s", toolOutput.String())
 	}
 }
 
 func TestAddBuiltinsWithWorkspaceRootKeepsSessionTools(t *testing.T) {
 	reg := tool.NewRegistry()
 	var stderr bytes.Buffer
-	addBuiltins(reg, nil, []string{robustTempDir(t)}, sandbox.Spec{}, 120*time.Second, builtin.SearchSpec{}, &stderr, robustTempDir(t), netclient.ProxySpec{}, nil, nil, builtin.SessionDataGuard{}, builtin.ManagedConfigPaths{}, nil, nil)
+	addBuiltins(reg, nil, []string{robustTempDir(t)}, sandbox.Spec{}, 120*time.Second, builtin.SearchSpec{}, &stderr, robustTempDir(t), netclient.ProxySpec{}, nil, nil, builtin.SessionDataGuard{}, builtin.ManagedConfigPaths{}, nil, nil, nil, nil)
 	for _, name := range []string{
 		"todo_write",
 		"complete_step",
@@ -3351,8 +3280,8 @@ api_key_env = "REASONIX_TEST_KEY_UNSET"
 	// user-global REASONIX.md in the real config dir could append; the test
 	// environment has none, so the base stands alone.)
 	base := sys
-	if i := strings.Index(sys, "\n\n# Skills"); i >= 0 {
-		base = sys[:i]
+	if before, _, ok := strings.Cut(sys, "\n\n# Skills"); ok {
+		base = before
 	}
 	// The language policy, user-decision policy, and current-workspace line are
 	// always appended at boot; strip them so this assertion is purely about
@@ -3506,7 +3435,7 @@ func systemMessage(msgs []provider.Message) string {
 func stripLanguagePolicy(s string) string {
 	s = strings.TrimSpace(s)
 	for _, policy := range []string{
-		config.LanguagePolicy,
+		config.LanguagePolicy, config.WorkPracticePolicy,
 		config.UserDecisionPolicy,
 	} {
 		s = strings.TrimSpace(strings.TrimSuffix(s, policy))
@@ -3515,8 +3444,8 @@ func stripLanguagePolicy(s string) string {
 }
 
 func stripEnvironmentBlock(s string) string {
-	if i := strings.Index(s, "\n\n## Environment"); i >= 0 {
-		return s[:i]
+	if before, _, ok := strings.Cut(s, "\n\n## Environment"); ok {
+		return before
 	}
 	return s
 }
@@ -3689,7 +3618,7 @@ func TestRememberPermissionRuleSerializesConcurrentWriters(t *testing.T) {
 	start := make(chan struct{})
 	results := make(chan control.RememberResult, writers)
 	var wg sync.WaitGroup
-	for i := 0; i < writers; i++ {
+	for i := range writers {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
@@ -3707,7 +3636,7 @@ func TestRememberPermissionRuleSerializesConcurrentWriters(t *testing.T) {
 	}
 
 	got := config.LoadForEdit(filepath.Join(workspace, "reasonix.toml"))
-	for i := 0; i < writers; i++ {
+	for i := range writers {
 		rule := fmt.Sprintf("Edit(file-%02d)", i)
 		if !hasPermissionRule(got.Permissions.Allow, rule) {
 			t.Errorf("permissions.allow missing %q: %v", rule, got.Permissions.Allow)
@@ -3725,7 +3654,7 @@ func TestRememberPermissionRuleSerializesCrossProcessWriters(t *testing.T) {
 	const rulesPerWorker = 8
 	commands := make([]*exec.Cmd, 0, workers)
 	outputs := make([]bytes.Buffer, workers)
-	for worker := 0; worker < workers; worker++ {
+	for worker := range workers {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestRememberPermissionRuleProcessHelper$")
 		cmd.Stdout = &outputs[worker]
 		cmd.Stderr = &outputs[worker]
@@ -3772,8 +3701,8 @@ func TestRememberPermissionRuleSerializesCrossProcessWriters(t *testing.T) {
 	}
 
 	got := config.LoadForEdit(filepath.Join(workspace, "reasonix.toml"))
-	for worker := 0; worker < workers; worker++ {
-		for n := 0; n < rulesPerWorker; n++ {
+	for worker := range workers {
+		for n := range rulesPerWorker {
 			rule := fmt.Sprintf("Edit(process-%d-file-%02d)", worker, n)
 			if !hasPermissionRule(got.Permissions.Allow, rule) {
 				t.Errorf("permissions.allow missing %q: %v", rule, got.Permissions.Allow)
@@ -3811,7 +3740,7 @@ func TestRememberPermissionRuleProcessHelper(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	for n := 0; n < rules; n++ {
+	for n := range rules {
 		rule := fmt.Sprintf("Edit(process-%d-file-%02d)", worker, n)
 		result := rememberPermissionRule(workspace, rule)
 		if result.Err != nil || !result.Saved {
@@ -4002,12 +3931,7 @@ plan_mode_read_only_commands = ["gh issue view"]
 }
 
 func hasPermissionRule(rules []string, want string) bool {
-	for _, rule := range rules {
-		if rule == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(rules, want)
 }
 
 func hasPlanModeReadOnlyCommand(commands []string, want string) bool {
@@ -4901,7 +4825,7 @@ func TestBuildMigratesLegacyEagerBeforeStatsDemotion(t *testing.T) {
 	// Three samples above 2*budget — the rule in stats.go's Recommend triggers
 	// when the trailing window is entirely over the threshold. Use 30s so even
 	// future budget bumps stay below the threshold.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := plugin.RecordStartup("slowserver", 30*time.Second); err != nil {
 			t.Fatalf("RecordStartup #%d: %v", i, err)
 		}
@@ -4984,8 +4908,7 @@ func TestBuildExtraPluginProbeKeepsSessionProcessAlive(t *testing.T) {
 	workspace := robustTempDir(t)
 	t.Chdir(workspace)
 
-	sessionCtx, cancelSession := context.WithCancel(context.Background())
-	defer cancelSession()
+	sessionCtx := t.Context()
 	ctrl, err := Build(sessionCtx, Options{
 		SessionDir: filepath.Join(t.TempDir(), "sessions"),
 		Sink:       event.Discard,

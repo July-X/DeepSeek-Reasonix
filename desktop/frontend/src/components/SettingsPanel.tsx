@@ -45,6 +45,7 @@ import {
 } from "../lib/fontFamily";
 import { getDisplayMode, onDisplayModeChange, setDisplayMode as setLocalDisplayMode } from "../lib/displayMode";
 import { getProcessFoldPreference, onProcessFoldPreferenceChange, setProcessFoldPreference, type ProcessFoldPreference } from "../lib/processFoldPreference";
+import { setReasoningSummaryEnabled, useReasoningSummaryEnabled } from "../lib/reasoningSummaryPreference";
 import { DEFAULT_STATUS_BAR_ITEMS, normalizeStatusBarItems, type StatusBarItemId } from "../lib/statusBarItems";
 import { normalizeToolApprovalMode } from "../lib/types";
 import {
@@ -72,10 +73,11 @@ import { getSuccessPreference, setSuccessPreference, getAttentionPreference, set
 import { ModalCloseButton } from "./ModalCloseButton";
 import { ShortcutComboDisplay } from "./ShortcutComboDisplay";
 
-const SETTINGS_TABS: SettingsTab[] = ["general", "models", "bots", "mcp", "remote", "skills", "subagents", "plugins", "memory", "hooks", "diagnostics", "shortcuts", "permissions", "sandbox", "network", "appearance", "updates"];
+const SETTINGS_TABS: SettingsTab[] = ["general", "models", "bots", "mcp", "remote", "skills", "subagents", "plugins", "memory", "hooks", "diagnostics", "shortcuts", "permissions", "sandbox", "network", "appearance", "storage", "updates"];
 export type SettingsInitialFocus =
-  | { target: "bot-allowlist"; connectionId?: string }
-  | { target: "model-access" };
+  | { target: "bot-allowlist"; connectionId?: string; requestId?: number }
+  | { target: "model-access"; requestId?: number }
+  | { target: "model-stats"; requestId: number };
 type DesktopPlatform = "darwin" | "windows" | "linux";
 
 const MCPServersSettingsPage = lazy(() => import("./CapabilitiesPanel").then((module) => ({ default: module.MCPServersSettingsPage })));
@@ -85,12 +87,11 @@ const PluginsSettingsPage = lazy(() => import("./CapabilitiesPanel").then((modul
 const MemorySettingsPage = lazy(() => import("./MemoryPanel").then((module) => ({ default: module.MemorySettingsPage })));
 const SubagentsSettingsPage = lazy(() => import("./SubagentsPanel").then((module) => ({ default: module.SubagentsSettingsPage })));
 const DiagnosticsSettingsPage = lazy(() => import("./DiagnosticsSettingsPage").then((module) => ({ default: module.DiagnosticsSettingsPage })));
+const StorageSettingsPage = lazy(() => import("./StorageSettingsPage").then((module) => ({ default: module.StorageSettingsPage })));
 const UsageStatsPanel = lazy(() => import("./UsageStatsPanel").then((module) => ({ default: module.UsageStatsPanel })));
 const QRCodeSVG = lazy(() => import("qrcode.react").then((module) => ({ default: module.QRCodeSVG })));
 
-// SettingsPanel is the desktop settings centre — a centred modal with left
-// navigation and a right content area. It hosts all settings pages plus MCP,
-// Skills, and Memory management, replacing the old per-feature drawers.
+// SettingsPanel is the desktop settings centre: a modal hosting settings pages and capability management.
 export function SettingsPanel({
   onClose,
   onChanged,
@@ -99,6 +100,7 @@ export function SettingsPanel({
   agentRunning = false,
   desktopPlatform,
   onUseSubagent,
+  activeWorkspaceKey = "",
 }: {
   onClose: () => void;
   onChanged: (settings?: SettingsView | null) => void;
@@ -107,6 +109,7 @@ export function SettingsPanel({
   agentRunning?: boolean;
   desktopPlatform: DesktopPlatform;
   onUseSubagent: (command: string) => void;
+  activeWorkspaceKey?: string;
 }) {
   const t = useT();
   const [s, setS] = useState<SettingsView | null>(null);
@@ -279,10 +282,7 @@ export function SettingsPanel({
     return () => document.removeEventListener("keydown", onKey);
   }, [requestClose]);
 
-  // The settings-reliant pages (general, models, network, permissions,
-  // sandbox, appearance, updates) need SettingsView loaded. MCP, Skills, Plugins,
-  // and Memory
-  // load their own data and render regardless.
+  // These pages need SettingsView; capability pages load their own data.
   const needsSettings = tab === "general" || tab === "models" || tab === "bots" || tab === "subagents" || tab === "network" || tab === "permissions" || tab === "sandbox" || tab === "appearance" || tab === "updates";
   const lazySettingsPageFallback = <div className="empty">{t("settings.loading")}</div>;
 
@@ -325,7 +325,7 @@ export function SettingsPanel({
                 {tab === "bots" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><BotsSection s={s} busy={busy} apply={apply} initialFocus={initialFocus} /></SettingsPageShell>}
                 {tab === "mcp" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><MCPServersSettingsPage /></Suspense></SettingsPageShell>}
                 {tab === "remote" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><RemoteHostsPage /></Suspense></SettingsPageShell>}
-                {tab === "skills" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><SkillsSettingsPage /></Suspense></SettingsPageShell>}
+                {tab === "skills" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><SkillsSettingsPage activeWorkspaceKey={activeWorkspaceKey} /></Suspense></SettingsPageShell>}
                 {tab === "subagents" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><Suspense fallback={lazySettingsPageFallback}><SubagentsSettingsPage s={s} onUseInChat={(command) => {
                   pendingSubagentCommandRef.current = command;
                   requestClose();
@@ -396,10 +396,12 @@ export function SettingsPanel({
                     />
                   </SettingsPageShell>
                 )}
+                {tab === "storage" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><StorageSettingsPage /></Suspense></SettingsPageShell>}
                 {tab === "updates" && s && (
                   <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}>
                     <UpdatesSection
                       configPath={s.configPath}
+                      shadowedByPath={s.shadowedByPath}
                       checkUpdates={s.checkUpdates}
                       telemetry={s.telemetry !== false}
                       metrics={s.metrics !== false}
@@ -579,8 +581,8 @@ function settingsTabLabel(id: SettingsTab, t: ReturnType<typeof useT>): string {
       return t("settings.tab.permissions");
     case "sandbox":
       return t("settings.tab.sandbox");
-    case "appearance":
-      return t("settings.tab.appearance");
+    case "appearance": return t("settings.tab.appearance");
+    case "storage": return t("settings.tab.storage");
     case "updates":
       return t("settings.tab.updates");
   }
@@ -620,8 +622,8 @@ function settingsTabMeta(id: SettingsTab, s: SettingsView, t: ReturnType<typeof 
       return permissionModeLabel(s.permissions.mode, t);
     case "sandbox":
       return sandboxModeLabel(s.sandbox.bash, t);
-    case "appearance":
-      return t("settings.appearanceMeta");
+    case "appearance": return t("settings.appearanceMeta");
+    case "storage": return t("settings.storageMeta");
     case "updates":
       return t("settings.updatesMeta");
   }
@@ -834,7 +836,7 @@ const COMPACT_RATIO_PRESETS = [
   [0.8, "settings.compactRatioPreset.80"],
   [0.85, "settings.compactRatioPreset.85"],
 ] as const;
-const REASONING_PROTOCOLS: readonly string[] = ["", "deepseek", "glm", "openai", "none"];
+const REASONING_PROTOCOLS: readonly string[] = ["", "deepseek", "glm", "kimi-k3", "openai", "none"];
 const THINKING_MODES: readonly string[] = ["", "enabled", "disabled", "adaptive"];
 const PROXY_TYPES = ["http", "https", "socks5", "socks5h"] as const;
 const LANGUAGE_PREFS: LangPref[] = ["", "zh", "en"];
@@ -1326,6 +1328,7 @@ export function normalizeProviderView(p: ProviderView): ProviderView {
     authHeader: Boolean(p.authHeader),
     reasoningProtocol: normalizeReasoningProtocol(p.reasoningProtocol),
     thinking: normalizeThinkingMode(p.thinking),
+    webSearch: Boolean(p.webSearch),
     supportedEfforts: asArray(p.supportedEfforts),
     modelOverrides: asArray(p.modelOverrides),
     requiresKey,
@@ -1386,7 +1389,6 @@ function normalizeSettingsView(view: SettingsView | null | undefined): SettingsV
     ? Number(agent.effectiveCompactRatio)
     : agent.compactRatio;
   agent.compactRatioOverridden = Boolean(agent.compactRatioOverridden);
-  agent.compactRatioRemote = Boolean(agent.compactRatioRemote);
   return {
     ...view,
     providers: asArray(view.providers).map(normalizeProviderView),
@@ -1489,6 +1491,12 @@ function statusBarItemLabel(id: StatusBarItemId, t: ReturnType<typeof useT>): st
       return t("status.sessionTokensLabel");
     case "turn_tokens":
       return t("status.turnTokensLabel");
+    case "turn_tps":
+      return t("status.tpsLabel");
+    case "turn_output_tokens":
+      return t("status.outputTokensLabel");
+    case "turn_cache_tokens":
+      return t("status.cacheTokensLabel");
     case "turn_cost":
       return t("status.turnCostLabel");
     case "session_turns":
@@ -1542,8 +1550,8 @@ function reasoningProtocolLabel(protocol: string, t: ReturnType<typeof useT>): s
   switch (protocol) {
     case "deepseek":
       return t("settings.reasoningProtocol.deepseek");
-    case "glm":
-      return t("settings.reasoningProtocol.glm");
+    case "glm": return t("settings.reasoningProtocol.glm");
+    case "kimi-k3": return t("settings.reasoningProtocol.kimiK3");
     case "openai":
       return t("settings.reasoningProtocol.openai");
     case "none":
@@ -1571,6 +1579,7 @@ function GeneralSection({ s, busy, apply, agentRunning }: SectionProps & { agent
   const closeBehavior = normalizeCloseBehavior(s.closeBehavior);
   const [displayMode, setDisplayMode] = useState<DisplayMode>(() => normalizeDisplayMode(getDisplayMode()));
   const [processFold, setProcessFold] = useState<ProcessFoldPreference>(getProcessFoldPreference);
+  const reasoningSummaryEnabled = useReasoningSummaryEnabled();
   const [statusBarItemsExpanded, setStatusBarItemsExpanded] = useState(false);
   const [draggingStatusBarItem, setDraggingStatusBarItem] = useState<StatusBarItemId | null>(null);
   const [statusBarDragTarget, setStatusBarDragTargetState] = useState<StatusBarDragTarget | null>(null);
@@ -1742,6 +1751,20 @@ function GeneralSection({ s, busy, apply, agentRunning }: SectionProps & { agent
   };
   return (
     <SettingsSection>
+      <SettingsField label={t("settings.desktopLayoutStyle")}>
+        <div className="set-seg">
+          {(["classic", "workbench", "creation"] as const).map((style) => (
+            <button
+              key={style}
+              className={`set-seg__btn${desktopLayoutStyle === style ? " set-seg__btn--on" : ""}`}
+              disabled={busy}
+              onClick={() => void apply(() => app.SetDesktopLayoutStyle(style))}
+            >
+              {desktopLayoutStyleLabel(style, t)}
+            </button>
+          ))}
+        </div>
+      </SettingsField>
       <SettingsField label={t("settings.language")}>
         <div className="set-seg">
           {LANGUAGE_PREFS.map((pref) => (
@@ -1766,20 +1789,6 @@ function GeneralSection({ s, busy, apply, agentRunning }: SectionProps & { agent
               onClick={() => void apply(() => app.SetDesktopCurrency(currency))}
             >
               {currency === "" ? t("settings.currencyAuto") : currency}
-            </button>
-          ))}
-        </div>
-      </SettingsField>
-      <SettingsField label={t("settings.desktopLayoutStyle")}>
-        <div className="set-seg">
-          {(["classic", "workbench", "creation"] as const).map((style) => (
-            <button
-              key={style}
-              className={`set-seg__btn${desktopLayoutStyle === style ? " set-seg__btn--on" : ""}`}
-              disabled={busy}
-              onClick={() => void apply(() => app.SetDesktopLayoutStyle(style))}
-            >
-              {desktopLayoutStyleLabel(style, t)}
             </button>
           ))}
         </div>
@@ -1828,6 +1837,7 @@ function GeneralSection({ s, busy, apply, agentRunning }: SectionProps & { agent
           ))}
         </div>
       </SettingsField>
+      <SettingsField label={t("settings.reasoningSummary")} hint={t("settings.reasoningSummaryHint")}><div className="set-seg">{([true, false] as const).map((enabled) => <button key={enabled ? "on" : "off"} type="button" className={`set-seg__btn${reasoningSummaryEnabled === enabled ? " set-seg__btn--on" : ""}`} aria-pressed={reasoningSummaryEnabled === enabled} onClick={() => setReasoningSummaryEnabled(enabled)}>{t(enabled ? "settings.reasoningSummary.on" : "settings.reasoningSummary.off")}</button>)}</div></SettingsField>
       <SettingsField label={t("settings.defaultToolApprovalMode")} hint={t("settings.defaultToolApprovalModeHint")}>
         <div className="set-seg">
           {TOOL_APPROVAL_MODES.map((mode) => (
@@ -4085,8 +4095,20 @@ function botDraftWithDerivedGatewayState(draft: BotSettingsView): BotSettingsVie
 function ModelsSection({ s, busy, apply, backgroundApply, initialFocus }: ModelsSectionProps) {
   const t = useT();
   const [subtab, setSubtab] = useState<"usage" | "access" | "stats">(
-    initialFocus?.target === "model-access" ? "access" : "usage",
+    initialFocus?.target === "model-access"
+      ? "access"
+      : initialFocus?.target === "model-stats"
+        ? "stats"
+        : "usage",
   );
+  // The command palette may re-target this section while the settings panel is
+  // already open (the subtab state is not remounted by a tab change). Each
+  // freshly allocated focus request runs this effect once, including repeated
+  // requests for the same target after the user changes subtabs.
+  useEffect(() => {
+    if (initialFocus?.target !== "model-access" && initialFocus?.target !== "model-stats") return;
+    setSubtab(initialFocus.target === "model-access" ? "access" : "stats");
+  }, [initialFocus?.target, initialFocus?.requestId]);
   const autoRefreshKeyRef = useRef("");
   const autoRefreshGenerationRef = useRef(0);
   const refs = useMemo(() => allRefs(s), [s.providers]);
@@ -4500,7 +4522,6 @@ function ModelsSection({ s, busy, apply, backgroundApply, initialFocus }: Models
               </div>
             </SettingsField>
             {compactRatioOverrideHint && <div className="provider-fetch-banner provider-fetch-banner--warn">{compactRatioOverrideHint}</div>}
-            {agent.compactRatioRemote && <div className="provider-fetch-banner provider-fetch-banner--warn">{t("settings.compactRatioRemote")}</div>}
           </SettingsSection>
         </>
       ) : subtab === "access" ? (
@@ -4790,12 +4811,16 @@ function ProvidersSection({ s, busy, apply }: SectionProps) {
   const modelDraftForFetch = (p: ProviderView, fetched: string[]): ProviderModelDraft => {
     const candidates = providerModelCandidates(p.models, fetched);
     const selected = mergedFetchedProviderModels(p.models, fetched, { preserveCurated: true });
-    const visionSource = p.visionModelsConfigured ? p.visionModels : inferredVisionModels(candidates);
+    const visionCapability = providerVisionCapability(p.kind, p.baseUrl);
+    const visionSource = visionCapability === "unsupported"
+      ? []
+      : (p.visionModelsConfigured ? p.visionModels : inferredVisionModels(candidates));
     return {
       providerName: p.name,
       candidates,
       selected: candidates.filter((model) => selected.includes(model)),
       visionModels: candidates.filter((model) => visionSource.includes(model)),
+      visionCapability,
     };
   };
 
@@ -4947,7 +4972,7 @@ function ProvidersSection({ s, busy, apply }: SectionProps) {
       await app.SaveProvider({
         ...provider,
         models,
-        visionModels,
+        visionModels: draft.visionCapability === "unsupported" ? [] : visionModels,
         visionModelsConfigured: true,
         default: providerDefaultModel(provider.default, models),
       });
@@ -5033,6 +5058,11 @@ function ProvidersSection({ s, busy, apply }: SectionProps) {
             onClearDraftModels={() => updateModelDraftSelection(group.id, () => [])}
             onCancelDraftModels={() => setGroupModelDraft(group.id, null)}
             onSaveDraftModels={() => void saveModelDraft(group)}
+            onToggleWebSearch={(enabled) => {
+              const provider = group.providers[0];
+              if (!provider) return;
+              void apply(() => app.SaveProvider({ ...provider, webSearch: enabled }));
+            }}
             onSaveEditorKey={(env, value) => group.builtIn ? saveProviderKey(group, env, value) : saveKeyEnvAndAutoRefresh(group, env, value)}
             onClearEditorKey={clearProviderKey}
             onDelete={(p) => apply(() => app.RemoveProviderAccess(p.name)).then(() => {
@@ -5075,6 +5105,7 @@ type ProviderModelDraft = {
   candidates: string[];
   selected: string[];
   visionModels: string[];
+  visionCapability: ProviderVisionCapability;
 };
 
 type AddProviderMode = null | "official" | "custom";
@@ -5444,6 +5475,7 @@ function ProviderAccessCard({
   onClearDraftModels,
   onCancelDraftModels,
   onSaveDraftModels,
+  onToggleWebSearch,
   onSaveEditorKey,
   onClearEditorKey,
   onDelete,
@@ -5466,6 +5498,7 @@ function ProviderAccessCard({
   onClearDraftModels: () => void;
   onCancelDraftModels: () => void;
   onSaveDraftModels: () => void;
+  onToggleWebSearch: (enabled: boolean) => void;
   onSaveEditorKey: (apiKeyEnv: string, value: string) => Promise<void>;
   onClearEditorKey?: (apiKeyEnv: string) => Promise<void>;
   onDelete?: (p: ProviderView) => Promise<void>;
@@ -5576,6 +5609,17 @@ function ProviderAccessCard({
         />
       )}
 
+      {editableProvider && (
+        <ProviderServiceCapabilities
+          kind={editableProvider.kind}
+          baseUrl={editableProvider.baseUrl}
+          models={editableProvider.models}
+          enabled={Boolean(editableProvider.webSearch)}
+          disabled={busy}
+          onChange={onToggleWebSearch}
+        />
+      )}
+
       {group.providers.length > 1 && (
         <div className="provider-profiles">
           {group.providers.map((p) => {
@@ -5679,7 +5723,7 @@ function ProviderModelDraftPicker({
         {deferredCandidates.length > 0 ? deferredCandidates.map((model) => {
           const enabled = selected.has(model);
           return (
-            <div className="provider-model-draft__option" key={model} style={{ contentVisibility: "auto", containIntrinsicSize: "auto 48px" }}>
+            <div className="provider-model-draft__option" key={model} role="listitem" style={{ contentVisibility: "auto", containIntrinsicSize: "auto 48px" }}>
               <label className="provider-model-draft__model">
                 <input
                   type="checkbox"
@@ -5689,15 +5733,23 @@ function ProviderModelDraftPicker({
                 />
                 <span>{model}</span>
               </label>
-              <label className="provider-model-draft__vision">
-                <input
-                  type="checkbox"
-                  checked={enabled && vision.has(model)}
-                  disabled={disabled || !enabled}
-                  onChange={() => onToggleVision(model)}
-                />
-                <span>{t("settings.visionModel")}</span>
-              </label>
+              {draft.visionCapability === "configurable" ? (
+                <label className="provider-model-draft__vision">
+                  <input
+                    type="checkbox"
+                    checked={enabled && vision.has(model)}
+                    disabled={disabled || !enabled}
+                    aria-label={t("settings.visionModelAria", { model })}
+                    onChange={() => onToggleVision(model)}
+                  />
+                  <span>{t("settings.visionModel")}</span>
+                </label>
+              ) : (
+                <div className="provider-model-draft__capabilities" aria-label={t("settings.modelCapabilitiesAria", { model })}>
+                  <span>{t("settings.textInput")}</span>
+                  <span>{t("settings.imageInputUnsupported")}</span>
+                </div>
+              )}
             </div>
           );
         }) : (
@@ -5713,6 +5765,61 @@ function ProviderModelDraftPicker({
         </button>
       </div>
     </div>
+  );
+}
+
+function ProviderServiceCapabilities({
+  kind,
+  baseUrl,
+  models,
+  enabled,
+  disabled,
+  onChange,
+}: {
+  kind: string;
+  baseUrl: string;
+  models: string[];
+  enabled: boolean;
+  disabled: boolean;
+  onChange: (enabled: boolean) => void;
+}) {
+  const t = useT();
+  const capabilityID = useId();
+  const costID = `${capabilityID}-cost`;
+  if (!providerSupportsServerWebSearch(kind, baseUrl)) return null;
+  const normalizedKind = kind.trim().toLowerCase();
+  return (
+    <section className="provider-capabilities" aria-labelledby={capabilityID}>
+      <div className="provider-card-block__label" id={capabilityID}>
+        {t("settings.providerCapabilities")}
+      </div>
+      <label className="provider-capability-row">
+        <span className="provider-capability-row__copy">
+          <span className="provider-capability-row__title">
+            {t("settings.serverWebSearch")}
+            <span className="badge badge--project">{t("settings.recommended")}</span>
+          </span>
+          <span>{t("settings.serverWebSearchHint")}</span>
+        </span>
+        <input
+          className="provider-capability-row__switch"
+          type="checkbox"
+          role="switch"
+          checked={enabled}
+          disabled={disabled}
+          aria-describedby={costID}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+      </label>
+      <div className="provider-capability-row__cost" id={costID}>
+        {t("settings.serverWebSearchCostHint")}
+      </div>
+      <div className="provider-capability-badges" aria-label={t("settings.providerCompatibility")}>
+        <span>{normalizedKind === "responses" ? t("settings.responsesStateless") : t("settings.anthropicCompatible")}</span>
+        <span>{t("settings.imageInputUnsupported")}</span>
+        {models.length > 0 && <span>{t("settings.serverWebSearchApplies", { models: models.join(", ") })}</span>}
+      </div>
+    </section>
   );
 }
 
@@ -5757,6 +5864,50 @@ function providerBaseHost(baseUrl: string): string {
     return new URL(baseUrl).hostname.toLowerCase();
   } catch {
     return "";
+  }
+}
+
+type ProviderVisionCapability = "configurable" | "unsupported";
+
+function isDeepSeekOfficialEndpoint(baseUrl: string): boolean {
+  return providerBaseHost(baseUrl) === "api.deepseek.com";
+}
+
+export function providerSupportsServerWebSearch(kind: string, baseUrl: string): boolean {
+  try {
+    const endpoint = new URL(baseUrl.trim());
+    if (
+      endpoint.protocol !== "https:" ||
+      endpoint.hostname.toLowerCase() !== "api.deepseek.com" ||
+      endpoint.port ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.search ||
+      endpoint.hash
+    ) return false;
+    const path = endpoint.pathname.replace(/\/+$/, "");
+    switch (kind.trim().toLowerCase()) {
+      case "responses":
+        return path === "";
+      case "anthropic":
+        return path === "/anthropic";
+      default:
+        return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
+function providerVisionCapability(kind: string, baseUrl: string): ProviderVisionCapability {
+  if (!isDeepSeekOfficialEndpoint(baseUrl)) return "configurable";
+  switch (kind.trim().toLowerCase()) {
+    case "openai":
+    case "responses":
+    case "anthropic":
+      return "unsupported";
+    default:
+      return "configurable";
   }
 }
 
@@ -5851,6 +6002,7 @@ export const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker
   candidates,
   selectedModels,
   visionModels,
+  visionCapability = "configurable",
   contextWindows,
   disabled,
   onToggleModel,
@@ -5862,6 +6014,7 @@ export const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker
   candidates: string[];
   selectedModels: string[];
   visionModels: string[];
+  visionCapability?: ProviderVisionCapability;
   contextWindows: Record<string, string>;
   disabled: boolean;
   onToggleModel: (model: string) => void;
@@ -5915,7 +6068,7 @@ export const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker
         {deferredCandidates.length > 0 ? deferredCandidates.map((model) => {
           const enabled = selected.has(model);
           return (
-            <div className="provider-model-draft__option" key={model} style={{ contentVisibility: "auto", containIntrinsicSize: "auto 48px" }}>
+            <div className="provider-model-draft__option" key={model} role="listitem" style={{ contentVisibility: "auto", containIntrinsicSize: "auto 48px" }}>
               <label className="provider-model-draft__model">
                 <input
                   type="checkbox"
@@ -5925,15 +6078,23 @@ export const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker
                 />
                 <span>{model}</span>
               </label>
-              <label className="provider-model-draft__vision">
-                <input
-                  type="checkbox"
-                  checked={enabled && vision.has(model)}
-                  disabled={disabled || !enabled}
-                  onChange={() => onToggleVision(model)}
-                />
-                <span>{t("settings.visionModel")}</span>
-              </label>
+              {visionCapability === "configurable" ? (
+                <label className="provider-model-draft__vision">
+                  <input
+                    type="checkbox"
+                    checked={enabled && vision.has(model)}
+                    disabled={disabled || !enabled}
+                    aria-label={t("settings.visionModelAria", { model })}
+                    onChange={() => onToggleVision(model)}
+                  />
+                  <span>{t("settings.visionModel")}</span>
+                </label>
+              ) : (
+                <div className="provider-model-draft__capabilities" aria-label={t("settings.modelCapabilitiesAria", { model })}>
+                  <span>{t("settings.textInput")}</span>
+                  <span>{t("settings.imageInputUnsupported")}</span>
+                </div>
+              )}
               <div className="provider-model-draft__context-field">
                 <label className="provider-model-draft__context">
                   <span>{t("settings.modelContextWindow")}</span>
@@ -6010,6 +6171,7 @@ export function ProviderEditor({
   );
   const [reasoningProtocol, setReasoningProtocol] = useState(normalizeReasoningProtocol(initial?.reasoningProtocol));
   const [thinking, setThinking] = useState(normalizeThinkingMode(initial?.thinking));
+  const [webSearch, setWebSearch] = useState(Boolean(initial?.webSearch));
   const [supportedEfforts] = useState<string[]>(initial?.supportedEfforts ?? []);
   const [defaultEffort] = useState(initial?.defaultEffort ?? "");
   const [fetchingModels, setFetchingModels] = useState(false);
@@ -6026,6 +6188,7 @@ export function ProviderEditor({
   const effectiveBaseUrl = fullChatUrl ? providerBaseURLFromChatURL(chatUrl) : baseUrl.trim();
   const effectiveChatUrl = fullChatUrl ? trimmedURL(chatUrl) : "";
   const effectiveModelsUrl = modelsUrl.trim();
+  const effectiveVisionCapability = providerVisionCapability(effectiveKind, effectiveBaseUrl);
   const effectiveHeaders = parseProviderHeaders(headersDraft);
   const extraBodyParse = useMemo(() => {
     try {
@@ -6096,6 +6259,7 @@ export function ProviderEditor({
         contextWindow: Number(ctx) || 0,
         reasoningProtocol,
         thinking,
+        webSearch: providerSupportsServerWebSearch(effectiveKind, effectiveBaseUrl) && webSearch,
         supportedEfforts: cleanedSupportedEfforts,
         defaultEffort: cleanDefaultEffort,
         modelOverrides: mergeProviderModelContextWindows(initial?.modelOverrides, parseProviderListInput(models), modelContextWindows),
@@ -6125,7 +6289,9 @@ export function ProviderEditor({
     setFetchStatus(null);
     setFetchFallback(null);
     const ms = parseProviderListInput(models);
-    const vms = parseProviderListInput(visionModels).filter((model) => ms.includes(model));
+    const vms = effectiveVisionCapability === "unsupported"
+      ? []
+      : parseProviderListInput(visionModels).filter((model) => ms.includes(model));
     const effectiveApiKeyEnv = providerApiKeyEnvForSave(name, apiKeyEnv, keyDraft);
     const provider: ProviderView = {
       name: name.trim(),
@@ -6148,6 +6314,7 @@ export function ProviderEditor({
       contextWindow: Number(ctx) || 0,
       reasoningProtocol,
       thinking,
+      webSearch: providerSupportsServerWebSearch(effectiveKind, effectiveBaseUrl) && webSearch,
       supportedEfforts: cleanedSupportedEfforts,
       // Clear the stored default if no levels are selected; the backend's
       // NormalizeEffort would otherwise silently ignore an unsupported value.
@@ -6443,6 +6610,7 @@ export function ProviderEditor({
         candidates={modelCandidateNames}
         selectedModels={modelNames}
         visionModels={visionModelNames}
+        visionCapability={effectiveVisionCapability}
         contextWindows={modelContextWindows}
         disabled={busy || fetchingModels}
         onToggleModel={toggleEditorModel}
@@ -6450,6 +6618,14 @@ export function ProviderEditor({
         onContextWindowChange={updateEditorModelContextWindow}
         onSelectAll={selectAllEditorModels}
         onClear={clearEditorModels}
+      />
+      <ProviderServiceCapabilities
+        kind={effectiveKind}
+        baseUrl={effectiveBaseUrl}
+        models={modelNames}
+        enabled={webSearch}
+        disabled={busy || fetchingModels}
+        onChange={setWebSearch}
       />
       {advancedFields}
       <div className="prov-card__actions">
@@ -7005,6 +7181,7 @@ const mb = (n: number) => (n / MB).toFixed(1);
 // action with inline progress and errors.
 function UpdatesSection({
   configPath,
+  shadowedByPath,
   checkUpdates,
   telemetry,
   metrics,
@@ -7012,6 +7189,7 @@ function UpdatesSection({
   applySettings,
 }: {
   configPath: string;
+  shadowedByPath?: string;
   checkUpdates: boolean;
   telemetry: boolean;
   metrics: boolean;
@@ -7019,7 +7197,7 @@ function UpdatesSection({
   applySettings: (fn: () => Promise<void>) => Promise<boolean>;
 }) {
   const t = useT();
-  const { status, check, apply: applyUpdate, openDownload } = useUpdater();
+  const { status, check, apply: applyUpdate, openDownload, abandonPending } = useUpdater();
   const [version, setVersion] = useState("");
   useEffect(() => {
     app.Version().then(setVersion).catch(() => {});
@@ -7162,6 +7340,16 @@ function UpdatesSection({
             )}
           </div>
           <span className="banner__spacer" />
+          {status.disposition === "recovery" && (
+            <button
+              className="btn btn--small"
+              type="button"
+              disabled={settingsBusy || updaterBusy}
+              onClick={() => void abandonPending()}
+            >
+              {t("updater.discardPrevious")}
+            </button>
+          )}
           {downloadIsPrimary && (
             <button className="btn btn--primary btn--small" type="button" onClick={openDownload}>
               {t("updater.officialDownload")}
@@ -7264,6 +7452,11 @@ function UpdatesSection({
           {configPath && (
             <Tooltip label={configPath} fill block className="mem-hint settings-config-path">
               {t("settings.config", { path: configPath })}
+            </Tooltip>
+          )}
+          {shadowedByPath && (
+            <Tooltip label={shadowedByPath} fill block className="mem-hint settings-config-path settings-config-path--shadowed">
+              {t("settings.configShadowed", { path: shadowedByPath })}
             </Tooltip>
           )}
         </div>

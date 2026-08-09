@@ -54,8 +54,17 @@ ok(
   "onboarding opens the model access flow instead of model usage",
 );
 ok(
-  /initialFocus\?\.target === "model-access" \? "access" : "usage"/.test(settingsSource),
-  "model settings honor the onboarding access target while preserving usage as the default",
+  /initialFocus\?\.target === "model-access"[\s\S]*?initialFocus\?\.target === "model-stats"[\s\S]*?"usage"/.test(settingsSource),
+  "model settings honor access and statistics focus targets while preserving usage as the default",
+);
+ok(
+  !settingsSource.includes("modelFocusHandledRef"),
+  "each fresh model focus object can re-target the same subtab again",
+);
+ok(
+  /setSettingsFocus\(\(current\) => \(\{[\s\S]*?target: "model-stats",[\s\S]*?requestId: \(current\?\.requestId \?\? 0\) \+ 1,[\s\S]*?\}\)\)/.test(appSource) &&
+    /initialFocus\?\.requestId/.test(settingsSource),
+  "usage statistics commands derive a monotonic request id from the shared focus state",
 );
 ok(
   /case "deepseek-responses":\s*return t\("settings\.addProvider\.preset\.deepseekResponsesDesc"\)/.test(settingsSource),
@@ -90,6 +99,21 @@ ok(
     source.includes('"settings.reasoningProtocol.glm"'),
   ),
   "GLM reasoning protocol is localized in every supported locale",
+);
+ok(
+  settingsSource.includes('settings.reasoningSummary') &&
+    settingsSource.includes('settings.reasoningSummary.on') &&
+    settingsSource.includes('setReasoningSummaryEnabled(enabled)'),
+  "General settings exposes live reasoning-summary options",
+);
+ok(
+  [enLocaleSource, zhLocaleSource, zhTWLocaleSource].every((source) =>
+    source.includes('"settings.reasoningSummary"') &&
+    source.includes('"settings.reasoningSummaryHint"') &&
+    source.includes('"settings.reasoningSummary.on"') &&
+    source.includes('"settings.reasoningSummary.off"'),
+  ),
+  "reasoning-summary switch labels are localized in every supported locale",
 );
 ok(
   /mockPreset\("deepseek-anthropic",\s*"DeepSeek Anthropic"/.test(bridgeSource),
