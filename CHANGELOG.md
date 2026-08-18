@@ -6,10 +6,59 @@ branch.
 
 ## Unreleased
 
+### Changed
+
+- **Fact-driven execution:** Ordinary requests always enter the executor.
+  There is no automatic simple / light / full task mode and no per-turn
+  `TaskPolicy` classification. The planner runs only for an explicit Plan,
+  an approval boundary, or Goal start. The host builds verification
+  obligations from concrete tool effects and receipts. Plan, Goal,
+  permission, and sandbox stay independent. Tool schemas and the executor
+  system prefix stay byte-stable. Historical `<execution-policy>` tags remain
+  readable on old sessions and are stripped from new provider context.
+  Old `--preset`/`--profile` compatibility no-ops are unchanged.
+
 ### Fixed
 
+- **v1.24.2 session snapshot & recovery root fix:** Keep PR #7982's WAL/CAS/lease
+  safety foundation, but replace process-level "I hold a lease" ownership with a
+  generation-bound `SessionWriteAuthority`. Same-revision tool-preview/load
+  reshapes no longer false-diverge; recovery files are bounded to one path per
+  writer/lineage; empty checkpoints heal from their own WAL; projection lineage
+  rebinds across upgrade/model switch and inherits across recovery forks without
+  changing provider-visible prompt bytes. Catalog upgrades to disposable
+  `session-catalog/v3.sqlite` with recovery lineage roles
+  (`normal|covered_copy|adopted|diverged`); covered idle copies move to the
+  recoverable `.trash` using a 15-minute idle threshold applied on two early
+  sweeps (at startup and ~20 minutes later), then a 24-hour threshold on the
+  6-hour background ticker; independent diverged branches stay and are listed
+  for user choice. v1/v2 catalogs are
+  left byte-unchanged for coexistence/downgrade.
+  **v1.24.1** only hid/reclaimed already-created covered copies and fixed Windows
+  flash-window startup; **v1.24.2** stops the misclassification source and repairs
+  existing user directories without rewriting authoritative JSONL/WAL/sidecar data.
+
+- Goal now runs continuously by default: the former 16-round per-Run boundary,
+  10/20/40 cross-Run quotas, default wall-clock budget, and numeric
+  no-progress/Todo-stall pauses no longer stop valid work. Progress guards still
+  detect repeated host outcomes and zero-evidence work, but redirect the model
+  to re-plan instead of producing `goal_run_budget` or `goal_stuck`. Explicit
+  `[agent].goal_token_budget`, `--max-steps`, positive time/cost budgets, manual
+  pause/stop, genuine user/external blockers, and evaluator fail-closed behavior
+  remain available. The Goal token budget defaults to `0` (off); resuming its
+  `budget_spend` pause grants a fresh slice without clearing cumulative usage.
+  Goal status reports turns, provider requests, tokens, the optional configured
+  token threshold, and cumulative active work time. Bot `max_steps` also
+  defaults to `0` (continuous), while positive user configuration is enforced.
+
+- Removed numeric Goal pauses in existing sidecars automatically normalize to
+  `running` without sending a model request. Active Goal sidecars write
+  `turnsLimit: -1` as a downgrade-safe unlimited sentinel while public runtime
+  APIs retain deprecated limit fields as `0`. The migration preserves unknown
+  fields, todos, checkpoints, usage, evidence, and historical metadata.
+
 - Goal is now the sole long-task runtime. Historical AutoResearch sidecars
-  migrate transactionally into research-budget Goals. Invalid archives block
+  migrate transactionally into Goals with research compatibility metadata. Invalid archives block
   fail closed and remain read-only, retaining the task id and compatibility mode
   for a restart or `/goal resume` retry; successful Goal-only sidecars omit the
   old task id and write an explicit downgrade fence so previous readers cannot

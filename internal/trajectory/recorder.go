@@ -27,9 +27,11 @@ type Record struct {
 	TS                  int64                `json:"ts"`
 	Event               *eventwire.Event     `json:"event,omitempty"`
 	ReadinessAudit      *ReadinessAudit      `json:"readiness_audit,omitempty"`
+	AnchorSafetyAudit   *AnchorSafetyAudit   `json:"anchor_safety_audit,omitempty"`
 	ProtocolRecovery    string               `json:"protocol_recovery,omitempty"`
 	TurnCompletion      bool                 `json:"turn_completion,omitempty"`
 	ContractShadow      *ContractShadowAudit `json:"contract_shadow,omitempty"`
+	CompletionReport    *CompletionReport    `json:"completion_report,omitempty"`
 	OutcomeProgress     *OutcomeProgress     `json:"outcome_progress,omitempty"`
 	DelegationAdmission *DelegationAdmission `json:"delegation_admission,omitempty"`
 	MemoryRecall        *MemoryRecall        `json:"memory_recall,omitempty"`
@@ -41,6 +43,18 @@ type MemoryRecall struct {
 	UsedChars  int               `json:"used_chars,omitempty"`
 	Omitted    int               `json:"omitted,omitempty"`
 	Suppressed string            `json:"suppressed,omitempty"`
+	ShadowHits []MemoryRecallHit `json:"shadow_hits,omitempty"`
+}
+
+type AnchorSafetyAudit struct {
+	Mode                  string `json:"mode"`
+	TaskMode              string `json:"task_mode"`
+	RangeLines            int    `json:"range_lines"`
+	ObservationAge        int    `json:"observation_age"`
+	LegacyAllowed         bool   `json:"legacy_allowed"`
+	ShadowAllowed         bool   `json:"shadow_allowed"`
+	Reason                string `json:"reason"`
+	SameBatchReadRejected bool   `json:"same_batch_read_rejected,omitempty"`
 }
 
 // MemoryRecallHit is one recalled fact's content-free fingerprint.
@@ -78,6 +92,12 @@ type OutcomeProgress struct {
 	LocalExecSeen    bool `json:"local_exec_seen,omitempty"`
 	GovernorEligible bool `json:"governor_eligible,omitempty"`
 	GovernorEngaged  bool `json:"governor_engaged,omitempty"`
+	// Runway is a pointer so old records (nil: not observed) stay distinct from
+	// a new record whose counterfactual account genuinely reached zero.
+	Runway      *int `json:"runway,omitempty"`
+	RunwayDry   int  `json:"runway_dry,omitempty"`
+	RunwayIdle  int  `json:"runway_idle,omitempty"`
+	RunwaySpent bool `json:"runway_spent,omitempty"`
 }
 
 // ContractShadowAudit mirrors event.ContractShadowAudit with stable keys.
@@ -91,6 +111,23 @@ type ContractShadowAudit struct {
 	Verdict               string `json:"verdict"`
 	Complete              bool   `json:"complete,omitempty"`
 	ReadyToFinalize       bool   `json:"ready_to_finalize,omitempty"`
+}
+
+// CompletionReport mirrors event.CompletionReportAudit with stable keys.
+type CompletionReport struct {
+	Verdict             string   `json:"verdict"`
+	Risk                string   `json:"risk,omitempty"`
+	Criteria            int      `json:"criteria,omitempty"`
+	CriteriaSatisfied   int      `json:"criteria_satisfied,omitempty"`
+	Changes             int      `json:"changes,omitempty"`
+	ChangesUnreviewed   int      `json:"changes_unreviewed,omitempty"`
+	Verifications       int      `json:"verifications,omitempty"`
+	VerificationsFailed int      `json:"verifications_failed,omitempty"`
+	VerificationsStale  int      `json:"verifications_stale,omitempty"`
+	Gaps                int      `json:"gaps,omitempty"`
+	GapKinds            []string `json:"gap_kinds,omitempty"`
+	ClaimsVerified      int      `json:"claims_verified,omitempty"`
+	ClaimsUnbacked      int      `json:"claims_unbacked,omitempty"`
 }
 
 // ReadinessAudit mirrors evidence.ReadinessAudit with stable snake_case keys.
@@ -125,6 +162,8 @@ type Recorder struct {
 	err    error
 	closed bool
 }
+
+var _ event.OptionalSinkCapabilities = (*Recorder)(nil)
 
 // New opens (or truncates) path and returns a Recorder forwarding to inner.
 // A nil clock means time.Now.
@@ -166,6 +205,12 @@ func (r *Recorder) Emit(e event.Event) {
 	r.inner.Emit(e)
 }
 
+// RecordDelegationAudit forwards without persisting: delegation receipts are
+// aggregated by run metrics, and the trajectory schema stays unchanged.
+func (r *Recorder) RecordDelegationAudit(a evidence.DelegationAudit) {
+	event.RecordDelegationAudit(r.inner, a)
+}
+
 func (r *Recorder) RecordReadinessAudit(a evidence.ReadinessAudit) {
 	r.append(Record{ReadinessAudit: &ReadinessAudit{
 		Result:                    string(a.Result),
@@ -184,6 +229,16 @@ func (r *Recorder) RecordReadinessAudit(a evidence.ReadinessAudit) {
 	event.RecordReadinessAudit(r.inner, a)
 }
 
+func (r *Recorder) RecordAnchorSafetyAudit(a event.AnchorSafetyAudit) {
+	r.append(Record{AnchorSafetyAudit: &AnchorSafetyAudit{
+		Mode: a.Mode, TaskMode: a.TaskMode, RangeLines: a.RangeLines,
+		ObservationAge: a.ObservationAge, LegacyAllowed: a.LegacyAllowed,
+		ShadowAllowed: a.ShadowAllowed, Reason: a.Reason,
+		SameBatchReadRejected: a.SameBatchReadRejected,
+	}})
+	event.RecordAnchorSafetyAudit(r.inner, a)
+}
+
 func (r *Recorder) RecordContractShadow(a event.ContractShadowAudit) {
 	r.append(Record{ContractShadow: &ContractShadowAudit{
 		Intent:                a.Intent,
@@ -199,7 +254,27 @@ func (r *Recorder) RecordContractShadow(a event.ContractShadowAudit) {
 	event.RecordContractShadow(r.inner, a)
 }
 
+func (r *Recorder) RecordCompletionReport(a event.CompletionReportAudit) {
+	r.append(Record{CompletionReport: &CompletionReport{
+		Verdict:             a.Verdict,
+		Risk:                a.Risk,
+		Criteria:            a.Criteria,
+		CriteriaSatisfied:   a.CriteriaSatisfied,
+		Changes:             a.Changes,
+		ChangesUnreviewed:   a.ChangesUnreviewed,
+		Verifications:       a.Verifications,
+		VerificationsFailed: a.VerificationsFailed,
+		VerificationsStale:  a.VerificationsStale,
+		Gaps:                a.Gaps,
+		GapKinds:            a.GapKinds,
+		ClaimsVerified:      a.ClaimsVerified,
+		ClaimsUnbacked:      a.ClaimsUnbacked,
+	}})
+	event.RecordCompletionReport(r.inner, a)
+}
+
 func (r *Recorder) RecordOutcomeProgress(sample evidence.OutcomeSample) {
+	runway := sample.Runway
 	r.append(Record{OutcomeProgress: &OutcomeProgress{
 		Round:            sample.Round,
 		Exploration:      sample.Exploration,
@@ -216,6 +291,10 @@ func (r *Recorder) RecordOutcomeProgress(sample evidence.OutcomeSample) {
 		LocalExecSeen:    sample.LocalExecSeen,
 		GovernorEligible: sample.GovernorEligible,
 		GovernorEngaged:  sample.GovernorEngaged,
+		Runway:           &runway,
+		RunwayDry:        sample.RunwayDry,
+		RunwayIdle:       sample.RunwayIdle,
+		RunwaySpent:      sample.RunwaySpent,
 	}})
 	event.RecordOutcomeProgress(r.inner, sample)
 }
@@ -227,6 +306,9 @@ func (r *Recorder) RecordMemoryRecall(a event.MemoryRecallAudit) {
 			ID: hit.ID, Revision: hit.Revision, Scope: hit.Scope,
 			Type: hit.Type, Freshness: hit.Freshness, Score: hit.Score,
 		})
+	}
+	for _, hit := range a.Shadow {
+		rec.ShadowHits = append(rec.ShadowHits, MemoryRecallHit{ID: hit.ID, Score: hit.Score})
 	}
 	r.append(Record{MemoryRecall: rec})
 	event.RecordMemoryRecall(r.inner, a)
@@ -247,6 +329,14 @@ func (r *Recorder) RecordProtocolRecovery(a event.ProtocolRecoveryAudit) {
 func (r *Recorder) RecordTurnCompletion() {
 	r.append(Record{TurnCompletion: true})
 	event.RecordTurnCompletion(r.inner)
+}
+
+func (r *Recorder) RecordWorkspaceMutation(m event.WorkspaceMutation) {
+	event.RecordWorkspaceMutation(r.inner, m)
+}
+
+func (r *Recorder) RecordRunBudget(sample event.RunBudgetSample) {
+	event.RecordRunBudget(r.inner, sample)
 }
 
 // Close flushes and closes the file, returning the first error seen. Events

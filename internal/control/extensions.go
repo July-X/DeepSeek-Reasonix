@@ -8,8 +8,10 @@ import (
 
 	"reasonix/internal/event"
 	"reasonix/internal/eventwire"
+	"reasonix/internal/evidence"
 	"reasonix/internal/extension"
 	"reasonix/internal/extension/dispatch"
+	"reasonix/internal/sessioninbox"
 )
 
 // Extension dispatch wiring (stage 6b1). Nil dispatcher is a no-op.
@@ -116,6 +118,8 @@ type frontendEventSink struct {
 	warned map[string]bool
 }
 
+var _ event.OptionalSinkCapabilities = (*frontendEventSink)(nil)
+
 func newFrontendEventSink(inner event.Sink, d *dispatch.Dispatcher) *frontendEventSink {
 	return &frontendEventSink{inner: inner, d: d, warned: map[string]bool{}}
 }
@@ -166,6 +170,13 @@ func (s *frontendEventSink) Emit(ev event.Event) {
 	s.inner.Emit(ev)
 }
 
+func (s *frontendEventSink) InboxChanged(snap sessioninbox.InboxSnapshot) {
+	if s == nil {
+		return
+	}
+	notifyInboxChanged(s.inner, snap)
+}
+
 // warnOnce logs msg at most once per key for the life of the sink. Warnings
 // stay on the log: routing them back through the sink would re-enter the
 // strategy path they describe.
@@ -192,4 +203,56 @@ func extensionFailurePlugin(err error) string {
 		return violationErr.Plugin
 	}
 	return "unknown"
+}
+
+// The audit capabilities pass through untouched: extension rulings apply to
+// user-facing events, never to the content-free telemetry channels — without
+// these, enabling extensions severed every audit from the recorder.
+
+func (s *frontendEventSink) RecordReadinessAudit(a evidence.ReadinessAudit) {
+	event.RecordReadinessAudit(s.inner, a)
+}
+
+func (s *frontendEventSink) RecordAnchorSafetyAudit(a event.AnchorSafetyAudit) {
+	event.RecordAnchorSafetyAudit(s.inner, a)
+}
+
+func (s *frontendEventSink) RecordContractShadow(a event.ContractShadowAudit) {
+	event.RecordContractShadow(s.inner, a)
+}
+
+func (s *frontendEventSink) RecordDelegationAudit(a evidence.DelegationAudit) {
+	event.RecordDelegationAudit(s.inner, a)
+}
+
+func (s *frontendEventSink) RecordCompletionReport(a event.CompletionReportAudit) {
+	event.RecordCompletionReport(s.inner, a)
+}
+
+func (s *frontendEventSink) RecordOutcomeProgress(sample evidence.OutcomeSample) {
+	event.RecordOutcomeProgress(s.inner, sample)
+}
+
+func (s *frontendEventSink) RecordDelegationAdmission(a event.DelegationAdmissionAudit) {
+	event.RecordDelegationAdmission(s.inner, a)
+}
+
+func (s *frontendEventSink) RecordMemoryRecall(a event.MemoryRecallAudit) {
+	event.RecordMemoryRecall(s.inner, a)
+}
+
+func (s *frontendEventSink) RecordProtocolRecovery(a event.ProtocolRecoveryAudit) {
+	event.RecordProtocolRecovery(s.inner, a)
+}
+
+func (s *frontendEventSink) RecordTurnCompletion() {
+	event.RecordTurnCompletion(s.inner)
+}
+
+func (s *frontendEventSink) RecordWorkspaceMutation(m event.WorkspaceMutation) {
+	event.RecordWorkspaceMutation(s.inner, m)
+}
+
+func (s *frontendEventSink) RecordRunBudget(sample event.RunBudgetSample) {
+	event.RecordRunBudget(s.inner, sample)
 }

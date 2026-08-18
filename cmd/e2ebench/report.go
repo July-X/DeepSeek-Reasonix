@@ -9,12 +9,8 @@ import (
 )
 
 func render(results []result) string {
-	profile := benchmarkProfileBaseline
 	arm := "full"
 	if len(results) > 0 {
-		if results[0].Profile != "" {
-			profile = results[0].Profile
-		}
 		if results[0].Arm != "" {
 			arm = results[0].Arm
 		}
@@ -23,7 +19,7 @@ func render(results []result) string {
 	if len(results) > 0 && results[0].CacheArm != "" && results[0].CacheArm != benchmarkCacheCold {
 		cache = " · " + results[0].CacheArm + "-cache"
 	}
-	return fmt.Sprintf("## 🤖 Reasonix e2e benchmark (%s · arm `%s`%s)\n\n", profile, arm, cache) + renderBody(results)
+	return fmt.Sprintf("## 🤖 Reasonix e2e benchmark (arm `%s`%s)\n\n", arm, cache) + renderBody(results)
 }
 
 // suiteStats aggregates result entries; ran/pass1 count tasks (first
@@ -44,7 +40,10 @@ type suiteStats struct {
 func gatherSuiteStats(results []result) suiteStats {
 	s := suiteStats{maxAttempt: 1, classes: map[string]int{}, prefixChangeReasons: map[string]int{}, bySource: map[string]sourceUsage{}}
 	for _, r := range results {
-		if r.Skipped {
+		// No-solution tasks are graded on honesty, not correctness; leaving
+		// them out here keeps every accuracy and cost-per-solved denominator
+		// meaningful. renderCompletionIntegrity reports them, spend included.
+		if r.Skipped || r.NoSolution {
 			continue
 		}
 		// ran counts tasks, not attempts: retries add entries, first attempts
@@ -189,13 +188,20 @@ func renderBody(results []result) string {
 		comma(s.tools), comma(s.toolFails), s.compacts, currencySym(s.currency), s.cost)
 	b.WriteString(perSolvedLine(s))
 	b.WriteString(requestsBySourceLine(s.bySource))
+	b.WriteString(renderMeterAccounting(results))
+	b.WriteString(renderFaultRecovery(results))
 	b.WriteString(renderTimeAttribution(results))
 	b.WriteString(renderSolveProfiles(results))
 	b.WriteString(renderToolSurface(results))
+	b.WriteString(renderAnchorSafety(results))
 	b.WriteString(renderContractShadow(results))
+	b.WriteString(renderCompletionReport(results))
+	b.WriteString(renderCompletionIntegrity(results))
 	b.WriteString(renderOutcomeProgress(results))
 	b.WriteString(renderMemoryShadow(results))
 	b.WriteString(renderCognition(results))
+	b.WriteString(renderAnchor(results))
+	b.WriteString(renderDelegation(results))
 	b.WriteString(renderDelegationAdmission(results))
 	b.WriteString(renderMechanismLedger(results))
 	if s.unaccounted > 0 {

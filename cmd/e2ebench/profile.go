@@ -1,41 +1,31 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+
+	"reasonix/internal/ablation"
 )
 
-const (
-	benchmarkProfileBaseline = "baseline"
-	benchmarkProfileEconomy  = "economy"
-	benchmarkProfileBalanced = "balanced"
-	benchmarkProfileDelivery = "delivery"
-)
-
-// normalizeBenchmarkProfile validates the tool-surface arm. baseline stays
-// distinct from balanced: it passes no --profile flag at all, preserving the
-// byte-identical control command line older comparisons were recorded with.
-func normalizeBenchmarkProfile(profile string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(profile)) {
-	case "", benchmarkProfileBaseline:
-		return benchmarkProfileBaseline, nil
-	case benchmarkProfileEconomy:
-		return benchmarkProfileEconomy, nil
-	case benchmarkProfileBalanced:
-		return benchmarkProfileBalanced, nil
-	case benchmarkProfileDelivery:
-		return benchmarkProfileDelivery, nil
-	default:
-		return "", fmt.Errorf("unknown benchmark profile %q (want baseline, economy, balanced, or delivery)", profile)
-	}
+// experimentAxes is the validated set of fixed axes one suite invocation runs
+// on. They are resolved together so a second bad flag is reported alongside
+// the first instead of being masked by an early exit.
+type experimentAxes struct {
+	cache, anchor string
+	arm           ablation.Set
 }
 
-func appendBenchmarkProfileArgs(args []string, profile string) []string {
-	if profile == benchmarkProfileBaseline {
-		return args
-	}
-	return append(args, "--profile", profile)
+func resolveExperimentAxes(ablate, cache, anchor string) (experimentAxes, error) {
+	a, aerr := ablation.Parse(ablate)
+	c, cerr := normalizeCacheArm(cache)
+	an, anerr := normalizeAnchorArm(anchor)
+	return experimentAxes{cache: c, anchor: an, arm: a}, errors.Join(aerr, cerr, anerr)
 }
+
+// benchmarkProfileStandard keeps the historical JSON field readable while the
+// harness itself has one execution contract. It is metadata, not an arm.
+const benchmarkProfileStandard = "standard"
 
 const (
 	benchmarkCacheCold = "cold"

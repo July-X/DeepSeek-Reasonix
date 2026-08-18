@@ -5,11 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"reasonix/internal/ablation"
@@ -18,23 +15,21 @@ import (
 )
 
 // Compaction is a low-frequency cache-reset point: the prompt grows append-only
-// (high cache hits) until a turn nears compactRatio of the window, then it is
-// compacted down to a tail budget. The budget is a fixed token count, not a
-// fraction of the window, so a huge window still compacts rarely while a small
-// one still lands below the trigger (which is what stops the re-compaction loop).
+// until compactRatio of the window is crossed, then pressure-time tool pruning
+// and up to two cache-aligned summary checkpoints restore headroom.
 const (
-	defaultSoftCompactRatio    = 0.5   // report growing context here, but keep the cache-stable prefix intact
-	defaultToolResultSnipRatio = 0.6   // rewrite stale tool results cheaply before summary compaction
-	defaultCompactRatio        = 0.8   // trigger: prompt at this fraction of the window compacts
-	defaultCompactForceRatio   = 0.9   // force compaction at this high-water mark even for low-value folds
-	defaultCompactTarget       = 0.5   // safety cap: the kept tail never exceeds this fraction of the window
-	defaultTailTokens          = 16384 // verbatim recent-tail budget, in tokens
-	minRecentKeep              = 2     // never keep fewer recent messages than this
-	minCompactMessages         = 2     // skip compaction below this many compactable messages
-	fallbackTokPerChar         = 0.25  // ~4 chars/token, used before any usage is available to calibrate
-	maxPinnedFirstUserTokens   = 1500  // ceiling on pinning the first user turn verbatim; larger first turns (pasted content) stay foldable
-	pinnedFirstUserWindowFrac  = 0.15  // and never pin a first turn worth more than this fraction of the window
-	maxKeepSmallUserTurns      = 20    // position-fixed keep window for small user turns in the fold region; the first N survive verbatim, older ones fold (prefix byte-stable, never "latest N")
+	defaultCompactRatio    = 0.80 // sole automatic maintenance trigger (new configs)
+	recentTailBudgetRatio  = 0.16 // recent verbatim tail as a fraction of the window
+	summaryOutputMaxTokens = 8192 // max digest output; further clipped by remaining candidate space
+	minRecentKeep          = 2    // never keep fewer recent messages than this
+	minCompactMessages     = 2    // skip compaction below this many compactable messages
+	fallbackTokPerChar     = 0.25 // ~4 chars/token, used before any usage is available to calibrate
+	protocolReserveTokens  = 256  // provider framing and control fields not represented by message estimates
+)
+
+var (
+	errSummaryOutputTruncated = errors.New("summarizer output truncated")
+	errCheckpointRejected     = errors.New("checkpoint candidate rejected")
 )
 
 // summaryTag wraps the compaction summary so the model can distinguish it from
@@ -44,18 +39,10 @@ const (
 	summaryTagClose = "</compaction-summary>"
 )
 
-// summaryTimeout bounds one summarizer call so a stalled stream surfaces a clear
-// failure (then a mechanical fold) instead of hanging compaction indefinitely.
-const summaryTimeout = 90 * time.Second
-
-// summarySystemPrompt steers the executor to distill older history into a
-// structured briefing it can keep relying on after the originals are dropped.
-// The section layout mirrors what a coding agent actually needs to resume work
-// mid-task: the goal verbatim, the concrete state of the code, and an explicit
-// next step — so the post-compaction turn doesn't lose the thread or re-derive
-// decisions already made.
-const summarySystemPrompt = `You are compacting the earlier part of a coding agent's conversation to save context.
-The agent keeps your summary alongside the user's own turns (kept verbatim) and the recent tail; your job is to fold the assistant/tool work into a briefing it can resume from.
+// compactionInstruction is appended as the only new message after an otherwise
+// byte-stable sampling prefix. This lets providers reuse the ordinary request's
+// system, tools and message-prefix KV cache.
+const compactionInstruction = `Compact the preceding conversation prefix into a durable resume briefing.
 Write under these exact headings, omitting a heading only if it has no content:
 
 ## Standing facts & constraints
@@ -79,101 +66,45 @@ Problems hit and how they were resolved (or not), so the same dead ends are not 
 ## Pending & next step
 What is still in progress or unstarted, and the single most concrete next action to take.
 
-Rules: be terse — bullet points and fragments, not prose. Preserve identifiers, paths, and numbers exactly. Do NOT invent anything not present in the messages; if something is unknown, leave it out rather than guessing.`
+Rules: be terse — bullet points and fragments, not prose. Preserve identifiers, paths, and numbers exactly. Merge valid facts from any existing <compaction-summary> and remove facts superseded by later messages. Do NOT invent anything not present in the messages; if something is unknown, leave it out rather than guessing. Output only the structured Markdown briefing. Do not call tools. Do not output reasoning.`
 
-// compactThresholds returns the prompt-token boundaries maybeCompact switches
-// on. The compaction ablation arm collapses the snip and fold triggers onto
-// soft, so the cache-preserving deferral branch is unreachable and the session
-// folds as soon as it grows — what a harness with no prompt-cache strategy does.
-func (a *Agent) compactThresholds() (soft, snip, high int) {
-	high = int(float64(a.contextWindow) * a.compactRatio)
-	snip = int(float64(a.contextWindow) * a.toolResultSnipRatio)
-	soft = int(float64(a.contextWindow) * a.softCompactRatio)
-	if a.ablation.Off(ablation.Compaction) {
-		high, snip = soft, soft
+// compactTrigger is the sole automatic context-maintenance boundary. Output
+// budgets are intentionally absent: they are clipped against the final request
+// at send time and must never make compaction happen earlier than the user's
+// configured compact_ratio.
+func (a *Agent) compactTrigger() int {
+	window := a.effectiveContextWindow()
+	if a == nil || window <= 0 {
+		return 0
 	}
-	return soft, snip, high
+	ratio := a.compactRatio
+	if ratio <= 0 {
+		ratio = defaultCompactRatio
+	}
+	if a.ablation.Off(ablation.Compaction) {
+		ratio = 0.5
+	}
+	return max(1, int(float64(window)*ratio))
 }
 
-// maybeCompact compacts into a context projection when the last turn's prompt
-// has grown to the configured fraction of the context window. It never rewrites
-// the canonical transcript. No-op when compaction is disabled or usage is
-// unavailable.
-func (a *Agent) maybeCompact(ctx context.Context, u *provider.Usage) {
-	if a.contextWindow <= 0 || u == nil {
-		return
+// hardInputCeiling is a physical input-safety boundary, not another user
+// compaction threshold. Reply budgets are resolved independently at send time.
+func (a *Agent) hardInputCeiling() int {
+	window := a.effectiveContextWindow()
+	if a == nil || window <= 0 {
+		return 0
 	}
-	promptTokens := u.LatestPromptTokens()
-	if promptTokens == 0 {
-		return
+	return max(1, window-protocolReserveTokens)
+}
+
+// recentTailBudget is the content-construction budget for the recent verbatim
+// tail. Harness-style compaction always retains 16% of the model window.
+func (a *Agent) recentTailBudget() int {
+	window := a.effectiveContextWindow()
+	if a == nil || window <= 0 {
+		return 1
 	}
-	soft, snip, high := a.compactThresholds()
-	// A turn that sits under the trigger is the breathing room a healthy
-	// compaction buys; it clears the stuck latch and the run counter. This has to
-	// happen before the soft/snip branches return, because a compaction that
-	// settles the prompt anywhere in [snip, high) is working exactly as intended:
-	// leaving a stale run count behind there would latch the *next* compaction as
-	// "the window is too small" and silently disable auto-compaction for the rest
-	// of the session.
-	if promptTokens < high {
-		a.consecutiveCompacts = 0
-		a.compactStuck = false
-	}
-	// Between the soft ratio and the trigger, report growing context once without
-	// rewriting the prefix — a compaction here would needlessly crater the cache.
-	if promptTokens >= soft && promptTokens < snip && !a.softCompactNoticed {
-		a.softCompactNoticed = true
-		detail := fmt.Sprintf("context reached %.0f%% of window; keeping cache-first prefix until compact threshold %.0f%%", a.softCompactRatio*100, a.compactRatio*100)
-		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "Context is getting large; preserving cache until cleanup is needed.", Detail: detail})
-		return
-	}
-	if promptTokens >= snip && promptTokens < high {
-		// Snip only into a projection view — never rewrite the canonical log.
-		if err := a.snipToProjection(ctx); err != nil {
-			a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "Context snip skipped for now.", Detail: err.Error()})
-		}
-		return
-	}
-	if promptTokens < high {
-		return // the latch was already cleared above
-	}
-	if a.compactStuck {
-		return
-	}
-	force := promptTokens >= int(float64(a.contextWindow)*a.compactForceRatio)
-	// Projection-only prune before folding. Install the pruned view first so the
-	// next request (and its real usage) can measure whether a paid summarize is
-	// still needed — never rewrite the canonical transcript.
-	ratio := a.tokPerChar()
-	msgs := a.session.Messages
-	pruned, pst := a.applyToolResultMaintenanceView(msgs, toolResultPrune)
-	if pst.Results > 0 {
-		saved := int(float64(pst.SavedChars) * ratio)
-		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(
-			"pruned %d stale tool results (~%d tokens est.) before compaction", pst.Results, saved)})
-		_ = a.installPruneProjection(pruned, pst)
-		if !force {
-			// Defer summarization until a later turn still reports pressure under
-			// the pruned projection. Force-ratio turns still fold immediately.
-			return
-		}
-	}
-	if _, err := a.compactToProjection(ctx, "auto", "", force); err != nil {
-		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "Context cleanup skipped for now.", Detail: fmt.Sprintf("compaction skipped: %v", err)})
-		return
-	}
-	// A healthy compaction drops the prompt under the trigger, so the next turn
-	// won't compact. Compacting on consecutive turns means the kept tail alone
-	// exceeds the trigger — the system prompt plus one verbatim turn is bigger than
-	// the window allows. Re-firing every turn is the loop users hit, so pause
-	// auto-compaction and say why, once.
-	a.consecutiveCompacts++
-	if a.consecutiveCompacts >= 2 {
-		a.compactStuck = true
-		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "Automatic context cleanup paused because the context window is too small.", Detail: fmt.Sprintf(
-			"context_window=%d is too small for compaction to help (the system prompt plus one turn already exceeds %.0f%% of it); raise context_window or shrink tool output. Auto-compaction paused until the prompt drops.",
-			a.contextWindow, a.compactRatio*100)})
-	}
+	return max(1, int(float64(window)*recentTailBudgetRatio))
 }
 
 // foldEconomics estimates whether compacting the given region saves enough
@@ -204,6 +135,11 @@ func estimateMessagesTokens(msgs []provider.Message) int {
 		}
 		for _, item := range m.ResponsesItems {
 			total += estimateTextTokens(string(item))
+		}
+		for _, search := range m.ServerSearch {
+			provider.WalkServerSearchEstimate(search, func(s string) {
+				total += estimateTextTokens(s)
+			})
 		}
 	}
 	return total
@@ -303,220 +239,45 @@ func isCompactionSummary(m provider.Message) bool {
 		strings.HasPrefix(strings.TrimLeft(m.Content, "\n "), summaryTagOpen)
 }
 
-// pinnedPrefixLen counts the leading messages a fold keeps verbatim: the system
-// prompt, the first user turn (its task + stated facts/constraints) when it is
-// small enough to be a brief, and the NEWEST prior summary — so a fold never
-// summarizes the user's facts away. Older summaries are NOT pinned: they enter
-// the fold region and are merged into the next digest (A1 rolling merge), so a
-// long session cannot accumulate an unbounded chain of digests. Merging re-feeds
-// the old summary text into the summarizer, so the facts it captured survive in
-// the new digest instead of being silently dropped.
+// pinnedPrefixLen keeps only the system message. All older user turns,
+// failures, and [[keep]] markers enter the Harness-style summary prefix.
 func (a *Agent) pinnedPrefixLen(msgs []provider.Message) int {
-	i := 0
-	if i < len(msgs) && msgs[i].Role == provider.RoleSystem {
-		i++
+	if len(msgs) > 0 && msgs[0].Role == provider.RoleSystem {
+		return 1
 	}
-	if i < len(msgs) && msgs[i].Role == provider.RoleUser && !isCompactionSummary(msgs[i]) && a.fixedPinnableUserTurn(msgs[i]) {
-		i++
-	}
-	// The entire summary run stays inside the fold region; partitionFold keeps
-	// the NEWEST summary verbatim and folds the older ones into the next digest
-	// (A1 rolling merge) — re-feeding their text through the summarizer so a
-	// long session cannot accumulate an unbounded chain of digests.
-	return i
+	return 0
 }
 
-// fixedPinnableUserTurn reports whether a user turn is small enough to keep
-// verbatim in a position-stable prefix. Identity decisions must not use the
-// latest provider usage: after projection activates, that usage describes the
-// projection while the canonical transcript remains larger, which would make
-// the same turn drift in or out across compactions. Dynamic token calibration is
-// reserved for non-identity estimates such as tail sizing.
-func (a *Agent) fixedPinnableUserTurn(m provider.Message) bool {
-	budget := maxPinnedFirstUserTokens
-	if a.contextWindow > 0 {
-		if f := int(float64(a.contextWindow) * pinnedFirstUserWindowFrac); f < budget {
-			budget = f
-		}
-	}
-	return int(float64(msgChars(m))*fallbackTokPerChar) <= budget
-}
-
-// partitionFold splits a compaction region into what is kept verbatim — small user
-// turns (a fact the user stated is never summarized away) — and the rest, which
-// folds. Order within each group is preserved.
-//
-// Prior digests inside the region are folded (not kept verbatim): the newest
-// digest is already pinned by pinnedPrefixLen outside the region, so any summary
-// seen here is an older one being merged into the next digest (A1 rolling merge).
-// Merging re-feeds the old summary text into the summarizer, preserving its facts.
-//
-// The small-turn keep window is position-fixed (only the first keepSmallUserTurns
-// small user turns in the region survive), never "the most recent N" — a dynamic
-// tail window would move with every compaction and rewrite the kept prefix,
-// cratering the server-side prefix cache (mental-seal: prefix stability is the
-// first principle). A fixed prefix window keeps the surviving bytes identical
-// across compactions; only the folded middle is replaced by a digest.
-func (a *Agent) partitionFold(region []provider.Message) (kept, fold []provider.Message) {
-	policyKeep := keepIndexes(region, a.keepPolicy)
-	keptSmallUserTurns := 0
-	// The NEWEST summary in the region (the last one in the contiguous summary
-	// run) is kept verbatim; older digests fold into the next digest (A1 rolling
-	// merge) and are re-fed through the summarizer, so the digest chain cannot
-	// accumulate unboundedly.
-	lastSummary := -1
-	for i, m := range region {
-		if isCompactionSummary(m) {
-			lastSummary = i
-		}
-	}
-	for i, m := range region {
-		keep := m.LocalOnly || policyKeep[i] || (isCompactionSummary(m) && i == lastSummary)
-		if !keep && m.Role == provider.RoleUser && !isCompactionSummary(m) && a.fixedPinnableUserTurn(m) {
-			// Position-fixed small-turn keep window: the first N small user turns
-			// in the region survive verbatim; older ones fold into the digest so
-			// a long session cannot accumulate unbounded verbatim user turns.
-			// N is fixed (not "latest N"), so the kept prefix stays byte-stable.
-			// Digests are excluded: they are governed by the A1 rolling merge
-			// (only the newest survives verbatim; older ones re-enter the fold).
-			if keptSmallUserTurns < maxKeepSmallUserTurns {
-				keep = true
-			}
-			keptSmallUserTurns++
-		}
-		if keep {
-			kept = append(kept, m)
-		} else {
-			fold = append(fold, m)
-		}
-	}
-	return kept, fold
-}
-
-func keepIndexes(region []provider.Message, policy KeepPolicy) []bool {
-	keep := make([]bool, len(region))
-	policyStart := 0
-	for i, m := range region {
-		if isCompactionSummary(m) {
-			policyStart = i + 1
-		}
-	}
-	// Retention applies only to messages since the latest digest; older kept
-	// messages are allowed to fold on the next pass so they cannot grow forever.
-	for i, m := range region {
-		if i >= policyStart && shouldKeepMessage(m, policy) {
-			keep[i] = true
-		}
-	}
-	for i, m := range region {
-		if !keep[i] {
-			continue
-		}
-		switch m.Role {
-		case provider.RoleTool:
-			if j := findToolCaller(region, i, m.ToolCallID); j >= 0 {
-				keepToolCallGroup(region, keep, j)
-			}
-		case provider.RoleAssistant:
-			keepToolCallGroup(region, keep, i)
-		}
-	}
-	return keep
-}
-
-func keepToolCallGroup(region []provider.Message, keep []bool, assistantIndex int) {
-	if assistantIndex < 0 || assistantIndex >= len(region) {
-		return
-	}
-	m := region[assistantIndex]
-	if m.Role != provider.RoleAssistant || len(m.ToolCalls) == 0 {
-		return
-	}
-	keep[assistantIndex] = true
-	ids := toolCallIDs(m)
-	for j := assistantIndex + 1; j < len(region) && region[j].Role == provider.RoleTool; j++ {
-		if ids[region[j].ToolCallID] {
-			keep[j] = true
-		}
-	}
-}
-
-func shouldKeepMessage(m provider.Message, policy KeepPolicy) bool {
-	if policy&KeepErrors != 0 && isErrorMessage(m) {
-		return true
-	}
-	if policy&KeepUserMarked != 0 && isUserMarked(m) {
-		return true
-	}
-	return false
-}
-
-func isErrorMessage(m provider.Message) bool {
-	if m.Role != provider.RoleTool {
-		return false
-	}
-	s := strings.TrimSpace(strings.ToLower(m.Content))
-	return strings.HasPrefix(s, "error:") || strings.HasPrefix(s, "blocked:")
-}
-
-func isUserMarked(m provider.Message) bool {
-	if m.Role != provider.RoleUser {
-		return false
-	}
-	content := strings.TrimSpace(strings.ToLower(m.Content))
-	return strings.HasPrefix(content, "[[keep]]") ||
-		strings.HasPrefix(content, "[keep]") ||
-		strings.HasPrefix(content, "<keep>") ||
-		strings.HasPrefix(content, "<!-- keep -->")
-}
-
-func findToolCaller(region []provider.Message, toolIndex int, id string) int {
-	for i := toolIndex - 1; i >= 0; i-- {
-		if region[i].Role != provider.RoleAssistant {
-			continue
-		}
-		for _, tc := range region[i].ToolCalls {
-			if tc.ID == id {
-				return i
-			}
-		}
-	}
-	return -1
-}
-
-func toolCallIDs(m provider.Message) map[string]bool {
-	ids := make(map[string]bool, len(m.ToolCalls))
-	for _, tc := range m.ToolCalls {
-		ids[tc.ID] = true
-	}
-	return ids
-}
-
-// planCompaction locates the region to summarize. head is the count of leading
-// messages preserved verbatim (see pinnedPrefixLen); start is where the preserved
-// recent tail begins, so msgs[head:start] is compacted. The tail is bounded by a
-// token budget (not a message count), so a few large tool outputs can't keep it
-// above the trigger and re-fire compaction every turn. ok is false when there is
-// too little to compact.
-func (a *Agent) planCompaction(msgs []provider.Message, min int) (head, start int, ok bool) {
+// planCompaction returns [head:start] to fold while retaining the newest 16%
+// of the model window and keeping tool-call/result groups balanced.
+func (a *Agent) planCompaction(msgs []provider.Message, min int, force bool) (head, start int, ok bool) {
 	head = a.pinnedPrefixLen(msgs)
 	if a.contextWindow > 0 {
-		budget := defaultTailTokens
-		if maxByWin := int(float64(a.contextWindow) * defaultCompactTarget); maxByWin < budget {
-			budget = maxByWin
+		budget := a.recentTailBudget()
+		if force {
+			if half := estimateMessagesTokens(modelInputMessages(msgs)) / 2; half > 0 && half < budget {
+				budget = half
+			}
 		}
 		start = tailStart(msgs, head, budget, a.tokPerChar(), a.tailFloor())
+		// Remeasure when force or non-strict roles; strict-alternating otherwise
+		// keeps a cheap tokPerChar overestimate of the tail under force.
+		floor := max(head, len(msgs)-a.tailFloor())
+		remeasure := force || !a.strictAlternatingRoles
+		for remeasure && start < floor && estimateMessagesTokens(provider.ModelMessages(msgs[start:])) > budget {
+			start++
+			for start < floor && start < len(msgs) && msgs[start].Role == provider.RoleTool {
+				start++
+			}
+		}
 	} else {
-		// No window to budget against (manual /compact on an unconfigured
-		// provider): keep a fixed count of recent messages, aligned off any tool.
+		// No window: keep a fixed recent count, aligned off tool results.
 		start = len(msgs) - a.tailFloor()
-		for start > head && msgs[start].Role == provider.RoleTool {
+		for start > head && start < len(msgs) && msgs[start].Role == provider.RoleTool {
 			start--
 		}
 	}
-	if start < head {
-		start = head
-	}
+	start = max(start, head)
 	if start-head < min {
 		return head, start, false
 	}
@@ -524,10 +285,7 @@ func (a *Agent) planCompaction(msgs []provider.Message, min int) (head, start in
 }
 
 func (a *Agent) tailFloor() int {
-	if a.recentKeep > minRecentKeep {
-		return a.recentKeep
-	}
-	return minRecentKeep
+	return 0
 }
 
 // tailStart walks newest→oldest, growing the verbatim tail until the next
@@ -561,11 +319,9 @@ func tailStart(msgs []provider.Message, head, budgetTokens int, tokPerChar float
 // actually sent (the provider strips it). Falls back to ~4 chars/token before
 // any usage is known, and ignores absurd ratios.
 func (a *Agent) tokPerChar() float64 {
-	if u := a.lastUsage.Load(); u != nil && u.PromptTokens > 0 {
-		if c := charsOfMessages(a.session.Messages); c > 0 {
-			if r := float64(u.PromptTokens) / float64(c); r > 0.05 && r < 2 {
-				return r
-			}
+	if cal := a.sess.output.promptCalibration.Load(); cal != nil && cal.compactChars > 0 {
+		if r := float64(cal.promptTokens) / float64(cal.compactChars); r > 0.05 && r < 2 {
+			return r
 		}
 	}
 	return fallbackTokPerChar
@@ -593,31 +349,70 @@ func charsOfMessages(msgs []provider.Message) int {
 	return n
 }
 
-// summarize asks the executor's own provider (no tools) to distill the region
-// into a briefing. instructions is optional /compact focus + PreCompact text.
+// summarize asks the executor's own provider to distill a replayed prefix into
+// a briefing. instructions is optional /compact focus + PreCompact text.
+// Named returns so defer can attach RequestCount and still return usage.
+func compactionInstructionWithFocus(instructions string) string {
+	instruction := compactionInstruction
+	if strings.TrimSpace(instructions) != "" {
+		instruction += "\n\nAdditional focus for this compaction (prioritize keeping this):\n" + strings.TrimSpace(instructions)
+	}
+	return instruction
+}
+
+// summaryRequest builds the exact cache-aligned request shape used by
+// summarize. Keeping planning and execution on this shared builder prevents a
+// supposedly safe overflow fold from being rejected only after it is selected.
+func (a *Agent) summaryRequest(region []provider.Message, instructions string) provider.Request {
+	prefix := append([]provider.Message(nil), region...)
+	if len(prefix) == 0 || prefix[0].Role != provider.RoleSystem {
+		visible := a.modelVisibleMessages()
+		if len(visible) > 0 && visible[0].Role == provider.RoleSystem {
+			prefix = append([]provider.Message{visible[0]}, prefix...)
+		}
+	}
+	messages := a.normalizeModelRequestMessages(prefix)
+	messages = append(messages, provider.Message{Role: provider.RoleUser, Content: compactionInstructionWithFocus(instructions)})
+	var schemas []provider.ToolSchema
+	if a.svc.tools != nil {
+		schemas = a.svc.tools.Schemas()
+	}
+	return provider.Request{
+		Messages:    messages,
+		Tools:       schemas,
+		MaxTokens:   summaryOutputMaxTokens,
+		Temperature: provider.OptionalTemperature(a.temperature),
+	}
+}
+
+// summarize asks the executor's own provider to distill a replayed prefix into
+// a briefing. instructions is optional /compact focus + PreCompact text.
 // Named returns so defer can attach RequestCount and still return usage.
 func (a *Agent) summarize(ctx context.Context, region []provider.Message, instructions string) (summary string, usage *provider.Usage, err error) {
-	ctx, cancel := context.WithTimeout(ctx, summaryTimeout)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	ctx = provider.WithRequestAttemptCounter(ctx)
-	sys := summarySystemPrompt
-	if strings.TrimSpace(instructions) != "" {
-		sys += "\n\nAdditional focus for this compaction (prioritize keeping this):\n" + strings.TrimSpace(instructions)
-	}
 	defer func() {
 		usage = provider.UsageWithRequestAttemptCount(ctx, usage)
 		if usage != nil && (usage.TotalTokens > 0 || usage.RequestCount > 0) {
-			a.sink.Emit(event.Event{Kind: event.Usage, ModelRef: a.modelRef, Usage: usage, Pricing: a.pricing, UsageSource: event.UsageSourceCompaction})
+			a.svc.sink.Emit(event.Event{Kind: event.Usage, ModelRef: a.modelRef, Usage: usage, Pricing: a.svc.pricing, UsageSource: event.UsageSourceCompaction})
 		}
 	}()
 	defer trackPublishedHostStream(ctx, cancel)()
-	ch, err := a.prov.Stream(ctx, provider.Request{
-		Messages: []provider.Message{
-			{Role: provider.RoleSystem, Content: sys},
-			{Role: provider.RoleUser, Content: renderTranscript(region)},
-		},
-		Temperature: provider.OptionalTemperature(a.temperature),
-	})
+	req := a.summaryRequest(region, instructions)
+	if err := a.applyAdmissionToRequest(&req); err != nil {
+		return "", usage, err
+	}
+	if req.MaxTokens > summaryOutputMaxTokens {
+		req.MaxTokens = summaryOutputMaxTokens
+	}
+	if req.MaxTokens < 256 {
+		return "", usage, fmt.Errorf("summary output budget too small (%d tokens)", req.MaxTokens)
+	}
+	if a.svc.prov == nil {
+		return "", usage, fmt.Errorf("summary unavailable")
+	}
+	ch, err := a.svc.prov.Stream(ctx, req)
 	if err != nil {
 		return "", usage, err
 	}
@@ -630,6 +425,9 @@ func (a *Agent) summarize(ctx context.Context, region []provider.Message, instru
 			return "", usage, ctx.Err()
 		case chunk, ok := <-ch:
 			if !ok {
+				if usage != nil && usage.FinishReason == "length" {
+					return "", usage, fmt.Errorf("%w: provider reached the output token limit", errSummaryOutputTruncated)
+				}
 				s := strings.TrimSpace(b.String())
 				if s == "" {
 					return "", usage, fmt.Errorf("summarizer returned empty output")
@@ -648,15 +446,11 @@ func (a *Agent) summarize(ctx context.Context, region []provider.Message, instru
 	}
 }
 
-// summarizeWithRetry retries one non-timeout failure; timeout/cancel do not retry.
-// Token and request counts from both attempts are merged into the returned Usage.
-func (a *Agent) summarizeWithRetry(ctx context.Context, fold []provider.Message, instructions string) (string, *provider.Usage, error) {
-	summary, usage, err := a.summarize(ctx, fold, instructions)
-	if err == nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return summary, usage, err
-	}
-	summary2, usage2, err2 := a.summarize(ctx, fold, instructions)
-	return summary2, mergeStreamUsage(usage, usage2), err2
+// summarizeOnce performs exactly one application-layer summary request.
+// Timeouts, empty results, stream errors, and output truncation all fail once
+// with no second attempt.
+func (a *Agent) summarizeOnce(ctx context.Context, fold []provider.Message, instructions string) (string, *provider.Usage, error) {
+	return a.summarize(ctx, fold, instructions)
 }
 
 // renderTranscript flattens messages into a readable transcript for summarization.
@@ -678,7 +472,11 @@ func renderTranscript(msgs []provider.Message) string {
 			}
 			b.WriteString("\n")
 		case provider.RoleTool:
-			fmt.Fprintf(&b, "[tool %s result]\n%s\n\n", m.Name, m.Content)
+			body := m.Content
+			if m.RawContent != "" {
+				body = m.RawContent
+			}
+			fmt.Fprintf(&b, "[tool %s result]\n%s\n\n", m.Name, body)
 		case provider.RoleSystem:
 			fmt.Fprintf(&b, "[system]\n%s\n\n", m.Content)
 		}
@@ -705,26 +503,4 @@ func summarizeToolArgs(args string) string {
 	}
 	sort.Strings(keys)
 	return fmt.Sprintf("{%s} (%d keys)", strings.Join(keys, ", "), len(parsed))
-}
-
-// archiveMessages writes the dropped originals to a timestamped .jsonl (one
-// message per line) under dir, returning the file path.
-func archiveMessages(dir string, msgs []provider.Message) (string, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, time.Now().Format("20060102-150405.000")+".jsonl")
-	f, err := os.Create(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	enc := json.NewEncoder(f)
-	for _, m := range msgs {
-		if err := enc.Encode(m); err != nil {
-			return "", err
-		}
-	}
-	return path, nil
 }

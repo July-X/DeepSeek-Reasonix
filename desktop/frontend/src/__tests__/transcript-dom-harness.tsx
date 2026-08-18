@@ -9,6 +9,7 @@ import { JSDOM } from "jsdom";
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { createServer, type ViteDevServer } from "vite";
+import type { ReasoningDisplayMode } from "../lib/reasoningDisplayPreference";
 import type { Item } from "../lib/useController";
 
 export interface TranscriptHarnessOptions {
@@ -18,6 +19,8 @@ export interface TranscriptHarnessOptions {
   rowHeight?: number;
   /** Extra localStorage seed values (display mode, fold preference, …). */
   storage?: Record<string, string>;
+  /** Authoritative reasoning mode to hydrate before Transcript is imported. */
+  reasoningDisplayMode?: ReasoningDisplayMode;
 }
 
 export interface TranscriptHarness {
@@ -28,15 +31,10 @@ export interface TranscriptHarness {
   render: (items: Item[], props?: Record<string, unknown>) => Promise<void>;
   flush: () => Promise<void>;
   settle: () => Promise<void>;
+  waitFor: (condition: () => boolean, description: string, attempts?: number) => Promise<void>;
   unmount: () => Promise<void>;
   close: () => Promise<void>;
   loadModule: <T>(path: string) => Promise<T>;
-}
-
-class NoopResizeObserver {
-  observe() {}
-  unobserve() {}
-  disconnect() {}
 }
 
 export async function createTranscriptHarness(options: TranscriptHarnessOptions = {}): Promise<TranscriptHarness> {
@@ -58,15 +56,38 @@ export async function createTranscriptHarness(options: TranscriptHarnessOptions 
   globalThis.CustomEvent = dom.window.CustomEvent;
   globalThis.MouseEvent = dom.window.MouseEvent;
   globalThis.KeyboardEvent = dom.window.KeyboardEvent;
+  globalThis.WheelEvent = dom.window.WheelEvent;
   globalThis.requestAnimationFrame = dom.window.requestAnimationFrame.bind(dom.window);
   globalThis.cancelAnimationFrame = dom.window.cancelAnimationFrame.bind(dom.window);
   globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window) as typeof getComputedStyle;
-  globalThis.ResizeObserver = NoopResizeObserver as unknown as typeof ResizeObserver;
-  dom.window.ResizeObserver = NoopResizeObserver as unknown as typeof ResizeObserver;
+  class TranscriptResizeObserver {
+    constructor(private readonly callback: ResizeObserverCallback) {}
+    observe(target: Element) {
+      const element = target as HTMLElement;
+      const height = element.classList.contains("transcript__row")
+        ? rowHeight
+        : element.dataset.viewportType === "element" || element.classList.contains("transcript")
+          ? viewportHeight
+          : element.classList.contains("transcript__header")
+            ? rowHeight
+            : 0;
+      queueMicrotask(() => this.callback([{
+        target,
+        contentRect: { width: 800, height, top: 0, right: 800, bottom: height, left: 0, x: 0, y: 0, toJSON: () => ({}) },
+        borderBoxSize: [{ inlineSize: 800, blockSize: height }],
+        contentBoxSize: [{ inlineSize: 800, blockSize: height }],
+        devicePixelContentBoxSize: [{ inlineSize: 800, blockSize: height }],
+      } as unknown as ResizeObserverEntry], this as unknown as ResizeObserver));
+    }
+    unobserve() {}
+    disconnect() {}
+  }
+  globalThis.ResizeObserver = TranscriptResizeObserver as unknown as typeof ResizeObserver;
+  dom.window.ResizeObserver = TranscriptResizeObserver as unknown as typeof ResizeObserver;
   Object.defineProperty(dom.window, "matchMedia", {
     configurable: true,
     value: () => ({
-      matches: true, // prefers-reduced-motion: keep GSAP tweens out of the assertions
+      matches: true, // prefers-reduced-motion: keep visual transitions out of the assertions
       media: "(prefers-reduced-motion: reduce)",
       onchange: null,
       addEventListener() {},
@@ -113,14 +134,28 @@ export async function createTranscriptHarness(options: TranscriptHarnessOptions 
       return 0;
     },
   });
+  Object.defineProperty(proto, "clientWidth", {
+    configurable: true,
+    get(this: HTMLElement) {
+      if (this.classList.contains("transcript")) return 800;
+      return 0;
+    },
+  });
   Object.defineProperty(proto, "scrollHeight", {
     configurable: true,
     get(this: HTMLElement) {
       if (this.classList.contains("transcript")) {
-        // The virtualizer writes the total row height onto the sizer.
-        const sizer = this.querySelector<HTMLElement>(".transcript__virtual-sizer");
-        const height = sizer ? Number.parseFloat(sizer.style.height) : 0;
-        return Number.isFinite(height) ? height : 0;
+        const list = this.querySelector<HTMLElement>("[data-testid='virtuoso-item-list']");
+        if (list) {
+          const paddingTop = Number.parseFloat(list.style.paddingTop || "0");
+          const paddingBottom = Number.parseFloat(list.style.paddingBottom || "0");
+          const rendered = Array.from(list.querySelectorAll<HTMLElement>("[data-known-size]"))
+            .reduce((sum, item) => sum + Number.parseFloat(item.dataset.knownSize || "0"), 0);
+          const total = paddingTop + rendered + paddingBottom;
+          if (Number.isFinite(total) && total > 0) return total;
+        }
+        const count = Number.parseInt(this.dataset.transcriptRowCount ?? "0", 10);
+        return Number.isFinite(count) ? count * rowHeight : 0;
       }
       return 0;
     },
@@ -130,38 +165,39 @@ export async function createTranscriptHarness(options: TranscriptHarnessOptions 
     this: HTMLElement,
     arg?: number | ScrollToOptions,
   ) {
+    const max = Math.max(0, this.scrollHeight - this.clientHeight);
     if (typeof arg === "number") {
-      this.scrollTop = arg;
+      this.scrollTop = Math.max(0, Math.min(max, arg));
     } else if (arg && typeof arg.top === "number") {
-      this.scrollTop = arg.top;
+      this.scrollTop = Math.max(0, Math.min(max, arg.top));
+    }
+  };
+  (proto as unknown as { scrollBy: (arg?: number | ScrollToOptions) => void }).scrollBy = function (
+    this: HTMLElement,
+    arg?: number | ScrollToOptions,
+  ) {
+    const max = Math.max(0, this.scrollHeight - this.clientHeight);
+    if (typeof arg === "number") {
+      this.scrollTop = Math.max(0, Math.min(max, this.scrollTop + arg));
+    } else if (arg && typeof arg.top === "number") {
+      this.scrollTop = Math.max(0, Math.min(max, this.scrollTop + arg.top));
     }
   };
 
-  // GSAP's CSS plugin cannot run against jsdom; the assertions are about
-  // state-driven DOM, so the animation hooks are stubbed out.
   const server = await createServer({
     appType: "custom",
     logLevel: "silent",
     server: { middlewareMode: true },
-    plugins: [
-      {
-        name: "stub-animation-hooks",
-        enforce: "pre",
-        load(id) {
-          if (id.endsWith("/src/lib/useGSAPCollapse.ts")) {
-            return "export function useGSAPCollapse() {}";
-          }
-          if (id.endsWith("/src/lib/useEntranceAnimation.ts")) {
-            return "export function useEntranceAnimation() { return { current: null }; }";
-          }
-          return undefined;
-        },
-      },
-    ],
   });
-  const { Transcript } = await server.ssrLoadModule("/src/components/Transcript.tsx");
+  if (options.reasoningDisplayMode) {
+    const preference = await server.ssrLoadModule("/src/lib/reasoningDisplayPreference.ts") as {
+      hydrateReasoningDisplayMode: (mode: unknown, explicit: boolean) => void;
+    };
+    preference.hydrateReasoningDisplayMode(options.reasoningDisplayMode, true);
+  }
+  const { TranscriptTestSurface } = await server.ssrLoadModule("/src/__tests__/transcript-test-surface.tsx");
   const { LocaleProvider } = await server.ssrLoadModule("/src/lib/i18n.tsx");
-  const TranscriptComponent = Transcript as React.ComponentType<Record<string, unknown>>;
+  const TranscriptComponent = TranscriptTestSurface as React.ComponentType<Record<string, unknown>>;
   const Locale = LocaleProvider as React.ComponentType<{ children?: React.ReactNode }>;
 
   const container = dom.window.document.getElementById("root")!;
@@ -184,6 +220,18 @@ export async function createTranscriptHarness(options: TranscriptHarnessOptions 
     }
   };
 
+  // Each attempt costs one 30ms flush, so the default is a three-second budget,
+  // not eight tries. It returns the moment the condition holds, so a generous
+  // cap is free on the happy path and only makes a genuine failure slower —
+  // which beats failing a correct test on a loaded runner.
+  const waitFor = async (condition: () => boolean, description: string, attempts = 100) => {
+    for (let i = 0; i < attempts; i += 1) {
+      if (condition()) return;
+      await flush();
+    }
+    if (!condition()) throw new Error(`timed out waiting for ${description}`);
+  };
+
   return {
     dom,
     container,
@@ -199,7 +247,14 @@ export async function createTranscriptHarness(options: TranscriptHarnessOptions 
           React.createElement(
             Locale,
             null,
-            React.createElement(TranscriptComponent, { items, onPrompt: () => {}, questionNavigator: false, ...props }),
+            React.createElement(TranscriptComponent, {
+              items,
+              onPrompt: () => {},
+              questionNavigator: false,
+              viewportHeight,
+              rowHeight,
+              ...props,
+            }),
           ),
         );
       });
@@ -207,6 +262,7 @@ export async function createTranscriptHarness(options: TranscriptHarnessOptions 
     },
     flush,
     settle,
+    waitFor,
     unmount: async () => {
       const current = root;
       root = null;

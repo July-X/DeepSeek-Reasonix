@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,10 @@ import (
 	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/store"
 )
+
+// ErrSessionTitleChanged reports that a conditional rename observed a newer
+// custom title and left it untouched.
+var ErrSessionTitleChanged = errors.New("session title changed")
 
 // BranchMeta is the small sidecar record that turns flat session files into a
 // navigable conversation tree. The conversation itself remains in the .jsonl
@@ -32,47 +37,56 @@ type BranchMeta struct {
 	TopicTitle       string    `json:"topic_title,omitempty"`
 	CustomTitle      string    `json:"custom_title,omitempty"`
 	Model            string    `json:"model,omitempty"`
-	TokenMode        string    `json:"token_mode,omitempty"`
-	Mode             string    `json:"mode,omitempty"`
-	ToolApprovalMode string    `json:"tool_approval_mode,omitempty"`
-	Goal             string    `json:"goal,omitempty"`
-	Recovered        bool      `json:"recovered,omitempty"`
-	RecoveryReason   string    `json:"recovery_reason,omitempty"`
-	RecoveryDigest   string    `json:"recovery_digest,omitempty"`
-	// RecoveryDepth counts how many recovery forks separate this branch from a
-	// normal session (1 = forked from a normal session). SaveRecoveryBranch
-	// refuses to fork past SessionRecoveryMaxDepth so a conflict loop cannot
-	// spawn unbounded nested recovery chains (#5993 reached 8 levels). Legacy
-	// recovery metas without the field are treated as depth 1.
-	RecoveryDepth int    `json:"recovery_depth,omitempty"`
-	Revision      int64  `json:"revision,omitempty"`
-	ContentDigest string `json:"content_digest,omitempty"`
-	WriterID      string `json:"writer_id,omitempty"`
+	// TokenMode is a deprecated dual-write field; new writes pin it to "full".
+	TokenMode string `json:"token_mode,omitempty"`
+	// AgentPreset is a deprecated dual-write field; new writes pin it to "balanced".
+	AgentPreset      string `json:"agent_preset,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	ToolApprovalMode string `json:"tool_approval_mode,omitempty"`
+	Goal             string `json:"goal,omitempty"`
+	Recovered        bool   `json:"recovered,omitempty"`
+	RecoveryReason   string `json:"recovery_reason,omitempty"`
+	RecoveryDigest   string `json:"recovery_digest,omitempty"`
+	// RecoveryDepth is 1 for new stable recovery branches. Older nested
+	// files may still carry a larger historical value.
+	RecoveryDepth int `json:"recovery_depth,omitempty"`
+	// RecoveryPreferred is a user's explicit choice among genuinely diverged
+	// recovery leaves. It changes the default open target, but never authorizes
+	// deletion and is cleared automatically if that leaf is no longer valid.
+	RecoveryPreferred       bool   `json:"recovery_preferred,omitempty"`
+	RecoveryPreferredDigest string `json:"recovery_preferred_digest,omitempty"`
+	Revision                int64  `json:"revision,omitempty"`
+	ContentDigest           string `json:"content_digest,omitempty"`
+	WriterID                string `json:"writer_id,omitempty"`
 	// SchemaVersion records the BranchMeta version that last wrote the listing
 	// fields (Turns/Preview) FROM the session's content. It is stamped only by the
 	// writers that actually derive those counts — Controller.snapshot's
 	// UpdateSessionMeta and Fork/Branch — never by EnsureBranchMeta / TouchBranchMeta
-	// / rename / set-model, which don't know the turn count. So ListSessions can
-	// tell a meta whose counts are authoritative (>= BranchMetaCountsVersion: trust
-	// Turns even when 0 = genuinely empty) from a legacy/contentless one
-	// (< version: decode once, then backfill + stamp).
+	// / rename / set-model, which don't know the turn count. ListSessions trusts
+	// positive v1 counts, but revalidates a v1 zero once because old preview errors
+	// could be cached as empty. Current-version zero counts are authoritative.
 	SchemaVersion int `json:"schema_version,omitempty"`
 	// Turns and Preview are listing-only fields the desktop sidebar and CLI
 	// pickers show ("5 turns · 'help me debug…'") without decoding the whole
 	// .jsonl. The autosave path (Controller.snapshot) keeps them fresh from the
 	// in-memory conversation, so ListSessions stays O(1) per session instead of
-	// O(file size). Gated by SchemaVersion (above), not Turns == 0, so a
-	// genuinely-empty session is recorded once and never re-decoded.
+	// O(file size). SchemaVersion distinguishes a current, validated zero from an
+	// old zero that may have swallowed a decode error.
 	Turns        int               `json:"turns,omitempty"`
 	Preview      string            `json:"preview,omitempty"`
 	InFlightTurn *InFlightTurnMeta `json:"in_flight_turn,omitempty"`
+	// Closed completed todo shelves; desktop remounts hide the same fingerprint.
+	DismissedTodoBatches []string `json:"dismissed_todo_batches,omitempty"`
 }
 
-// BranchMetaCountsVersion is stamped into BranchMeta.SchemaVersion whenever a
-// writer records Turns/Preview from session content (UpdateSessionMeta,
-// Fork/Branch). Bump it when the meaning of those listing fields changes so
-// existing listings re-derive them instead of trusting a stale cache.
-const BranchMetaCountsVersion = 1
+const (
+	// branchMetaCountsInitialVersion introduced content-derived Turns/Preview.
+	// Positive counts from this version remain authoritative.
+	branchMetaCountsInitialVersion = 1
+	// BranchMetaCountsVersion certifies that zero turns came from a successful,
+	// error-aware decode. Version 1 could cache a preview failure as zero turns.
+	BranchMetaCountsVersion = 2
+)
 
 // InFlightTurnMeta records the message-log boundary for a foreground turn that
 // has started but not yet reached TurnDone. If the process exits mid-turn, a
@@ -204,6 +218,18 @@ func SaveBranchMeta(sessionPath string, m BranchMeta) error {
 	})
 }
 
+// saveBranchMetaKeepInFlightTurn keeps any existing in-flight turn on rewrite.
+func saveBranchMetaKeepInFlightTurn(sessionPath string, m BranchMeta) error {
+	return UpdateBranchMeta(sessionPath, true, func(current *BranchMeta) error {
+		if m.InFlightTurn == nil {
+			m.InFlightTurn = current.InFlightTurn
+		}
+		preserveBranchMetaPersistence(&m, *current)
+		*current = m
+		return nil
+	})
+}
+
 func SaveBranchMetaPreserveUpdated(sessionPath string, m BranchMeta) error {
 	return UpdateBranchMeta(sessionPath, false, func(current *BranchMeta) error {
 		preserveBranchMetaPersistence(&m, *current)
@@ -230,12 +256,19 @@ func saveBranchMeta(sessionPath string, m BranchMeta, touchUpdated bool) error {
 	if m.CreatedAt.IsZero() {
 		m.CreatedAt = now
 	}
-	if touchUpdated || m.UpdatedAt.IsZero() {
+	if touchUpdated {
 		m.UpdatedAt = now
+	} else if m.UpdatedAt.IsZero() {
+		if info, err := os.Stat(sessionPath); err == nil {
+			m.UpdatedAt = info.ModTime().UTC()
+		} else {
+			m.UpdatedAt = now
+		}
 	}
 	if existing, ok, err := LoadBranchMeta(sessionPath); err == nil && ok {
 		preserveBranchMetaPersistence(&m, existing)
 	}
+	fileutil.Crash("branch-meta", metaPath)
 	if err := os.MkdirAll(filepath.Dir(metaPath), 0o755); err != nil {
 		return err
 	}
@@ -269,6 +302,7 @@ func preserveBranchMetaPersistence(next *BranchMeta, existing BranchMeta) {
 	if next == nil {
 		return
 	}
+	next.DismissedTodoBatches = MergeDismissedTodoBatches(existing.DismissedTodoBatches, next.DismissedTodoBatches)
 	if existing.Revision > next.Revision {
 		next.Revision = existing.Revision
 		next.ContentDigest = existing.ContentDigest
@@ -528,6 +562,18 @@ func ListBranches(dir string) ([]BranchInfo, error) {
 // topic title remains a separate grouping label, so explicit session names do
 // not fight topic auto-titling.
 func RenameSession(sessionPath string, title string) error {
+	return renameSession(sessionPath, nil, title)
+}
+
+// RenameSessionIfTitleUnchanged atomically updates a session title only when
+// no newer title writer has changed it since expectedTitle was observed. The
+// comparison and write share the BranchMeta path lock, so a delayed AI result
+// cannot overwrite a newer manual or AI rename.
+func RenameSessionIfTitleUnchanged(sessionPath, expectedTitle, title string) error {
+	return renameSession(sessionPath, &expectedTitle, title)
+}
+
+func renameSession(sessionPath string, expectedTitle *string, title string) error {
 	if sessionPath == "" {
 		return fmt.Errorf("empty session path")
 	}
@@ -542,6 +588,9 @@ func RenameSession(sessionPath string, title string) error {
 	m, err := ensureBranchMetaUnlocked(sessionPath)
 	if err != nil {
 		return err
+	}
+	if expectedTitle != nil && m.CustomTitle != *expectedTitle {
+		return fmt.Errorf("%w: expected %q, found %q", ErrSessionTitleChanged, *expectedTitle, m.CustomTitle)
 	}
 	m.CustomTitle = strings.TrimSpace(title)
 	return saveBranchMeta(sessionPath, m, false)

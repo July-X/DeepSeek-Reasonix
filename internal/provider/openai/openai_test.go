@@ -532,8 +532,8 @@ func TestStreamUsesConfiguredChatURL(t *testing.T) {
 	var sawRequest bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawRequest = true
-		if r.URL.Path != "/proxy/v1/chat/completions" {
-			t.Errorf("path = %s, want /proxy/v1/chat/completions", r.URL.Path)
+		if r.URL.RequestURI() != "/proxy/v1/chat/completions" {
+			t.Errorf("request URI = %s, want /proxy/v1/chat/completions", r.URL.RequestURI())
 			http.NotFound(w, r)
 			return
 		}
@@ -551,7 +551,7 @@ func TestStreamUsesConfiguredChatURL(t *testing.T) {
 		BaseURL: srv.URL + "/base",
 		Model:   "model-a",
 		APIKey:  "k",
-		Extra:   map[string]any{"chat_url": srv.URL + "/proxy/v1/chat/completions"},
+		Extra:   map[string]any{"chat_url": srv.URL + "/proxy/v1/chat/completions/"},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1078,7 +1078,7 @@ func TestNewDeepSeekV4FlashForwardsLowEffort(t *testing.T) {
 		t.Fatalf("Flash reasoning_effort = %q, want low", got)
 	}
 
-	_, err = New(provider.Config{
+	pro, err := New(provider.Config{
 		Name:    "deepseek",
 		BaseURL: "https://api.deepseek.com",
 		Model:   "deepseek-v4-pro",
@@ -1088,8 +1088,11 @@ func TestNewDeepSeekV4FlashForwardsLowEffort(t *testing.T) {
 			"reasoning_protocol": "deepseek",
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "requires deepseek-v4-flash") {
-		t.Fatalf("New Pro low error = %v, want model-scoped rejection", err)
+	if err != nil {
+		t.Fatalf("New Pro low: %v", err)
+	}
+	if got := pro.(*client).buildRequest(provider.Request{}).ReasoningEffort; got != "low" {
+		t.Fatalf("Pro reasoning_effort = %q, want low", got)
 	}
 
 	custom, err := New(provider.Config{
@@ -1108,6 +1111,22 @@ func TestNewDeepSeekV4FlashForwardsLowEffort(t *testing.T) {
 	}
 	if got := custom.(*client).buildRequest(provider.Request{}).ReasoningEffort; got != "low" {
 		t.Fatalf("custom reasoning_effort = %q, want explicit low", got)
+	}
+}
+
+func TestDeepSeekV4EffortAliasesSerializeAsHigh(t *testing.T) {
+	for _, model := range []string{"deepseek-v4-flash", "deepseek-v4-pro"} {
+		for _, alias := range []string{"medium", "xhigh"} {
+			p, err := New(provider.Config{Name: "deepseek", BaseURL: "https://api.deepseek.com", Model: model, APIKey: "test", Extra: map[string]any{
+				"effort": alias, "reasoning_protocol": "deepseek",
+			}})
+			if err != nil {
+				t.Fatalf("%s/%s: %v", model, alias, err)
+			}
+			if got := p.(*client).buildRequest(provider.Request{}).ReasoningEffort; got != "high" {
+				t.Fatalf("%s/%s reasoning_effort = %q", model, alias, got)
+			}
+		}
 	}
 }
 
@@ -1244,9 +1263,24 @@ func TestBuildRequestUsesProviderSpecificOutputBudget(t *testing.T) {
 		return p.(*client)
 	}
 
+	// Official DeepSeek auto omits max_tokens so the server uses its 384K ceiling.
+	// Effort only selects thinking depth; it must not invent a 16/32/64K cap.
 	deepseek := newClient(t, "https://api.deepseek.com", "deepseek-v4-flash", 0).buildRequest(provider.Request{})
-	if deepseek.MaxTokens != 131072 || deepseek.MaxCompletionTokens != 0 {
-		t.Fatalf("DeepSeek output budget = max_tokens %d, max_completion_tokens %d", deepseek.MaxTokens, deepseek.MaxCompletionTokens)
+	if deepseek.MaxTokens != 0 || deepseek.MaxCompletionTokens != 0 {
+		t.Fatalf("DeepSeek auto budget = max_tokens %d, max_completion_tokens %d, want omitted",
+			deepseek.MaxTokens, deepseek.MaxCompletionTokens)
+	}
+
+	lowEffort, err := New(provider.Config{
+		Name: "test", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-flash",
+		Extra: map[string]any{"effort": "low", "max_output_tokens": 0},
+	})
+	if err != nil {
+		t.Fatalf("New low-effort DeepSeek: %v", err)
+	}
+	lowReq := lowEffort.(*client).buildRequest(provider.Request{})
+	if lowReq.MaxTokens != 0 {
+		t.Fatalf("low-effort auto budget = %d, want omitted", lowReq.MaxTokens)
 	}
 
 	thinkingDisabledProvider, err := New(provider.Config{
@@ -1257,8 +1291,8 @@ func TestBuildRequestUsesProviderSpecificOutputBudget(t *testing.T) {
 		t.Fatalf("New thinking-disabled DeepSeek: %v", err)
 	}
 	thinkingDisabled := thinkingDisabledProvider.(*client).buildRequest(provider.Request{})
-	if thinkingDisabled.MaxTokens != 0 || thinkingDisabled.MaxCompletionTokens != 0 {
-		t.Fatalf("thinking-disabled DeepSeek received an automatic output budget: %+v", thinkingDisabled)
+	if thinkingDisabled.MaxTokens != 0 {
+		t.Fatalf("thinking-disabled DeepSeek auto budget = %d, want omitted", thinkingDisabled.MaxTokens)
 	}
 	effortDisabledProvider, err := New(provider.Config{
 		Name: "test", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-pro",
@@ -1269,7 +1303,7 @@ func TestBuildRequestUsesProviderSpecificOutputBudget(t *testing.T) {
 	}
 	effortDisabled := effortDisabledProvider.(*client).buildRequest(provider.Request{})
 	if effortDisabled.MaxTokens != 0 || effortDisabled.Thinking == nil || effortDisabled.Thinking.Type != "disabled" {
-		t.Fatalf("effort-disabled DeepSeek request = %+v, want thinking disabled without an automatic budget", effortDisabled)
+		t.Fatalf("effort-disabled DeepSeek request = %+v, want thinking disabled with omitted budget", effortDisabled)
 	}
 
 	explicitDisabledProvider, err := New(provider.Config{

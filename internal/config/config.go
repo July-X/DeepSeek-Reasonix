@@ -49,6 +49,7 @@ type Config struct {
 	UI               UIConfig            `toml:"ui"`
 	CLI              CLIConfig           `toml:"cli"`
 	Desktop          DesktopConfig       `toml:"desktop"`
+	Billing          BillingConfig       `toml:"billing"`
 	Telemetry        TelemetryConfig     `toml:"telemetry"`
 	Notifications    NotificationsConfig `toml:"notifications"`
 	Agent            AgentConfig         `toml:"agent"`
@@ -279,7 +280,7 @@ type CLIConfig struct {
 // language, terminal colours, or provider-visible prompt/request data.
 type DesktopConfig struct {
 	Language                string   `toml:"language"`                   // auto|en|zh; empty/auto = browser/OS auto-detect
-	Currency                string   `toml:"currency"`                   // user-global auto|CNY|USD pricing preference shared by desktop and CLI
+	Currency                string   `toml:"currency"`                   // legacy display currency; migrated to [billing].display_currency
 	LayoutStyle             string   `toml:"layout_style"`               // classic|workbench|creation; desktop layout style
 	Theme                   string   `toml:"theme"`                      // auto|dark|light; empty resolves to auto
 	ThemeStyle              string   `toml:"theme_style"`                // graphite|aurora|slate|carbon|nocturne|amber and legacy aliases
@@ -293,17 +294,17 @@ type DesktopConfig struct {
 	CheckUpdates            *bool    `toml:"check_updates"`              // startup update checks; nil keeps the default enabled
 	// UpdateChannel is a legacy compatibility field. It is accepted on read but
 	// ignored and omitted from future canonical writes.
-	UpdateChannel     string   `toml:"update_channel"`
-	Telemetry         *bool    `toml:"telemetry"`          // anonymous launch ping plus scrubbed next-launch native crash diagnostics; nil keeps the default enabled
-	Metrics           *bool    `toml:"metrics"`            // aggregate desktop metrics (anonymous signal/bucket counts, including lifecycle health; no content); nil keeps the default enabled
-	ProviderAccess    []string `toml:"provider_access"`    // desktop-only list of provider entries shown in Settings > Model > Access
-	ExpandThinking    bool     `toml:"expand_thinking"`    // true = show reasoning text expanded by default; false = collapsed
-	ConversationWidth string   `toml:"conversation_width"` // standard|full; max transcript width; empty = standard
+	UpdateChannel        string   `toml:"update_channel"`
+	Telemetry            *bool    `toml:"telemetry"`       // anonymous launch ping plus scrubbed next-launch native crash diagnostics; nil keeps the default enabled
+	Metrics              *bool    `toml:"metrics"`         // aggregate desktop metrics (anonymous signal/bucket counts, including lifecycle health; no content); nil keeps the default enabled
+	ProviderAccess       []string `toml:"provider_access"` // desktop-only list of provider entries shown in Settings > Model > Access
+	ExpandThinking       bool     `toml:"expand_thinking"` // deprecated compatibility alias: true maps to auto
+	ReasoningDisplayMode string   `toml:"reasoning_display_mode"`
+	ConversationWidth    string   `toml:"conversation_width"` // standard|full; max transcript width; empty = standard
 }
 
-// DesktopExternalOpener returns the user-selected external opener id. The
-// desktop shell resolves it against applications installed on the current OS;
-// an empty or unavailable id safely falls back to the platform file manager.
+// DesktopExternalOpener returns the selected opener id; unavailable ids fall
+// back to the platform file manager in the desktop shell.
 func (c *Config) DesktopExternalOpener() string {
 	if c == nil {
 		return ""
@@ -1278,6 +1279,13 @@ type AgentConfig struct {
 	SubagentEffort      string            `toml:"subagent_effort"`
 	SubagentEfforts     map[string]string `toml:"subagent_efforts"`
 	MaxSubagentDepth    int               `toml:"max_subagent_depth"`
+	// TaskCostBudget lands a task on one summary once it spends this much.
+	TaskCostBudget float64 `toml:"task_cost_budget"`
+	// TaskTimeBudgetMinutes is the same gate on wall clock. Both ship off.
+	TaskTimeBudgetMinutes float64 `toml:"task_time_budget_minutes"`
+	// GoalTokenBudget bounds an unattended Goal loop by cumulative tokens.
+	// Off unless set: a Goal runs until it finishes or you stop it.
+	GoalTokenBudget int `toml:"goal_token_budget"`
 	// MaxSubagentConcurrency bounds how many sub-agents (task, fleet items,
 	// profile skills, nested children) may run at once in one session.
 	// 0 means the default (6). Values outside 1–32 are clamped on load.
@@ -1302,14 +1310,15 @@ type AgentConfig struct {
 	// Deprecated compatibility field paired with AutoPlan. Old TOML remains
 	// readable, but loading clears it and rendering omits it.
 	AutoPlanClassifier string `toml:"auto_plan_classifier"`
-	// Compaction window fractions: soft = notice only, compact = trigger, force = hard ceiling.
+	// Soft/snip/force are retired compatibility keys; only CompactRatio is active.
 	SoftCompactRatio    float64 `toml:"soft_compact_ratio"`
 	ToolResultSnipRatio float64 `toml:"tool_result_snip_ratio"`
 	CompactRatio        float64 `toml:"compact_ratio"`
 	CompactForceRatio   float64 `toml:"compact_force_ratio"`
-	// Keep controls which compactable messages stay verbatim beyond the current
-	// user-fact/digest floor and recent tail. Empty uses the conservative default
-	// of keeping error tool results.
+	// ContextEditing is retired; native tool clearing is no longer an auto path.
+	ContextEditing string `toml:"context_editing"`
+	// Keep and RecentKeep are deprecated compatibility fields. They remain
+	// readable and writable but Harness-style compaction ignores them.
 	Keep       []string `toml:"keep"`
 	RecentKeep int      `toml:"recent_keep"`
 	// ColdResumePrune elides stale tool results when a session reopens past the
@@ -1318,6 +1327,7 @@ type AgentConfig struct {
 	// PlanModeReadOnlyCommands is retained for old config/session round trips. Main
 	// Plan bash calls now use the ordinary Permissions classifier and Sandbox.
 	PlanModeReadOnlyCommands []string `toml:"plan_mode_read_only_commands"`
+	LegacyAnchorSafetyGate   bool     `toml:"legacy_anchor_safety_gate"` // user-global rollback to the full-read guard
 }
 
 // ProviderEntry declares a model provider instance. ContextWindow is the model's
@@ -1327,11 +1337,12 @@ type ProviderEntry struct {
 	Name          string            `toml:"name"`
 	Kind          string            `toml:"kind"`
 	BaseURL       string            `toml:"base_url"`
-	ChatURL       string            `toml:"chat_url"`
-	Model         string            `toml:"model"`      // a single model (back-compat)
-	Models        []string          `toml:"models"`     // a vendor's model list (one base_url/key, many models)
-	ModelsURL     string            `toml:"models_url"` // auto-fetch models from this URL on startup
-	Default       string            `toml:"default"`    // default model when Models is set (else Models[0])
+	ChatURL       string            `toml:"chat_url"`    // legacy OpenAI chat endpoint override; retained with its historical semantics
+	RequestURL    string            `toml:"request_url"` // exact provider request URL written by current settings UI
+	Model         string            `toml:"model"`       // a single model (back-compat)
+	Models        []string          `toml:"models"`      // a vendor's model list (one base_url/key, many models)
+	ModelsURL     string            `toml:"models_url"`  // auto-fetch models from this URL on startup
+	Default       string            `toml:"default"`     // default model when Models is set (else Models[0])
 	APIKeyEnv     string            `toml:"api_key_env"`
 	PresetID      string            `toml:"preset_id"`      // curated preset identity; UI-only metadata, not sent to model providers.
 	PresetVersion int               `toml:"preset_version"` // curated preset schema version for future migrations.
@@ -1349,12 +1360,20 @@ type ProviderEntry struct {
 	resolvedSource    CredentialSource
 	BalanceURL        string `toml:"balance_url"` // optional; a provider-specific wallet-balance endpoint (DeepSeek: https://api.deepseek.com/user/balance). Empty = no balance readout.
 	ContextWindow     int    `toml:"context_window"`
-	// MaxOutputTokens is a protocol-neutral total output budget. Zero lets the
-	// provider choose a safe default, a positive value is explicit, and a
-	// negative value omits optional wire limits. Anthropic still requires one.
+	// MaxOutputTokens is a protocol-neutral total output budget for one turn.
+	// Zero means official DeepSeek omits the field (server 384K ceiling) and
+	// other vendors keep their own defaults. Effort selects thinking depth only.
+	// A positive value is an explicit cost cap. A negative value omits optional
+	// wire limits when the protocol allows; official DeepSeek Anthropic still
+	// sends 384K because max_tokens is mandatory. Never feeds compact_ratio.
 	MaxOutputTokens int                          `toml:"max_output_tokens"`
 	Price           *provider.Pricing            `toml:"price"`  // legacy/provider-wide fallback
 	Prices          map[string]*provider.Pricing `toml:"prices"` // optional per-model prices; keys are model ids
+	// BillingCurrency is the frozen list-price currency (ISO-4217). Independent
+	// of [billing].display_currency; switching display never rewrites this.
+	BillingCurrency string `toml:"billing_currency"`
+	// BillingMode is payg (default) or subscription_equivalent (e.g. MiMo Token Plan).
+	BillingMode string `toml:"billing_mode"`
 
 	persistedOfficialCurrency string
 
@@ -1730,49 +1749,6 @@ func (s MCPConfigSource) ProjectScoped() bool {
 	return s == MCPSourceProjectConfig || s == MCPSourceProjectMCPJSON
 }
 
-// PluginEntry declares an external MCP server. Type selects the transport:
-// "stdio" (default) launches Command/Args/Env as a subprocess; "http"
-// (a.k.a. streamable-http) and "sse" connect to a remote URL with optional
-// static Headers. String fields support ${VAR} / ${VAR:-default} expansion so
-// secrets (bearer tokens, keys) come from the environment, not the file. The
-// fields mirror Claude Code's mcpServers spec, so entries can come from either
-// reasonix.toml's [[plugins]] or a project-root .mcp.json (see loadMCPJSON).
-type PluginEntry struct {
-	Name    string            `toml:"name"`
-	Type    string            `toml:"type"` // "stdio" (default) | "http" | "sse"
-	Command string            `toml:"command"`
-	Args    []string          `toml:"args"`
-	Env     map[string]string `toml:"env"`
-	URL     string            `toml:"url"`
-	Headers map[string]string `toml:"headers"`
-	// StartupTimeoutSeconds overrides [tools].mcp_startup_timeout_seconds for
-	// initialize + tools/list. Zero keeps the global/default cap.
-	StartupTimeoutSeconds int `toml:"startup_timeout_seconds"`
-	// CallTimeoutSeconds overrides the default per-call deadline for this MCP
-	// server. Zero falls back to [tools].mcp_call_timeout_seconds.
-	CallTimeoutSeconds int `toml:"call_timeout_seconds"`
-	// ToolTimeoutSeconds overrides the per-call deadline for raw MCP tool names
-	// from this server. Keys are server-local tool names, not model-visible
-	// mcp__server__tool names.
-	ToolTimeoutSeconds map[string]int `toml:"tool_timeout_seconds"`
-	// AutoStart controls whether the server connects during session startup.
-	// Nil preserves historical behavior: configured servers start automatically.
-	AutoStart *bool `toml:"auto_start"`
-	// Tier is a legacy compatibility field. New config rendering omits it; enabled
-	// MCP servers connect automatically in the background unless auto_start=false.
-	// Historical values are accepted for old files:
-	//   "eager"      — blocks startup until the handshake completes; required for
-	//                  servers whose tools the system prompt depends on.
-	//   "lazy"       — legacy alias for background.
-	//   "background" — placeholder + spawn fired at boot but not waited on;
-	//                  swap happens once the spawn finishes.
-	// Empty defaults to "background" so enabled MCPs connect automatically
-	// without blocking chat. Unknown non-empty values fall back to "background".
-	Tier         string          `toml:"tier"`
-	Source       MCPConfigSource `toml:"-" json:"-"`
-	expansionEnv map[string]string
-}
-
 func (e PluginEntry) ShouldAutoStart() bool {
 	return e.AutoStart == nil || *e.AutoStart
 }
@@ -1851,11 +1827,12 @@ const LanguagePolicy = `Reply in the same language the user is using in their mo
 // Default returns the built-in default configuration.
 func Default() *Config {
 	return &Config{
-		ConfigVersion:    5,
+		ConfigVersion:    7,
 		DefaultModel:     "deepseek-flash",
 		CredentialsStore: CredentialsStoreAuto,
 		UI:               UIConfig{Theme: "auto", ShowTurnUsage: true},
 		Desktop:          DesktopConfig{DefaultToolApprovalMode: "auto", ConversationWidth: "standard"},
+		Billing:          BillingConfig{},
 		Notifications: NotificationsConfig{
 			Enabled:         false,
 			TurnDone:        true,
@@ -1866,13 +1843,15 @@ func Default() *Config {
 			SystemPrompt: DefaultSystemPrompt,
 			// Normal interactive execution has no configurable total round cap. It
 			// is bounded by adaptive progress guards and context compaction instead.
-			MaxSteps:               0,
-			PlannerMaxSteps:        0,
-			AutoPlan:               "off",
-			SoftCompactRatio:       0.5,
-			ToolResultSnipRatio:    0.6,
-			CompactRatio:           0.8,
-			CompactForceRatio:      0.9,
+			MaxSteps:        0,
+			PlannerMaxSteps: 0,
+			AutoPlan:        "off",
+			// Soft/snip/force are load-only compatibility; CompactRatio alone drives maintenance.
+			SoftCompactRatio:       0,
+			ToolResultSnipRatio:    0,
+			CompactRatio:           0.80,
+			CompactForceRatio:      0,
+			ContextEditing:         "",
 			MaxSubagentDepth:       2,
 			MaxSubagentConcurrency: 6,
 			MaxParallelWriters:     3,
@@ -1892,7 +1871,7 @@ func Default() *Config {
 		Network: NetworkConfig{ProxyMode: netclient.ModeAuto},
 		Bot: BotConfig{
 			ToolApprovalMode:   "ask",
-			MaxSteps:           25,
+			MaxSteps:           0,
 			DebounceMs:         1500,
 			QueueMode:          "steer",
 			QueueCap:           20,
@@ -1905,9 +1884,27 @@ func Default() *Config {
 			Feishu:             FeishuBotConfig{Domain: "feishu", AppSecretEnv: "FEISHU_BOT_APP_SECRET", Mode: "webhook", WebhookPort: 8080, RequireMention: true},
 			Weixin:             WeixinBotConfig{AccountID: "default", TokenEnv: "WEIXIN_BOT_TOKEN", APIBase: "https://ilinkai.weixin.qq.com"},
 		},
+		// New installs use DeepSeek's Anthropic-compatible Messages endpoint so
+		// provider-executed web search is available by default. Existing explicit
+		// provider entries are merged on top of these defaults and keep their
+		// configured protocol unchanged.
 		Providers: []ProviderEntry{
-			{Name: "deepseek-flash", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-flash", APIKeyEnv: "DEEPSEEK_API_KEY", BalanceURL: "https://api.deepseek.com/user/balance", ContextWindow: 1_000_000, Price: deepSeekV4FlashPriceUSD()},
-			{Name: "deepseek-pro", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-pro", APIKeyEnv: "DEEPSEEK_API_KEY", BalanceURL: "https://api.deepseek.com/user/balance", ContextWindow: 1_000_000, Price: deepSeekV4ProPriceUSD()},
+			{
+				Name: "deepseek-flash", Kind: "anthropic", BaseURL: deepSeekAnthropicBaseURL,
+				Model: "deepseek-v4-flash", APIKeyEnv: "DEEPSEEK_API_KEY",
+				BalanceURL: "https://api.deepseek.com/user/balance", Thinking: "enabled",
+				WebSearch: boolPointer(true), SupportedEfforts: []string{"disabled", "low", "high", "max"}, DefaultEffort: "high",
+				ContextWindow: 1_000_000, Price: deepSeekV4FlashPriceUSD(),
+				BillingCurrency: "USD", BillingMode: "payg",
+			},
+			{
+				Name: "deepseek-pro", Kind: "anthropic", BaseURL: deepSeekAnthropicBaseURL,
+				Model: "deepseek-v4-pro", APIKeyEnv: "DEEPSEEK_API_KEY",
+				BalanceURL: "https://api.deepseek.com/user/balance", Thinking: "enabled",
+				WebSearch: boolPointer(true), SupportedEfforts: []string{"disabled", "low", "high", "max"}, DefaultEffort: "high",
+				ContextWindow: 1_000_000, Price: deepSeekV4ProPriceUSD(),
+				BillingCurrency: "USD", BillingMode: "payg",
+			},
 		},
 	}
 }
@@ -1945,6 +1942,9 @@ func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
 		return nil, false
 	}
 	if access := desktopProviderAccessMap(c.Desktop.ProviderAccess); len(access) > 0 {
+		if access["deepseek"] && !canCanonicalizeLegacyDeepSeekProviders(c) {
+			delete(access, "deepseek")
+		}
 		ref = retargetDesktopOfficialRef(ref, access)
 	}
 	// "provider/model"

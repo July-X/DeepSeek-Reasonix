@@ -63,10 +63,6 @@ type vendorCapabilities struct {
 	// back to ordinary summarize without inheriting a large default".
 	compactionOutputTokens int
 
-	// nativeCompaction marks vendors with a dedicated compact endpoint.
-	// When false, agents must use ordinary summarize fallback.
-	nativeCompaction bool
-
 	// summaryRequired marks vendors whose Responses API requires the
 	// `summary` list on input reasoning items (DashScope; without it the
 	// server rejects with "Invalid 'summary': summary is required..."). The
@@ -95,10 +91,11 @@ var vendorTable = map[string]vendorCapabilities{
 		toolCallReasoning:      true,
 		singleSegmentReasoning: false,
 		ignoresTemperature:     false,
-		defaultMaxOutputTokens: provider.DefaultHighOutputTokens,
-		// Compaction summaries are short briefings; keep the budget separate
-		// from ordinary answer output so a summary call cannot inherit 32K.
-		compactionOutputTokens: 4096,
+		// 0 = omit max_output_tokens; official server ceiling is 384K.
+		defaultMaxOutputTokens: 0,
+		// Compaction summaries use a dedicated 16K-class budget, independent of
+		// ordinary answer output.
+		compactionOutputTokens: provider.DefaultOrdinaryOutputTokens,
 	},
 	"mimo": {
 		stateless:              true,
@@ -106,8 +103,25 @@ var vendorTable = map[string]vendorCapabilities{
 		toolCallReasoning:      true,
 		singleSegmentReasoning: true,
 		ignoresTemperature:     true,
-		defaultMaxOutputTokens: 128000,
-		compactionOutputTokens: 4096,
+		// Coding-agent default 32K; users may raise explicitly. Not 128K auto.
+		defaultMaxOutputTokens: provider.DefaultReasoningOutputTokens,
+		compactionOutputTokens: provider.DefaultOrdinaryOutputTokens,
+	},
+	// StepFun's Responses API accepts reasoning items only with a `summary`
+	// list and silently ignores previous_response_id (verified live: a
+	// continuation request billed only the new-turn tokens and the model
+	// hallucinated unrelated context), so it is stateless like DeepSeek but
+	// needs the summary field like DashScope. Only step-3.7-flash is enabled
+	// server-side; the wire shape is identical on the standard and step_plan
+	// hosts, so one entry covers both.
+	"stepfun": {
+		stateless:              true,
+		sessionCacheHeader:     false,
+		toolCallReasoning:      true,
+		singleSegmentReasoning: false,
+		ignoresTemperature:     false,
+		summaryRequired:        true,
+		compactionOutputTokens: provider.DefaultOrdinaryOutputTokens,
 	},
 	// "" (unknown OpenAI-compatible endpoint) → zero value = default behavior.
 	// Unknown gateways deliberately do NOT inherit a large max-output default.
@@ -134,6 +148,8 @@ func DetectVendor(baseURL string) string {
 		return "deepseek"
 	case host == "api.xiaomimimo.com", strings.HasSuffix(host, ".xiaomimimo.com"):
 		return "mimo"
+	case host == "api.stepfun.com", host == "api.stepfun.ai":
+		return "stepfun"
 	default:
 		return ""
 	}

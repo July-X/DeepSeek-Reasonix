@@ -46,6 +46,41 @@ func TestToWireStreamAttemptJSON(t *testing.T) {
 	}
 }
 
+func TestToWireWorkspaceChangedKeepsBoundedEmptyArrays(t *testing.T) {
+	w := ToWire(event.Event{Kind: event.WorkspaceChanged, Workspace: &event.WorkspaceChangedPayload{
+		Revisions:  event.WorkspaceRevision{Content: 4, Tree: 2, WorkingTree: 3, GitMeta: 1, Session: 7},
+		WatchState: event.WorkspaceWatchDegraded,
+		Source:     "reconcile",
+	}})
+	if w.Workspace == nil || w.Workspace.Changes == nil {
+		t.Fatalf("workspace payload/changes must be non-nil: %+v", w.Workspace)
+	}
+	b, err := json.Marshal(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"kind":"workspace_changed"`, `"changes":[]`, `"watchState":"degraded"`, `"session":7`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("workspace JSON = %s, missing %s", b, want)
+		}
+	}
+}
+
+func TestToWireContextMaintenanceJSON(t *testing.T) {
+	w := ToWire(event.Event{Kind: event.ContextMaintenanceEvent, Maintenance: &event.ContextMaintenance{
+		Status: "applied", Action: "prune", SavedTokens: 4096, ProjectionVersion: 3, CacheBreak: true,
+	}})
+	b, err := json.Marshal(w)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, want := range []string{`"kind":"context_maintenance"`, `"action":"prune"`, `"savedTokens":4096`, `"projectionVersion":3`, `"cacheBreak":true`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("context maintenance JSON = %s, want %s", b, want)
+		}
+	}
+}
+
 func TestToWireNoticeCarriesCode(t *testing.T) {
 	w := ToWire(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodeFinalReadiness, Text: "readiness copy"})
 	b, err := json.Marshal(w)
@@ -70,6 +105,21 @@ func TestToWireNoticeCarriesCode(t *testing.T) {
 	}
 	if strings.Contains(string(b), `"code"`) {
 		t.Fatalf("non-notice JSON = %s, must not carry a code", b)
+	}
+}
+
+func TestToWireWriteAccessApprovalKeepsNonNilArrays(t *testing.T) {
+	w := ToWire(event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{
+		ID: "a3", Tool: "bash", Subject: "install", Kind: event.ApprovalKindWriteAccess,
+		WriteAccess: event.NormalizeWriteAccessApproval(&event.WriteAccessApproval{}),
+	}})
+	b, err := json.Marshal(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	if !strings.Contains(body, `"write_access"`) || !strings.Contains(body, `"directories":[]`) {
+		t.Fatalf("write_access arrays must be [] not null: %s", body)
 	}
 }
 
@@ -178,6 +228,21 @@ func TestToWireToolCarriesResolvedCapabilityMetadata(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("tool JSON = %s, want %s", b, want)
 		}
+	}
+}
+
+func TestToWireToolOmitsHostOnlyWorkspaceMutationMetadata(t *testing.T) {
+	privatePath := "/Users/private/secret-project/file.go"
+	w := ToWire(event.Event{Kind: event.ToolResult, Tool: event.Tool{
+		ID: "c1", Name: "write_file", WorkspaceMutation: true,
+		WorkspacePaths: []string{privatePath}, WorkspaceAllPaths: true,
+	}})
+	b, err := json.Marshal(w)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), privatePath) || strings.Contains(string(b), "workspaceMutation") || strings.Contains(string(b), "workspacePaths") {
+		t.Fatalf("host-only workspace metadata leaked into eventwire JSON: %s", b)
 	}
 }
 

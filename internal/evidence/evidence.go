@@ -2,7 +2,6 @@ package evidence
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -21,11 +20,15 @@ import (
 )
 
 // TodoItem mirrors the todo_write item shape the host needs for step matching.
+// StepID is the item's stable identity: it survives a retitle and a reorder, so
+// completion attribution never has to be inferred from wording or position. It
+// is optional — a list written freehand has none, and matches by text instead.
 type TodoItem struct {
 	Content    string `json:"content"`
 	Status     string `json:"status"`
 	ActiveForm string `json:"activeForm,omitempty"`
 	Level      int    `json:"level,omitempty"`
+	StepID     string `json:"step_id,omitempty"`
 }
 
 // ValidateSerialTodos enforces the task-list state machine promised by
@@ -320,36 +323,15 @@ func AdvanceSerialTodo(todos []TodoItem, index int) bool {
 	return true
 }
 
-// TodoStepMatch is the result of matching complete_step.step against the latest
-// successful todo_write list in this turn.
+// TodoStepMatch is the result of matching a complete_step citation against the
+// latest successful todo_write list in this turn.
 type TodoStepMatch struct {
 	Found      bool
 	Index      int
 	Content    string
 	Status     string
 	ActiveForm string
-}
-
-// Receipt is the host-runtime record of one tool call. It stays in memory for
-// the current agent turn and is not serialized into prompts or session state.
-type Receipt struct {
-	ToolName  string          `json:"tool_name"`
-	Args      json.RawMessage `json:"args,omitempty"`
-	Profile   string          `json:"profile,omitempty"`
-	Success   bool            `json:"success"`
-	Command   string          `json:"command,omitempty"`
-	Step      string          `json:"step,omitempty"`
-	StepProof bool            `json:"step_proof,omitempty"`
-	TodoStep  *TodoStepMatch  `json:"todo_step,omitempty"`
-	Paths     []string        `json:"paths,omitempty"`
-	Read      bool            `json:"read,omitempty"`
-	Write     bool            `json:"write,omitempty"`
-	Mutation  bool            `json:"mutation,omitempty"`
-	Todos     []TodoItem      `json:"todos,omitempty"`
-	// OutputBytes is the host-observed length of the tool's (redacted, trimmed)
-	// output. Content-evidence checks require it to be non-zero so a command
-	// that printed nothing (head -n 0, >/dev/null) can never count as reading.
-	OutputBytes int `json:"output_bytes,omitempty"`
+	StepID     string
 }
 
 // BackgroundLease identifies a background job whose evidence was provisionally
@@ -377,6 +359,8 @@ type DeliveryCheckpoint struct {
 type Ledger struct {
 	mu               sync.Mutex
 	receipts         []Receipt
+	observations     []TextObservation
+	nextSequence     uint64
 	backgroundLeases []BackgroundLease
 }
 
@@ -390,6 +374,8 @@ func (l *Ledger) Reset() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.receipts = nil
+	l.observations = nil
+	l.nextSequence = 0
 	l.backgroundLeases = nil
 }
 
@@ -458,6 +444,8 @@ func (l *Ledger) Record(r Receipt) {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.nextSequence++
+	r.Sequence = l.nextSequence
 	if r.ToolName == "complete_step" && r.Step != "" && r.TodoStep == nil {
 		if match := latestTodoStep(r.Step, l.receipts); match.Found {
 			r.TodoStep = &match
@@ -541,54 +529,6 @@ func (l *Ledger) HasWriteOrCommandSince(index int) bool {
 		}
 	}
 	return false
-}
-
-// SuccessfulProgressSignaturesSince returns stable identities for successful
-// host-observed work recorded at or after index. Callers can keep a per-turn set
-// of these signatures so a new read, command, or mutation renews an execution
-// lease while exact repeats do not masquerade as progress.
-func (l *Ledger) SuccessfulProgressSignaturesSince(index int) []string {
-	if l == nil {
-		return nil
-	}
-	if index < 0 {
-		index = 0
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	var out []string
-	for i := index; i < len(l.receipts); i++ {
-		if sig, ok := progressReceiptSignature(l.receipts[i]); ok {
-			out = append(out, sig)
-		}
-	}
-	return out
-}
-
-func progressReceiptSignature(r Receipt) (string, bool) {
-	if !r.Success {
-		return "", false
-	}
-	kind := ""
-	switch {
-	case r.Mutation || r.Write:
-		kind = "mutation"
-	case r.Command != "":
-		kind = "command"
-	case r.Read && r.OutputBytes > 0:
-		kind = "read"
-	default:
-		return "", false
-	}
-	payload := strings.TrimSpace(string(r.Args))
-	var decoded any
-	if json.Unmarshal(r.Args, &decoded) == nil {
-		if canonical, err := json.Marshal(decoded); err == nil {
-			payload = string(canonical)
-		}
-	}
-	sum := sha256.Sum256([]byte(kind + "\x00" + r.ToolName + "\x00" + payload))
-	return fmt.Sprintf("%x", sum), true
 }
 
 func (l *Ledger) HasSuccessfulCommand(command string) bool {
@@ -1063,7 +1003,7 @@ func MatchStep(step string, todos []TodoItem) (TodoStepMatch, bool) {
 func MatchTodoIdentity(todo TodoItem, todos []TodoItem) (TodoStepMatch, bool) {
 	for i, candidate := range todos {
 		if sameTodoIdentity(todo, candidate) {
-			return TodoStepMatch{Found: true, Index: i + 1, Content: candidate.Content, Status: candidate.Status, ActiveForm: candidate.ActiveForm}, true
+			return todoMatchAt(i+1, candidate), true
 		}
 	}
 	found := -1
@@ -1081,7 +1021,7 @@ func MatchTodoIdentity(todo TodoItem, todos []TodoItem) (TodoStepMatch, bool) {
 		return TodoStepMatch{}, false
 	}
 	candidate := todos[found]
-	return TodoStepMatch{Found: true, Index: found + 1, Content: candidate.Content, Status: candidate.Status, ActiveForm: candidate.ActiveForm}, true
+	return todoMatchAt(found+1, candidate), true
 }
 
 // PreservesCompletedTodoPositions reports whether every previously completed
@@ -1184,12 +1124,19 @@ func (l *Ledger) HasSuccessfulWorkReceipt() bool {
 // HasSuccessfulVerificationCommand reports whether the turn ran at least one
 // command classified as verification rather than inspection or mutation.
 func (l *Ledger) HasSuccessfulVerificationCommand() bool {
+	return l.HasSuccessfulVerificationCommandAfter(-1)
+}
+
+// HasSuccessfulVerificationCommandAfter reports whether verification succeeded
+// after the named receipt index. Mutations before the boundary do not satisfy a
+// role setting's post-change verification floor.
+func (l *Ledger) HasSuccessfulVerificationCommandAfter(after int) bool {
 	if l == nil {
 		return false
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for _, r := range l.receipts {
+	for _, r := range l.receipts[max(after+1, 0):] {
 		if r.Success && r.ToolName == "bash" && bashCommandIsVerification(r.Command) {
 			return true
 		}
@@ -1462,7 +1409,7 @@ func (l *Ledger) hasSuccessfulPaths(paths []string, accept func(Receipt) bool) b
 
 type contextKey struct{}
 type sessionMessagesKey struct{}
-type deliveryProfileKey struct{}
+type closedLoopKey struct{}
 type todoStateKey struct{}
 
 func WithLedger(ctx context.Context, ledger *Ledger) context.Context {
@@ -1477,17 +1424,14 @@ func FromContext(ctx context.Context) (*Ledger, bool) {
 	return ledger, ok && ledger != nil
 }
 
-// WithDeliveryProfile marks tool execution as subject to the delivery-first
-// final-readiness contract. Tools use this only for stricter evidence validation;
-// it is ephemeral host state and is never serialized into sessions or prompts.
-func WithDeliveryProfile(ctx context.Context) context.Context {
-	return context.WithValue(ctx, deliveryProfileKey{}, true)
+// WithClosedLoopExecution marks a tool call for closed-loop evidence checks.
+func WithClosedLoopExecution(ctx context.Context) context.Context {
+	return context.WithValue(ctx, closedLoopKey{}, true)
 }
 
-// DeliveryProfileFromContext reports whether the current tool call must produce
-// evidence that the delivery final-readiness gate can accept.
-func DeliveryProfileFromContext(ctx context.Context) bool {
-	enabled, _ := ctx.Value(deliveryProfileKey{}).(bool)
+// ClosedLoopExecutionFromContext reports whether closed-loop evidence is required.
+func ClosedLoopExecutionFromContext(ctx context.Context) bool {
+	enabled, _ := ctx.Value(closedLoopKey{}).(bool)
 	return enabled
 }
 
@@ -1572,11 +1516,15 @@ func failedSessionCallIDs(msgs []provider.Message) map[string]bool {
 }
 
 func ReceiptFromToolCall(toolName string, args json.RawMessage, success bool, readOnly bool) Receipt {
+	effects := ClassifyToolCall(toolName, args, readOnly)
 	r := Receipt{
 		ToolName: toolName,
 		Args:     args,
 		Success:  success,
-		Mutation: ToolCallMutates(toolName, args, readOnly),
+		// Receipt.Mutation is delivery content debt. Repository-only state
+		// transitions such as a pure commit remain guarded writers, but do not
+		// force another content review pass by themselves.
+		Mutation: effects.ContentMutation,
 	}
 
 	var fields map[string]json.RawMessage
@@ -1605,37 +1553,33 @@ func ReceiptFromToolCall(toolName string, args json.RawMessage, success bool, re
 	return r
 }
 
-// ToolCallMutates is the delivery profile's conservative state-change
-// classifier. Trusted read-only tools never mutate. Meta tools that only
-// delegate (task, run_skill, review, …) never mutate by themselves — real
-// writes arrive via child evidence merge. Writer-capable tools do mutate,
-// except for bash commands that the host can prove are inspection or
-// verification commands.
-func ToolCallMutates(toolName string, args json.RawMessage, readOnly bool) bool {
-	if readOnly {
-		return false
+// ToolCallPaths returns the bounded, structurally declared file paths in a
+// tool call. It intentionally does not attempt to parse shell scripts; callers
+// must treat bash and unknown targets as allPaths when invalidation is needed.
+func ToolCallPaths(args json.RawMessage) []string {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(args, &fields); err != nil {
+		return nil
 	}
-	if IsNonMutationMetaTool(toolName) {
-		return false
-	}
-	switch toolName {
-	case "ask", "todo_write", "complete_step", "bash_output", "wait":
-		return false
-	case "bash":
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(args, &fields); err != nil {
-			return true
+	paths := extractPaths(fields)
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
 		}
-		return bashMayMutate(stringField(fields, "command"))
-	default:
-		return true
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
 	}
+	return out
 }
 
-// ToolCallRequiresDeliveryCriteria reports whether a call begins execution
-// work that needs an acceptance contract. Mutations always qualify; verification
-// commands also qualify even though they are intentionally not mutations.
-func ToolCallRequiresDeliveryCriteria(toolName string, args json.RawMessage, readOnly bool) bool {
+// ToolCallRequiresAcceptanceCriteria reports mutations and verification commands.
+func ToolCallRequiresAcceptanceCriteria(toolName string, args json.RawMessage, readOnly bool) bool {
 	if ToolCallMutates(toolName, args, readOnly) {
 		return true
 	}
@@ -1847,9 +1791,7 @@ func bashContainsVerificationSegment(command string) bool {
 		return false
 	}
 	for _, segment := range segments {
-		normalized, _ := shellsafe.NormalizeBashSafeRedirectsForMatch(segment)
-		fields, malformed := shellparse.StaticFields(normalized)
-		if malformed == "" && bashSegmentIsVerification(fields) {
+		if fields, ok := bashStaticArgv(segment); ok && bashSegmentIsVerification(fields) {
 			return true
 		}
 	}
@@ -1866,18 +1808,14 @@ func bashMayMutate(command string) bool {
 		return true
 	}
 	for _, segment := range segments {
-		normalized, safeRedirects := shellsafe.NormalizeBashSafeRedirectsForMatch(segment)
-		if !safeRedirects {
-			return true
+		normalized, _ := shellsafe.NormalizeBashSafeRedirectsForMatch(segment)
+		if normalized == "" {
+			normalized = segment
 		}
-		if staticFields, malformed := shellparse.StaticFields(normalized); malformed == "" && len(staticFields) > 0 && bashSegmentIsVerification(staticFields) {
+		if fields, ok := bashStaticArgv(normalized); ok && bashSegmentIsVerification(fields) {
 			continue
 		}
-		base, sub, fields, workspaceNonMutating := shellsafe.ClassifyWorkspaceNonMutatingCommand(normalized)
-		if !workspaceNonMutating {
-			return true
-		}
-		if bashReadOnlyCommandWrites(base, sub, fields) {
+		if shellsafe.ClassifyBash(segment).AnyMutation() {
 			return true
 		}
 	}
@@ -1899,26 +1837,31 @@ func bashCommandIsVerification(command string) bool {
 		if !safeRedirects {
 			return false
 		}
-		fields, malformed := shellparse.StaticFields(normalized)
-		if malformed != "" || len(fields) == 0 {
+		fields, ok := bashStaticArgv(normalized)
+		if !ok {
 			return false
 		}
 		if bashSegmentIsVerification(fields) {
 			found = true
 			continue
 		}
-		if _, _, readOnly := shellsafe.CommandIsReadOnly(normalized); !readOnly {
+		if shellsafe.ClassifyBash(normalized).AnyMutation() {
 			return false
 		}
 	}
 	return found
 }
 
-// IsDeliveryVerificationCommand reports whether command is a host-recognized
-// verification command for delivery finalization. Keep complete_step and the
-// final-readiness gate on this single classifier so a sign-off cannot claim a
-// command that the final gate will immediately reject.
-func IsDeliveryVerificationCommand(command string) bool {
+func bashStaticArgv(command string) ([]string, bool) {
+	if fields, _, ok := shellsafe.CommandArgv(command); ok {
+		return fields, true
+	}
+	fields, malformed := shellparse.StaticFields(command)
+	return fields, malformed == "" && len(fields) > 0
+}
+
+// IsVerificationCommand reports whether command is a recognized verifier.
+func IsVerificationCommand(command string) bool {
 	return bashCommandIsVerification(command)
 }
 
@@ -2227,34 +2170,6 @@ func nodeTestFlagWritesFile(arg string) bool {
 	default:
 		return false
 	}
-}
-
-func bashReadOnlyCommandWrites(base, sub string, fields []string) bool {
-	args := fields[1:]
-	if sub != "" && len(args) > 0 {
-		args = args[1:]
-	}
-	switch base {
-	case "find":
-		return hasCommandArg(args, "-exec", "-execdir", "-delete", "-ok", "-okdir", "-fls", "-fprint", "-fprint0", "-fprintf")
-	case "sort":
-		for _, arg := range args {
-			if arg == "-o" || arg == "--output" || strings.HasPrefix(arg, "--output=") || strings.HasPrefix(arg, "-o") {
-				return true
-			}
-		}
-	case "git":
-		if sub == "diff" || sub == "show" || sub == "log" {
-			for _, arg := range args {
-				if arg == "--output" || strings.HasPrefix(arg, "--output=") {
-					return true
-				}
-			}
-		}
-	case "go":
-		return sub == "env" && hasCommandArg(args, "-w", "-u")
-	}
-	return false
 }
 
 func hasCommandArg(args []string, candidates ...string) bool {
@@ -2600,7 +2515,13 @@ func stringField(fields map[string]json.RawMessage, key string) string {
 	return strings.TrimSpace(s)
 }
 
+// completeStepIdentity is the citation a receipt records, most stable first: a
+// step id survives a replan, an index survives a retitle, the title survives
+// neither.
 func completeStepIdentity(fields map[string]json.RawMessage) string {
+	if id := stringField(fields, "step_id"); id != "" {
+		return id
+	}
 	if n, ok := intField(fields, "step_index"); ok && n > 0 {
 		return strconv.Itoa(n)
 	}
@@ -2719,10 +2640,6 @@ func previousTodoCompleted(index int, current TodoItem, previous []TodoItem) boo
 	return false
 }
 
-func sameTodoIdentity(a, b TodoItem) bool {
-	return sameStepText(a.Content, b.Content) || sameStepText(a.ActiveForm, b.ActiveForm)
-}
-
 func hasSuccessfulCompleteStepForTodo(receipts []Receipt, index int, current []TodoItem) bool {
 	for _, r := range receipts {
 		if !r.Success || r.ToolName != "complete_step" || strings.TrimSpace(r.Step) == "" {
@@ -2758,31 +2675,20 @@ func latestTodoStep(step string, receipts []Receipt) TodoStepMatch {
 	return TodoStepMatch{}
 }
 
-func sameTodoMatch(todo TodoItem, match TodoStepMatch) bool {
-	return sameStepText(todo.Content, match.Content) || sameStepText(todo.ActiveForm, match.ActiveForm)
-}
-
-// todoContentRelates reports whether a todo item's preferred text has a
-// recognisable semantic relationship (substring overlap) with the step match
-// that was stored against a previous todo_write list.  It returns true when
-// the model has rephrased the same task, not swapped it for a different one.
-func todoContentRelates(todo TodoItem, match TodoStepMatch) bool {
-	return textOverlaps(todo.Content, match.Content) ||
-		textOverlaps(todo.ActiveForm, match.ActiveForm)
-}
-
-func textOverlaps(a, b string) bool {
-	return stepTextContains(normalizeStepText(a), normalizeStepText(b))
-}
-
+// matchTodoStep resolves a citation to a todo. A stable id wins outright; only
+// a list without ids falls back to position and wording, which a retitle or an
+// inserted step silently invalidates.
 func matchTodoStep(step string, todos []TodoItem) TodoStepMatch {
+	if m, ok := MatchStepID(step, todos); ok {
+		return m
+	}
 	if n, ok := parseStepIndex(normalizeStepText(step)); ok && n >= 1 && n <= len(todos) {
 		t := todos[n-1]
-		return TodoStepMatch{Found: true, Index: n, Content: t.Content, Status: t.Status, ActiveForm: t.ActiveForm}
+		return todoMatchAt(n, t)
 	}
 	for i, t := range todos {
 		if sameStepText(step, t.Content) || sameStepText(step, t.ActiveForm) {
-			return TodoStepMatch{Found: true, Index: i + 1, Content: t.Content, Status: t.Status, ActiveForm: t.ActiveForm}
+			return todoMatchAt(i+1, t)
 		}
 	}
 	// Containment fallback for wording drift; an ambiguous citation (containing
@@ -2799,7 +2705,7 @@ func matchTodoStep(step string, todos []TodoItem) TodoStepMatch {
 	}
 	if found >= 0 {
 		t := todos[found]
-		return TodoStepMatch{Found: true, Index: found + 1, Content: t.Content, Status: t.Status, ActiveForm: t.ActiveForm}
+		return todoMatchAt(found+1, t)
 	}
 	return TodoStepMatch{}
 }

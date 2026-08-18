@@ -15,6 +15,7 @@ import (
 	"reasonix/internal/memory"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
+	"reasonix/internal/sandbox"
 	"reasonix/internal/skill"
 )
 
@@ -49,6 +50,7 @@ type Lifecycle interface {
 type TurnControl interface {
 	Submit(input string)
 	SubmitDisplay(display, input string)
+	SubmitFinalReadinessRecovery(display, input string)
 	SubmitDeliveryRecovery(display, input string)
 	SubmitInvocationDisplay(display, input string, invocations []InvocationRequest)
 	SubmitEditedDisplay(display, input, original string)
@@ -59,6 +61,7 @@ type TurnControl interface {
 	SendWithRaw(input, raw string)
 	Run(ctx context.Context, input string) error
 	RunTurn(ctx context.Context, input string) error
+	RunFinalReadinessRecovery(ctx context.Context, input string) error
 	RunShell(command string)
 	Cancel()
 	Steer(text string)
@@ -75,6 +78,7 @@ type TurnControl interface {
 // posture (ask/auto/yolo). It mirrors the approvalManager surface.
 type Approvals interface {
 	Approve(id string, allow, session, persist bool)
+	ResolveApproval(id string, allow bool, scope sandbox.ApprovalScope) error
 	ResolvePlanDecision(id string, action PlanDecisionAction) error
 	// ResolveRecovery answers an Auto Guard card: continue|continue_task|revise. Revise
 	// refuses the mutation and steers feedback.
@@ -111,6 +115,11 @@ type Goals interface {
 	ResetPlannerSession()
 	PlanMode() bool
 	SetPlanMode(v bool)
+	// AgentPreset is the session role setting (light|balanced|delivery).
+	AgentPreset() string
+	// SetAgentPreset updates the role setting for subsequent turns without
+	// rebuilding the controller.
+	SetAgentPreset(preset string)
 }
 
 // SessionHistory covers checkpoint/rewind, branch/fork, and the log-restructuring
@@ -135,6 +144,7 @@ type SessionHistory interface {
 	SwitchBranch(ref string) (agent.BranchInfo, error)
 	Compact(ctx context.Context, instructions string) error
 	CompactRatio() float64
+	ContextReport() (summary, detail string)
 	SummarizeFrom(ctx context.Context, turn int) error
 	SummarizeUpTo(ctx context.Context, turn int) error
 }
@@ -197,6 +207,7 @@ type Capabilities interface {
 // Status covers read-only run/usage/billing telemetry and task list state.
 type Status interface {
 	ContextSnapshot() (int, int)
+	ContextMaintenanceSnapshot() agent.ContextMaintenanceSnapshot
 	LastUsage() *provider.Usage
 	Balance(ctx context.Context) (*billing.Balance, error)
 	Jobs() []jobs.View
@@ -253,6 +264,7 @@ type SessionAPI interface {
 	SessionPersistence
 	Input
 	Settings
+	Inbox
 }
 
 // Compile-time proof that the concrete controller satisfies each sub-port and
@@ -270,5 +282,6 @@ var (
 	_ SessionPersistence = (*Controller)(nil)
 	_ Input              = (*Controller)(nil)
 	_ Settings           = (*Controller)(nil)
+	_ Inbox              = (*Controller)(nil)
 	_ SessionAPI         = (*Controller)(nil)
 )

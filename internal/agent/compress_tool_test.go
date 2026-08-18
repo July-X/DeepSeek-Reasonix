@@ -3,8 +3,10 @@ package agent
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"reasonix/internal/event"
@@ -57,8 +59,17 @@ func TestCompressContextBeforePreservesCanonicalAndTail(t *testing.T) {
 	if len(prov.got) < 2 || strings.Contains(prov.got[1].Content, local.Content) {
 		t.Fatalf("LocalOnly content reached summarizer: %+v", prov.got)
 	}
-	if reasons := sess.DrainContentRewriteReasons(); !reflect.DeepEqual(reasons, []string{"compact_tool"}) {
-		t.Fatalf("cache reasons = %v, want [compact_tool]", reasons)
+	state := a.sess.compactionState
+	if state.Generation != 1 || state.Projection.ViewInputHash == "" || state.Projection.ViewOutputHash == "" {
+		t.Fatalf("range compression did not install complete v3 lineage: %+v", state)
+	}
+	if state.LastReceipt == nil || state.LastReceipt.Status != "applied" || state.LastReceipt.Action != "summary" ||
+		state.LastReceipt.Trigger != CompactionTriggerTool {
+		t.Fatalf("range compression receipt = %+v", state.LastReceipt)
+	}
+	// New summary checkpoints do not create archives; full originals stay in canonical.
+	if state.LastReceipt.Archive != "" {
+		t.Fatalf("summary checkpoint should not create archive, got %q", state.LastReceipt.Archive)
 	}
 }
 
@@ -75,7 +86,13 @@ func TestCompressContextAfterExcludesActiveTurnAndAppendsToolResult(t *testing.T
 		currentCall,
 	}}
 	before := sess.Snapshot()
-	a := New(&fakeProvider{reply: "completed turns summarized"}, tool.NewRegistry(), sess, Options{}, event.Discard)
+	telemetry := ""
+	sink := event.FuncSink(func(e event.Event) {
+		if e.Kind == event.Notice && e.Text == "compaction telemetry" {
+			telemetry = e.Detail
+		}
+	})
+	a := New(&fakeProvider{reply: "completed turns summarized"}, tool.NewRegistry(), sess, Options{}, sink)
 	a.activeTurnCreatedAt.Store(activeCreatedAt)
 
 	got, err := a.CompressContext(context.Background(), tool.CompressRequest{Direction: "after", Anchor: "folding at alpha"})
@@ -84,6 +101,9 @@ func TestCompressContextAfterExcludesActiveTurnAndAppendsToolResult(t *testing.T
 	}
 	if got.Status != "ok" || got.Messages != 4 {
 		t.Fatalf("result = %+v", got)
+	}
+	if !strings.Contains(telemetry, "summary_input="+SummaryInputNonPrefix) {
+		t.Fatalf("telemetry = %q, want non-prefix summary input", telemetry)
 	}
 	if !reflect.DeepEqual(sess.Snapshot(), before) {
 		t.Fatal("compress changed the active canonical turn")
@@ -123,7 +143,7 @@ func TestCompressContextAnchorErrorsDoNotChangeState(t *testing.T) {
 			t.Fatalf("anchor %q error = %v, want %q", tc.anchor, err, tc.want)
 		}
 	}
-	if !reflect.DeepEqual(sess.Snapshot(), before) || len(a.compactionState.Projection.Messages) != 0 {
+	if !reflect.DeepEqual(sess.Snapshot(), before) || len(a.sess.compactionState.Projection.Messages) != 0 {
 		t.Fatal("failed anchor lookup changed state")
 	}
 }
@@ -206,7 +226,7 @@ func TestCompressContextNoSavingsIsNoop(t *testing.T) {
 	if got.Status != "noop" || !strings.Contains(got.Reason, "not be smaller") {
 		t.Fatalf("result = %+v", got)
 	}
-	if len(a.compactionState.Projection.Messages) != 0 {
+	if len(a.sess.compactionState.Projection.Messages) != 0 {
 		t.Fatal("noop installed a projection")
 	}
 	if reasons := sess.DrainContentRewriteReasons(); len(reasons) != 0 {
@@ -214,9 +234,61 @@ func TestCompressContextNoSavingsIsNoop(t *testing.T) {
 	}
 }
 
+func TestCompressContextFailureDoesNotArchiveUncommittedRange(t *testing.T) {
+	archiveDir := t.TempDir()
+	sess := &Session{Messages: []provider.Message{
+		{Role: provider.RoleSystem, Content: "sys"},
+		{Role: provider.RoleUser, Content: "old unique"},
+		{Role: provider.RoleAssistant, Content: strings.Repeat("work ", 200)},
+		{Role: provider.RoleUser, Content: "keep unique"},
+	}}
+	a := New(&fakeProvider{streamErr: errors.New("summary unavailable")}, tool.NewRegistry(), sess, Options{ArchiveDir: archiveDir}, event.Discard)
+
+	if _, err := a.CompressContext(context.Background(), tool.CompressRequest{Direction: "before", Anchor: "keep unique"}); err == nil {
+		t.Fatal("CompressContext succeeded with a failed summarizer")
+	}
+	entries, err := os.ReadDir(archiveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed range compression left %d archive files", len(entries))
+	}
+	if a.sess.compactionState.Generation != 0 || a.sess.compactionState.LastReceipt != nil {
+		t.Fatalf("failed range compression changed sidecar state: %+v", a.sess.compactionState)
+	}
+}
+
 type staleCompressProvider struct {
 	started chan struct{}
 	release chan struct{}
+}
+
+type singleflightCompressProvider struct {
+	calls   atomic.Int32
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *singleflightCompressProvider) Name() string { return "singleflight-compress" }
+
+func (p *singleflightCompressProvider) Stream(_ context.Context, _ provider.Request) (<-chan provider.Chunk, error) {
+	n := p.calls.Add(1)
+	ch := make(chan provider.Chunk, 2)
+	if n == 1 {
+		close(p.started)
+		go func() {
+			<-p.release
+			ch <- provider.Chunk{Type: provider.ChunkText, Text: "summary"}
+			ch <- provider.Chunk{Type: provider.ChunkDone}
+			close(ch)
+		}()
+		return ch, nil
+	}
+	ch <- provider.Chunk{Type: provider.ChunkText, Text: "duplicate summary"}
+	ch <- provider.Chunk{Type: provider.ChunkDone}
+	close(ch)
+	return ch, nil
 }
 
 func (p *staleCompressProvider) Name() string { return "stale-compress" }
@@ -253,10 +325,56 @@ func TestCompressContextRejectsStaleTranscript(t *testing.T) {
 	if err := <-errCh; !errors.Is(err, errCompressStaleContext) {
 		t.Fatalf("error = %v, want stale context", err)
 	}
-	if len(a.compactionState.Projection.Messages) != 0 {
+	if len(a.sess.compactionState.Projection.Messages) != 0 {
 		t.Fatal("stale compression installed a projection")
 	}
 	if reasons := sess.DrainContentRewriteReasons(); len(reasons) != 0 {
 		t.Fatalf("stale compression reported cache rewrite reasons: %v", reasons)
+	}
+}
+
+func TestRangeCompressionSharesSummarySingleflight(t *testing.T) {
+	prov := &singleflightCompressProvider{started: make(chan struct{}), release: make(chan struct{})}
+	sess := &Session{Messages: []provider.Message{
+		{Role: provider.RoleSystem, Content: "sys"},
+		{Role: provider.RoleUser, Content: "old unique"},
+		{Role: provider.RoleAssistant, Content: strings.Repeat("work ", 200)},
+		{Role: provider.RoleUser, Content: "keep unique"},
+		{Role: provider.RoleAssistant, Content: "tail"},
+	}}
+	a := New(prov, tool.NewRegistry(), sess, Options{RecentKeep: 2, ArchiveDir: t.TempDir()}, event.Discard)
+	autoErr := make(chan error, 1)
+	go func() {
+		_, err := a.compactToProjection(context.Background(), CompactionTriggerPressure, "", true, false)
+		autoErr <- err
+	}()
+	<-prov.started
+
+	snap := a.snapshotExplicitCompression()
+	anchor := -1
+	for i, msg := range snap.visible {
+		if strings.Contains(UserMessageText(msg), "keep unique") {
+			anchor = i
+			break
+		}
+	}
+	if anchor < 0 {
+		t.Fatal("range anchor missing from snapshot")
+	}
+	rangeErr := make(chan error, 1)
+	go func() {
+		_, err := a.compressVisibleRange(context.Background(), snap, CompactionTriggerTool, "before", anchor, "keep unique", "")
+		rangeErr <- err
+	}()
+	close(prov.release)
+
+	if err := <-autoErr; err != nil {
+		t.Fatalf("automatic compression: %v", err)
+	}
+	if err := <-rangeErr; !errors.Is(err, errCompressStaleContext) {
+		t.Fatalf("queued range compression error = %v, want stale context", err)
+	}
+	if got := prov.calls.Load(); got != 1 {
+		t.Fatalf("summary provider calls = %d, want one shared transaction", got)
 	}
 }

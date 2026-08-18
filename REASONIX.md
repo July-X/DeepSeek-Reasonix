@@ -15,6 +15,11 @@ agent. It is the Reasonix analog of Claude Code's CLAUDE.md.
   the frontends `cli`, `serve`, `acp`, `bot`, `botruntime`, `boot` and the hosts
   `cmd/`, `desktop/` may import `control`; nothing below a frontend may import
   one. The declared sets live in `tools/repolint/layers.go`.
+- Subagent delegation keeps five concepts apart: a profile says how a worker
+  thinks, `TaskSpec` what this call wants, `CapabilityGrant` what it may touch,
+  `ContextRequest` what it starts from, `SchedulerPolicy` when it runs. Put a
+  field in whichever member decides its value — profiles carry ceilings, never
+  per-call values. `internal/agent/profile_boundary_test.go` enforces it.
 - Cache-first: the system-prompt prefix (base prompt + tools + memory) must stay
   byte-stable across turns so DeepSeek's automatic prefix cache stays warm. Never
   mutate it mid-session — ride the turn tail instead (see `control.Compose`).
@@ -22,6 +27,12 @@ agent. It is the Reasonix analog of Claude Code's CLAUDE.md.
   (`internal/boot/effect_test.go` pattern): assert what actually reaches the
   provider request, frontend sink, or trajectory through the real `boot.Build`
   assembly. Component correctness is not system effectiveness.
+- A mutex- or atomic-guarded struct is ratcheted on its **scalar** field count
+  (`struct-state`), not its total: independent flags multiply into states no
+  type records as legal. Fixing a boundary case by adding one more `bool` is
+  the move this blocks — group by lifetime into a named sub-state instead
+  (`agent.perTurnState` is the pattern), which costs one field and removes the
+  whole product.
 
 ## Comments
 
@@ -29,7 +40,7 @@ Default is none — the code is the truth. Write one only when the **why** is
 non-obvious: a hidden constraint, a workaround anchored to something verifiable,
 an invariant the type system cannot express, or an external-protocol quirk.
 
-- Declaration doc: ≤5 lines. Package comment: ≤8 lines, or ≤40 in a `doc.go`.
+- Declaration doc: ≤15 lines. Package comment: ≤8 lines, or ≤40 in a `doc.go`.
 - Every other comment: ≤3 lines. Struct-field and trailing `//`: 1 line.
 - Never: restatements of the code, phase/stage narrative, incident or
   conversation history, section banners, commented-out code, `@param` lists.
@@ -66,11 +77,14 @@ Run these **before every commit** to catch the fastest CI failures locally:
 ```bash
 gofmt -w .                          # catches gofmt (saves ~13s CI)
 go vet ./...                        # catches vet warnings (saves ~52s CI/lint)
-go run ./tools/repolint             # catches comment/size/layering regressions
+make lint                           # golangci-lint at CI's pin + repolint
 go test ./internal/tool/builtin/ ./internal/boot/  # catches tool/boot test breaks
 ```
 
-CI runs `golangci-lint` (not locally available), but gofmt + vet already block ~80% of fast-fail scenarios.
+`make lint` runs both gates CI runs, at the version in `.golangci-version`;
+`make lint-install` installs it. Do not skip it: a `modernize` finding never
+shows up in `go vet`, and the CI round trip that catches it instead costs ten
+minutes.
 
 ## Import cycle rule
 

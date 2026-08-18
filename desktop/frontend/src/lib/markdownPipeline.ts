@@ -34,6 +34,9 @@ import {
   type VirtualMarkdownTableData,
 } from "./largeMarkdownTable";
 import { isLocalFileHref } from "./localFileUrl";
+import { contentRevision } from "./contentRevision";
+import { markdownSelectionTextFromBlocks } from "./markdownSelectionProjection";
+export { estimateHastBytes } from "./markdownByteEstimate";
 
 export type { HastRoot, HastRootContent };
 
@@ -43,6 +46,12 @@ export interface MarkdownBlock {
   children: HastRootContent[];
   /** Lightweight representation for a large table with plain-text cells. */
   virtualTable?: VirtualMarkdownTableData;
+}
+
+export interface MarkdownParseResult {
+  blocks: MarkdownBlock[];
+  selectionText: string;
+  selectionRevision: number;
 }
 
 const SAFE_PROTOCOL_RE = /^(https?|ircs?|mailto|xmpp)$/i;
@@ -80,6 +89,14 @@ export function markdownUrlTransform(value: string): string {
   return isLocalFileHref(value) ? value : defaultMarkdownUrlTransform(value);
 }
 
+// Images use a separate protocol policy because their bytes are resolved and
+// validated by ResolveMarkdownImageForTab before reaching the WebView. Ordinary
+// links intentionally continue to reject data: URLs.
+export function markdownImageUrlTransform(value: string): string {
+  if (/^data:image\/(?:png|jpeg|gif|webp)(?:;base64)?,/i.test(value)) return value;
+  return isLocalFileHref(value) ? value : defaultMarkdownUrlTransform(value);
+}
+
 // The same transform react-markdown applies between the rehype plugins and
 // hast-util-to-jsx-runtime (its internal `post()` visitor): raw HTML nodes
 // become text (skipHtml is false), and every URL attribute passes through
@@ -99,7 +116,9 @@ function applyReactMarkdownTransforms(tree: HastRoot): void {
         const value = element.properties[key];
         const test = urlAttributes[key as keyof typeof urlAttributes];
         if (test === null || (test as readonly string[]).includes(element.tagName)) {
-          element.properties[key] = markdownUrlTransform(String(value || ""));
+          element.properties[key] = element.tagName === "img" && key === "src"
+            ? markdownImageUrlTransform(String(value || ""))
+            : markdownUrlTransform(String(value || ""));
         }
       }
     }
@@ -223,55 +242,22 @@ export function parseMarkdownToBlocks(text: string): MarkdownBlock[] {
   });
 }
 
+/** Parse once and derive both the render tree and copy projection. */
+export function parseMarkdown(text: string): MarkdownParseResult {
+  const blocks = parseMarkdownToBlocks(text);
+  const selectionText = markdownSelectionTextFromBlocks(blocks);
+  return {
+    blocks,
+    selectionText,
+    selectionRevision: contentRevision(selectionText),
+  };
+}
+
 /**
  * Content-derived cache revision for the transcript markdown cache: an FNV-1a
  * fingerprint of the source text. Cache entries also store the source itself,
  * so a (practically impossible) hash collision is caught by comparison.
  */
 export function markdownContentRevision(text: string): number {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < text.length; i += 1) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
-
-/**
- * Byte-weight estimate for parsed blocks, used by the transcript store's
- * byte-weighted markdown LRU. Counts node overhead plus string payloads; no
- * serialization is performed (that would allocate a second full copy).
- */
-export function estimateHastBytes(blocks: readonly MarkdownBlock[]): number {
-  let bytes = 0;
-  const walk = (node: HastRootContent): void => {
-    bytes += 48;
-    if (node.type === "text" || node.type === "comment") {
-      bytes += (node.value?.length ?? 0) * 2;
-      return;
-    }
-    if (node.type === "element") {
-      bytes += node.tagName.length * 2;
-      for (const key in node.properties) {
-        if (!Object.prototype.hasOwnProperty.call(node.properties, key)) continue;
-        const value = node.properties[key];
-        bytes += key.length * 2;
-        if (typeof value === "string") bytes += value.length * 2;
-        else if (Array.isArray(value)) bytes += value.length * 16;
-        else bytes += 16;
-      }
-      for (const child of node.children) walk(child);
-    }
-  };
-  for (const block of blocks) {
-    if (block.virtualTable) {
-      bytes += block.virtualTable.header.reduce((total, cell) => total + 24 + cell.length * 2, 0);
-      bytes += block.virtualTable.rows.reduce(
-        (total, row) => total + 24 + row.reduce((rowTotal, cell) => rowTotal + 24 + cell.length * 2, 0),
-        0,
-      );
-    }
-    for (const child of block.children) walk(child);
-  }
-  return bytes;
+  return contentRevision(text);
 }

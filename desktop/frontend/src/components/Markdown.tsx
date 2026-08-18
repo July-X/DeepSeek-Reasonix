@@ -1,7 +1,12 @@
 import { lazy, memo, startTransition, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
-const MarkdownRenderer = lazy(() => import("./MarkdownRenderer"));
-const MarkdownHistory = lazy(() => import("./MarkdownHistory"));
+async function loadMarkdownView<T>(component: Promise<T>): Promise<T> {
+  await import("./MarkdownImage.css");
+  return component;
+}
+
+const MarkdownRenderer = lazy(() => loadMarkdownView(import("./MarkdownRenderer")));
+const MarkdownHistory = lazy(() => loadMarkdownView(import("./MarkdownHistory")));
 const STREAMING_TAIL_THRESHOLD = 8_000;
 const FINALIZE_SETTLE_MS = 50;
 const FINALIZE_IDLE_TIMEOUT_MS = 1_000;
@@ -131,12 +136,15 @@ export function streamingMarkdownCommitInterval(textLength: number): number {
   return 50;
 }
 
-// streamingCommitTarget returns the prefix worth parsing while a stream is
-// live: everything up to the last completed block — a blank line, a closed
-// fence, closed display math, or the start of a heading, all on terminated
-// lines. The in-progress block rides the plain-text tail instead, so Markdown
-// re-parses once per completed block rather than once per commit interval. An
-// unclosed fence or $$ keeps the whole text parsed for live code highlighting.
+const STREAMING_LIST_ITEM_RE = /^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]+|$)/;
+const STREAMING_THEMATIC_BREAK_RE = /^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$/;
+
+function isStreamingListItemLine(line: string): boolean {
+  return STREAMING_LIST_ITEM_RE.test(line) && !STREAMING_THEMATIC_BREAK_RE.test(line);
+}
+
+// Live parse prefix: last completed block. A later list marker commits prior
+// items only — the new item stays in the tail so indented continuations can join.
 export function streamingCommitTarget(text: string): string {
   let lineStart = 0;
   let fence: { marker: string; length: number } | null = null;
@@ -165,6 +173,7 @@ export function streamingCommitTarget(text: string): string {
       // A heading interrupts a paragraph, so a partial heading line already
       // completes everything before it; a terminated one is itself complete.
       else if (/^ {0,3}#{1,6}[ \t]+/.test(line)) boundary = terminated ? lineEnd : lineStart;
+      else if (isStreamingListItemLine(line)) boundary = lineStart;
     }
     lineStart = lineEnd;
   }
@@ -302,7 +311,7 @@ const StreamingMarkdownTail = memo(function StreamingMarkdownTail({ text }: { te
     previousTextRef.current = text;
   }, [text]);
 
-  return <div ref={elementRef} className="md md--stream-tail" />;
+  return <div ref={elementRef} className="md md--stream-tail" data-transcript-selection-source-fallback />;
 });
 
 export const Markdown = memo(function Markdown({
@@ -359,7 +368,7 @@ export const Markdown = memo(function Markdown({
 
   const committedView = (
     <>
-      <Suspense fallback={<div className="md">{renderedText}</div>}>
+      <Suspense fallback={<div className="md" data-transcript-selection-source-fallback>{renderedText}</div>}>
         {sections.length === 1 ? (
           <MarkdownRenderer text={renderedText} plainStatusBlocks={plainStatusBlocks} />
         ) : (
@@ -377,12 +386,14 @@ export const Markdown = memo(function Markdown({
   if (streaming || legacyMode) return committedView;
 
   return (
-    <Suspense fallback={<div className="md">{text}</div>}>
+    <Suspense fallback={<div className="md" data-transcript-selection-source-fallback>{text}</div>}>
       <MarkdownHistory
         text={text}
         plainStatusBlocks={plainStatusBlocks}
         entryId={entryId}
-        fallback={wasStreamingRef.current ? committedView : <div className="md">{text}</div>}
+        fallback={wasStreamingRef.current
+          ? committedView
+          : <div className="md" data-transcript-selection-source-fallback>{text}</div>}
         onParsed={handleWorkerParsed}
         onError={handleWorkerError}
       />

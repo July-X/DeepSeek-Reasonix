@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -71,10 +72,9 @@ func TestFinishReasonMessage(t *testing.T) {
 		}
 	}
 	loud := map[string]string{
-		"length":                 "max output",
-		"client_reasoning_limit": "client reasoning safety limit",
-		"content_filter":         "content filter",
-		"repetition_truncation":  "repetition",
+		"length":                "max output",
+		"content_filter":        "content filter",
+		"repetition_truncation": "repetition",
 	}
 	for reason, fragment := range loud {
 		msg, ok := finishReasonMessage(&provider.Usage{FinishReason: reason})
@@ -115,6 +115,58 @@ type fakeTool struct {
 	delay    time.Duration
 	err      error
 	calls    *int32 // shared counter to assert all dispatched
+}
+
+type blockingTool struct {
+	name    string
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b blockingTool) Name() string            { return b.name }
+func (b blockingTool) Description() string     { return "" }
+func (b blockingTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (b blockingTool) ReadOnly() bool          { return true }
+func (b blockingTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
+	close(b.started)
+	select {
+	case <-b.release:
+		return b.name + " done", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+type workspaceSignalSink struct {
+	mu        sync.Mutex
+	events    []event.Event
+	mutations chan event.WorkspaceMutation
+}
+
+func newWorkspaceSignalSink() *workspaceSignalSink {
+	return &workspaceSignalSink{mutations: make(chan event.WorkspaceMutation, 8)}
+}
+
+func (s *workspaceSignalSink) Emit(e event.Event) {
+	s.mu.Lock()
+	s.events = append(s.events, e)
+	s.mu.Unlock()
+}
+
+func (s *workspaceSignalSink) RecordWorkspaceMutation(m event.WorkspaceMutation) {
+	s.mutations <- m
+}
+
+func (s *workspaceSignalSink) kinds(kind event.Kind) []event.Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []event.Event
+	for _, e := range s.events {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func (f fakeTool) Name() string            { return f.name }
@@ -268,7 +320,7 @@ func TestExecuteBatchParallelReadOnly(t *testing.T) {
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
 	start := time.Now()
-	batch := a.executeBatch(context.Background(), []provider.ToolCall{{Name: "a"}, {Name: "b"}, {Name: "c"}})
+	batch := a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{{Name: "a"}, {Name: "b"}, {Name: "c"}})
 	results := batch.results
 	elapsed := time.Since(start)
 
@@ -293,7 +345,7 @@ func TestExecuteBatchStampsToolResultTimestamps(t *testing.T) {
 	a := New(nil, reg, NewSession(""), Options{}, sink)
 
 	before := time.Now().UnixMilli()
-	a.executeBatch(context.Background(), []provider.ToolCall{{Name: "a"}})
+	a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{{Name: "a"}})
 	after := time.Now().UnixMilli()
 
 	results := sink.kinds(event.ToolResult)
@@ -312,6 +364,101 @@ func TestExecuteBatchStampsToolResultTimestamps(t *testing.T) {
 	}
 }
 
+func TestExecuteBatchMarksOnlyExecutedWritersForWorkspaceRefresh(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "write_file"})
+	reg.Add(fakeTool{name: "read_file", readOnly: true})
+	sink := &recordSink{}
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+	a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{
+		{Name: "write_file", Arguments: `{"path":"pkg/main.go","content":"x"}`},
+		{Name: "read_file", Arguments: `{"path":"pkg/main.go"}`},
+	})
+	results := sink.kinds(event.ToolResult)
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+	if !results[0].Tool.WorkspaceMutation || len(results[0].Tool.WorkspacePaths) != 1 || results[0].Tool.WorkspacePaths[0] != "pkg/main.go" {
+		t.Fatalf("writer metadata = %+v", results[0].Tool)
+	}
+	if results[1].Tool.WorkspaceMutation {
+		t.Fatalf("read-only call was marked as mutation: %+v", results[1].Tool)
+	}
+}
+
+func TestExecuteBatchMarksFailedWriterForWorkspaceRefresh(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "write_file", err: errors.New("partial write")})
+	sink := &recordSink{}
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+	a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{{Name: "write_file", Arguments: `{"path":"partial.go"}`}})
+	results := sink.kinds(event.ToolResult)
+	if len(results) != 1 || !results[0].Tool.WorkspaceMutation {
+		t.Fatalf("failed writer did not invalidate workspace: %+v", results)
+	}
+}
+
+func TestExecuteBatchPublishesWorkspaceMutationBeforeLaterToolCompletes(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "write_file"})
+	reg.Add(blockingTool{name: "slow_read", started: started, release: release})
+	sink := newWorkspaceSignalSink()
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{
+			{Name: "write_file", Arguments: `{"path":"ready.go","content":"x"}`},
+			{Name: "slow_read", Arguments: `{}`},
+		})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("later tool did not start")
+	}
+	select {
+	case mutation := <-sink.mutations:
+		if mutation.ToolName != "write_file" || len(mutation.Paths) != 1 || mutation.Paths[0] != "ready.go" {
+			t.Fatalf("workspace mutation = %+v", mutation)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer completion did not publish before the later tool completed")
+	}
+	if results := sink.kinds(event.ToolResult); len(results) != 0 {
+		t.Fatalf("provider-ordered ToolResult events published before the batch completed: %+v", results)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch did not finish after releasing the later tool")
+	}
+}
+
+func TestWorkspaceMutationClassifierTreatsGitCommitAsGitMetadata(t *testing.T) {
+	mutation, ok := workspaceMutationForCall("call", "bash", json.RawMessage(`{"command":"git commit -m test"}`), false)
+	if !ok || !mutation.GitMeta || mutation.Content || mutation.WorkingTree || mutation.Tree || !mutation.AllPaths {
+		t.Fatalf("git commit workspace invalidation = %+v, ok=%v", mutation, ok)
+	}
+	mutation, ok = workspaceMutationForCall("call", "bash", json.RawMessage(`{"command":"git commit -am test"}`), false)
+	if !ok || !mutation.GitMeta || !mutation.Content || !mutation.WorkingTree || !mutation.Tree {
+		t.Fatalf("content-writing git commit invalidation = %+v, ok=%v", mutation, ok)
+	}
+	if mutation, ok = workspaceMutationForCall("call", "bash", json.RawMessage(`{"command":"go test ./..."}`), false); ok {
+		t.Fatalf("ordinary verifier invalidated durable workspace state: %+v", mutation)
+	}
+	if mutation, ok = workspaceMutationForCall("call", "bash", json.RawMessage(`{"command":"date --set tomorrow"}`), false); ok {
+		t.Fatalf("host-only state write invalidated the workspace: %+v", mutation)
+	}
+	if mutation, ok = workspaceMutationForCall("call", "remember", json.RawMessage(`{"name":"preference"}`), false); ok {
+		t.Fatalf("host-only memory write invalidated the workspace: %+v", mutation)
+	}
+}
+
 func TestExecuteBatchCancelledCallsCarryNoTimestamps(t *testing.T) {
 	reg := tool.NewRegistry()
 	reg.Add(fakeTool{name: "a", readOnly: true})
@@ -321,7 +468,7 @@ func TestExecuteBatchCancelledCallsCarryNoTimestamps(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	a.executeBatch(ctx, []provider.ToolCall{{Name: "a"}})
+	a.executeBatch(ctx, &a.turn, []provider.ToolCall{{Name: "a"}})
 
 	results := sink.kinds(event.ToolResult)
 	if len(results) != 1 {
@@ -351,7 +498,7 @@ func TestExecuteBatchSegmentsAroundWrites(t *testing.T) {
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
 	start := time.Now()
-	batch := a.executeBatch(context.Background(), []provider.ToolCall{
+	batch := a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{
 		{Name: "ro1"},
 		{Name: "ro2"},
 		{Name: "rw"},
@@ -390,7 +537,7 @@ func TestExecuteBatchFeedsReceiptsToCompleteStep(t *testing.T) {
 	reg.Add(completeStep)
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
-	batch := a.executeBatch(context.Background(), []provider.ToolCall{
+	batch := a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{
 		{Name: "bash", Arguments: `{"command":"go test ./internal/..."}`},
 		{Name: "complete_step", Arguments: `{
 			"step":"Run checks",
@@ -413,11 +560,11 @@ func TestExecuteOneFailedReceiptDoesNotVerify(t *testing.T) {
 	reg.Add(fakeTool{name: "bash", readOnly: false, err: errors.New("boom")})
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
-	out := a.executeOne(context.Background(), provider.ToolCall{Name: "bash", Arguments: `{"command":"go test ./..."}`})
+	out := a.executeOne(context.Background(), &a.turn, provider.ToolCall{Name: "bash", Arguments: `{"command":"go test ./..."}`})
 	if out.errMsg == "" {
 		t.Fatal("failing fake tool should return an error outcome")
 	}
-	if a.evidence.HasSuccessfulCommand("go test ./...") {
+	if a.task.ledger.HasSuccessfulCommand("go test ./...") {
 		t.Fatal("failed bash receipt must not verify")
 	}
 }
@@ -428,15 +575,15 @@ func TestRunResetsEvidenceLedger(t *testing.T) {
 	prov := &mockProvider{name: "p", chunks: []provider.Chunk{{Type: provider.ChunkText, Text: "done"}}}
 	a := New(prov, reg, NewSession(""), Options{}, event.Discard)
 
-	a.executeOne(context.Background(), provider.ToolCall{Name: "bash", Arguments: `{"command":"go test ./..."}`})
-	if !a.evidence.HasSuccessfulCommand("go test ./...") {
+	a.executeOne(context.Background(), &a.turn, provider.ToolCall{Name: "bash", Arguments: `{"command":"go test ./..."}`})
+	if !a.task.ledger.HasSuccessfulCommand("go test ./...") {
 		t.Fatal("setup failed to record evidence")
 	}
 
 	if err := a.Run(context.Background(), "next turn"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if a.evidence.HasSuccessfulCommand("go test ./...") {
+	if a.task.ledger.HasSuccessfulCommand("go test ./...") {
 		t.Fatal("new user turn should not inherit previous receipts")
 	}
 }

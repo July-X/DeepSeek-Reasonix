@@ -467,16 +467,6 @@ func (c *Controller) SearchExternalFolderRefs(query string, limit int) []Externa
 	return out
 }
 
-// ExternalFolderRefLocalPath resolves a registered external-folder token path to
-// the local filesystem path authorized for this controller session.
-func (c *Controller) ExternalFolderRefLocalPath(tokenPath string) (path, displayPath string, ok bool) {
-	_, rel, abs, ok := c.externalFolderRefTarget(tokenPath)
-	if !ok {
-		return "", "", false
-	}
-	return filepath.Join(abs, filepath.FromSlash(rel)), externalFolderDisplayPath(abs, rel), true
-}
-
 func sortExternalFolderRefEntries(entries []ExternalFolderRefEntry) {
 	sort.Slice(entries, func(i, j int) bool {
 		return strings.ToLower(entries[i].DisplayName) < strings.ToLower(entries[j].DisplayName)
@@ -556,6 +546,13 @@ func (c *Controller) inputImages(line string) []string {
 	if !c.imageInputEnabled() {
 		return nil
 	}
+	return c.resolveInputImageCandidates(line)
+}
+
+// resolveInputImageCandidates resolves authorized image references without
+// consulting the active model capability. The parent controller uses this only
+// to hand candidates to a child; the child decides whether to embed them.
+func (c *Controller) resolveInputImageCandidates(line string) []string {
 	var urls []string
 	for _, r := range c.detectRefs(line) {
 		baseDir := c.workspaceRoot
@@ -1257,7 +1254,7 @@ func findPython() (string, error) {
 func runPDFTextCommand(name string, args []string) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), pdfExtractTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := proc.CommandContext(ctx, name, args...)
 	cmd.Env = secrets.ProcessEnv()
 	setShellKillTree(cmd)
 	cmd.WaitDelay = pdfExtractWaitDelay
