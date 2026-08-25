@@ -30,6 +30,7 @@ import (
 	"reasonix/internal/provider"
 	"reasonix/internal/runtimepolicy"
 	"reasonix/internal/sandbox"
+	"reasonix/internal/sessiontemp"
 	"reasonix/internal/shellparse"
 	"reasonix/internal/taskcontract"
 	"reasonix/internal/tool"
@@ -953,6 +954,8 @@ type Options struct {
 	WriteScheduler *SubagentScheduler
 	// WriteWorkspaceRoot normalizes parent write reservations.
 	WriteWorkspaceRoot string
+	// SessionTemp owns the exact private scratch root for delivery accounting.
+	SessionTemp *sessiontemp.Manager
 	// WriteRoots is the session-scoped writable directory manager.
 	WriteRoots *sandbox.WritableRootSet
 	// WriteAccessGate authorizes extra writable directories. nil is fail-closed
@@ -1178,6 +1181,9 @@ func (a *Agent) closedLoopActive() bool {
 	if a.planContractSnapshot() != nil {
 		return true
 	}
+	if a.turn.constraints.PolicyFloor == taskcontract.PolicyFloorDelivery {
+		return true
+	}
 	if a.turn.engine == nil {
 		return false
 	}
@@ -1234,8 +1240,8 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	runMaxSteps := a.maxSteps
 	runMaxStepsKey := a.maxStepsKey
 	a.recovery.runSeq.Add(1)
-	// All role settings participate in the workspace lease for the run; the
-	// exclusive write lock is still acquired lazily on the first real writer.
+	// All role settings participate in the workspace lease for the run; write
+	// locks are acquired per mutating tool and released when that tool ends.
 	if a.svc.workspaceLease != nil {
 		a.svc.workspaceLease.BeginRun()
 		defer a.svc.workspaceLease.EndRun()
@@ -1300,8 +1306,9 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 }
 
 // ReadinessResult is the host-consumable outcome of the Delivery final-answer
-// readiness check. The Controller reads it after each goal turn; plain turns
-// receive the same outcome as a FinalReadinessError.
+// readiness check. The Controller reads it after each Goal/approved-Plan turn;
+// plain Standard turns end after the visible answer and do not enter the Goal
+// continuation path.
 type ReadinessResult struct {
 	// Ready is true when no missing requirement remains.
 	Ready bool
@@ -2265,7 +2272,13 @@ func (a *Agent) recoveryPlanTransition(toolName string, args json.RawMessage) (b
 		return false, "", "", ""
 	}
 	after := evidence.ReceiptFromToolCall("todo_write", args, true, true).Todos
-	if len(after) == 0 || evidence.ValidateSerialTodos(after) != nil || !evidence.PreservesCompletedTodoPositions(before, after) {
+	if evidence.ValidateSerialTodos(after) != nil {
+		return false, "", "", ""
+	}
+	if len(after) == 0 {
+		return true, planReviewText(before), planReviewText(after), planTransitionDiff(before, after)
+	}
+	if !evidence.PreservesCompletedTodoPositions(before, after) {
 		// Let todo_write report malformed or invalid state directly; an invalid
 		// task list is not a meaningful plan proposal for the reviewer.
 		return false, "", "", ""

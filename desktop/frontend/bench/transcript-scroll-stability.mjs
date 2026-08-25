@@ -22,7 +22,7 @@ function assert(condition, message) {
   process.stdout.write(`  PASS  ${message}\n`);
 }
 
-async function moveToOuterReaderGutter(page, transcript) {
+async function moveToOuterReaderGutter(page, transcript, announce = true) {
   const deadline = Date.now() + 5_000;
   let point = null;
   while (!point && Date.now() < deadline) {
@@ -46,8 +46,219 @@ async function moveToOuterReaderGutter(page, transcript) {
     });
     if (!point) await page.waitForTimeout(16);
   }
-  assert(point != null, "outer reader wheel target resolves to visible row padding");
+  if (announce) assert(point != null, "outer reader wheel target resolves to visible row padding");
+  else if (point == null) throw new Error("outer reader wheel target is unavailable during traversal");
   await page.mouse.move(point.x, point.y);
+}
+
+async function waitForStableTranscriptGeometry(
+  page,
+  { timeout = 15_000, frames = 8, requireTail = false } = {},
+) {
+  await page.evaluate(({ timeout, frames, requireTail }) => new Promise((resolve, reject) => {
+    const startedAt = performance.now();
+    let previous = null;
+    let stableFrames = 0;
+    let lastSample = null;
+    const sample = () => {
+      const element = document.querySelector(".transcript");
+      if (element instanceof HTMLElement) {
+        const current = {
+          mode: element.dataset.scrollMode,
+          height: element.scrollHeight,
+          top: element.scrollTop,
+          clientHeight: element.clientHeight,
+        };
+        lastSample = { ...current, distance: current.height - current.top - current.clientHeight, stableFrames };
+        const unchanged = previous != null
+          && current.mode === previous.mode
+          && Math.abs(current.height - previous.height) <= 0.5
+          && Math.abs(current.top - previous.top) <= 0.5
+          && current.clientHeight === previous.clientHeight;
+        stableFrames = unchanged ? stableFrames + 1 : 0;
+        previous = current;
+        const distance = current.height - current.top - current.clientHeight;
+        const expectedPosition = !requireTail || (current.mode === "tail-follow" && distance <= 4);
+        if (expectedPosition && stableFrames >= frames) {
+          resolve();
+          return;
+        }
+      } else {
+        previous = null;
+        stableFrames = 0;
+      }
+      if (performance.now() - startedAt >= timeout) {
+        reject(new Error(`transcript geometry did not stay stable for ${frames} frames: ${JSON.stringify(lastSample)}`));
+        return;
+      }
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  }), { timeout, frames, requireTail });
+}
+
+async function openGeometryContractFixture(page) {
+  await page.click('.project-tree__topic-main:has-text("bench:geometry-229")');
+  await page.waitForFunction(
+    () => document.querySelector(".transcript")?.textContent?.includes("Geometry contract fixture complete."),
+    undefined,
+    { timeout: 30_000 },
+  );
+  await waitForStableTranscriptGeometry(page, { timeout: 30_000, requireTail: true });
+  return page.locator(".transcript");
+}
+
+async function runGeometryContractTraversal(page, label) {
+  const transcript = page.locator(".transcript");
+  const fixtureShape = await transcript.evaluate((element) => ({
+    totalRows: Number.parseInt(element.dataset.transcriptRowCount ?? "0", 10),
+    clientHeight: element.clientHeight,
+  }));
+  assert(
+    fixtureShape.totalRows >= 220 && fixtureShape.totalRows <= 240,
+    `${label}: sanitized fixture stays near 229 rows (${fixtureShape.totalRows})`,
+  );
+  await page.evaluate(() => {
+    window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = (write) => {
+      window.__geometryContractProbe?.writes.push(write);
+    };
+  });
+  await transcript.evaluate(() => {
+    const compact = {};
+    window.__geometryContractProbe = { active: true, frames: [], compact, allRows: {}, writes: [] };
+    window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = (write) => window.__geometryContractProbe?.writes.push(write);
+    const sample = () => {
+      const probe = window.__geometryContractProbe;
+      const element = document.querySelector(".transcript");
+      if (!probe?.active || !(element instanceof HTMLElement)) return;
+      const viewport = element.getBoundingClientRect();
+      const mounted = [...element.querySelectorAll(".transcript__row")];
+      const visible = mounted
+        .filter((row) => {
+          const rect = row.getBoundingClientRect();
+          return rect.bottom > viewport.top && rect.top < viewport.bottom;
+        })
+        .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top);
+      const first = visible[0];
+      const firstVisibleIndex = first instanceof HTMLElement
+        ? Number.parseInt(first.dataset.logicalIndex ?? first.dataset.index ?? "", 10)
+        : Number.NaN;
+      probe.frames.push({
+        top: element.scrollTop,
+        height: element.scrollHeight,
+        estimatedTotal: element.dataset.transcriptEstimatedTotal,
+        firstVisibleIndex: Number.isFinite(firstVisibleIndex) ? firstVisibleIndex : null,
+        firstVisibleTop: first instanceof HTMLElement ? first.getBoundingClientRect().top - viewport.top : null,
+        occupied: visible.length > 0,
+        visibleRows: visible.slice(0, 8).map((row) => ({
+          index: row.dataset.logicalIndex ?? row.dataset.index,
+          key: row.dataset.rowKey,
+          kind: row.dataset.rowKind,
+          variant: row.dataset.transcriptLayoutVariant,
+          height: row.getBoundingClientRect().height,
+          top: row.getBoundingClientRect().top - viewport.top,
+        })),
+      });
+      for (const row of mounted) {
+        if (!(row instanceof HTMLElement)) continue;
+        const variant = row.dataset.transcriptLayoutVariant ?? "";
+        const index = Number.parseInt(row.dataset.logicalIndex ?? row.dataset.index ?? "", 10);
+        const estimated = Number.parseFloat(row.dataset.estimatedSize ?? row.dataset.staticEstimate ?? "");
+        const measured = Number.parseFloat(row.dataset.knownSize ?? "") || row.getBoundingClientRect().height;
+        if (!Number.isFinite(index) || !Number.isFinite(estimated) || !Number.isFinite(measured)) continue;
+        const key = `${index}:${variant}`;
+        const error = Math.abs(measured - estimated);
+        const delta = measured - estimated;
+        const rowSample = {
+          index,
+          key: row.dataset.rowKey,
+          preview: row.textContent?.slice(0, 48),
+          kind: row.dataset.rowKind,
+          variant,
+          estimated,
+          measured,
+          error,
+          delta,
+        };
+        const previousAll = probe.allRows[key];
+        if (!previousAll || error > previousAll.error) probe.allRows[key] = rowSample;
+        if (variant === "static" || variant === "text-flow" || variant.endsWith("-expanded")) continue;
+        const previous = compact[key];
+        if (!previous || error > previous.error) compact[key] = rowSample;
+      }
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  });
+  await moveToOuterReaderGutter(page, transcript);
+  let reachedTop = false;
+  for (let attempt = 0; attempt < 240 && !reachedTop; attempt += 1) {
+    // Virtuoso recycles the row under a fixed pointer coordinate. Re-resolve
+    // the outer reader target so every synthetic wheel is delivered through
+    // the same capture path as a real continuous gesture.
+    await moveToOuterReaderGutter(page, transcript, false);
+    await page.mouse.wheel(0, -80);
+    await page.waitForTimeout(60);
+    reachedTop = await transcript.evaluate((element) => element.scrollTop <= 1);
+  }
+  assert(reachedTop, `${label}: first upward traversal reaches the physical top`);
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const probe = await transcript.evaluate(() => {
+    const current = window.__geometryContractProbe ?? { frames: [], compact: {}, writes: [] };
+    current.active = false;
+    window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = undefined;
+    window.__geometryContractProbe = undefined;
+    return current;
+  });
+  const occupied = probe.frames.every((frame) => frame.occupied);
+  let maxReversePx = 0;
+  let maxReverseRows = 0;
+  let worstReversePair = null;
+  let reverseRun = 0;
+  let maxReverseRun = 0;
+  let maxHeightDrop = 0;
+  for (let index = 1; index < probe.frames.length; index += 1) {
+    const previous = probe.frames[index - 1];
+    const current = probe.frames[index];
+    maxReversePx = Math.max(maxReversePx, current.top - previous.top);
+    maxHeightDrop = Math.max(maxHeightDrop, previous.height - current.height);
+    if (previous.firstVisibleIndex != null && current.firstVisibleIndex != null) {
+      const reverseRows = current.firstVisibleIndex - previous.firstVisibleIndex;
+      if (reverseRows > maxReverseRows) {
+        maxReverseRows = reverseRows;
+        worstReversePair = { previous, current };
+      }
+      const visualReverse = current.firstVisibleIndex > previous.firstVisibleIndex
+        || (current.firstVisibleIndex === previous.firstVisibleIndex
+          && previous.firstVisibleTop != null
+          && current.firstVisibleTop != null
+          && current.firstVisibleTop < previous.firstVisibleTop - 2);
+      reverseRun = visualReverse ? reverseRun + 1 : 0;
+      maxReverseRun = Math.max(maxReverseRun, reverseRun);
+    }
+  }
+  const compactRows = Object.values(probe.compact);
+  const reasoningRows = compactRows.filter((row) => row.variant === "reasoning-summary");
+  const reasoningError = Math.max(0, ...reasoningRows.map((row) => row.error));
+  const otherCompactError = Math.max(0, ...compactRows.filter((row) => row.variant !== "reasoning-summary").map((row) => row.error));
+  const forbiddenWrites = probe.writes.filter((write) => write.owner === "recovery" || write.owner === "anchor-compensation");
+  const largestOverestimates = Object.values(probe.allRows)
+    .filter((row) => row.delta < 0)
+    .sort((left, right) => left.delta - right.delta)
+    .slice(0, 8);
+  const largestUnderestimates = Object.values(probe.allRows)
+    .filter((row) => row.delta > 0)
+    .sort((left, right) => right.delta - left.delta)
+    .slice(0, 8);
+  assert(occupied, `${label}: every sampled frame keeps a mounted row in the viewport`);
+  assert(maxReverseRows <= 1, `${label}: first visible row never flashes downward by more than one row (${maxReverseRows}; ${JSON.stringify(worstReversePair)}; reasoning error ${reasoningError.toFixed(2)}; compact error ${otherCompactError.toFixed(2)}; height drop ${maxHeightDrop.toFixed(2)}; over ${JSON.stringify(largestOverestimates)}; under ${JSON.stringify(largestUnderestimates)}; writes ${JSON.stringify(probe.writes.slice(-8))})`);
+  assert(maxReverseRun <= 1, `${label}: no visible reverse displacement persists beyond one frame (${maxReverseRun}; physical anchor adjustment ${maxReversePx.toFixed(2)}px)`);
+  assert(maxHeightDrop < fixtureShape.clientHeight / 2, `${label}: list height never contracts by half a viewport (${maxHeightDrop.toFixed(2)}px)`);
+  assert(reasoningRows.length === 31, `${label}: traversal measures all 31 folded reasoning rows (${reasoningRows.length})`);
+  assert(reasoningError <= 2, `${label}: folded reasoning estimate error stays within 2px (${reasoningError.toFixed(2)}px)`);
+  assert(otherCompactError <= 8, `${label}: other compact estimate errors stay within 8px (${otherCompactError.toFixed(2)}px)`);
+  assert(forbiddenWrites.length === 0, `${label}: normal traversal emits zero recovery/anchor-compensation writes (${forbiddenWrites.length})`);
+  return { reasoningError, otherCompactError, totalRows: fixtureShape.totalRows };
 }
 
 async function waitForServer() {
@@ -66,9 +277,11 @@ async function waitForServer() {
   throw new Error("transcript scroll preview did not become ready");
 }
 
-const preview = spawn("pnpm", ["exec", "vite", "preview", "--port", String(port), "--strictPort", "--host", "127.0.0.1"], {
+const packageManager = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+const preview = spawn(packageManager, ["exec", "vite", "preview", "--port", String(port), "--strictPort", "--host", "127.0.0.1"], {
   cwd: frontendDir,
   stdio: "ignore",
+  shell: process.platform === "win32",
 });
 
 let browser;
@@ -164,8 +377,26 @@ try {
     const settle = () => frames-- <= 0 ? resolve() : requestAnimationFrame(settle);
     requestAnimationFrame(settle);
   }));
-  await page.mouse.move(hydrationBox.x + hydrationBox.width / 2, hydrationBox.y + hydrationBox.height / 2);
-  await page.mouse.wheel(0, 100_000);
+  await moveToOuterReaderGutter(page, hydrationTranscript);
+  // Full Markdown hydration can legitimately expand this synthetic document
+  // to ~30k CSS px. Keep driving the same outer-reader gesture until the
+  // physical tail is reached instead of assuming the old underestimated tree.
+  let previousDownwardTop = -1;
+  for (let attempt = 0; attempt < 128; attempt += 1) {
+    await moveToOuterReaderGutter(page, hydrationTranscript, false);
+    await page.mouse.wheel(0, 10_000);
+    const position = await hydrationTranscript.evaluate((element) => ({
+      top: element.scrollTop,
+      atBottom: element.scrollHeight - element.scrollTop - element.clientHeight <= 1,
+    }));
+    if (position.atBottom) break;
+    // A hydration resize intentionally guards the reader's previous extent
+    // for one intent burst. Start a fresh burst after the 180ms idle lease
+    // when that boundary is reached, matching a real user's next wheel turn.
+    const stalled = Math.abs(position.top - previousDownwardTop) <= 1;
+    previousDownwardTop = position.top;
+    await page.waitForTimeout(stalled ? 220 : 16);
+  }
   await page.waitForFunction(() => {
     const element = document.querySelector(".transcript");
     return element instanceof HTMLElement
@@ -199,6 +430,16 @@ try {
       && element.scrollHeight - element.scrollTop - element.clientHeight <= 1;
   });
   assert(true, "rapid A→B→A switching leaves the reported long-turn session at its physical bottom");
+  await openGeometryContractFixture(page);
+  await runGeometryContractTraversal(page, "DPR 1 first visit");
+  await page.click('.project-tree__topic-main:has-text("bench:small-6t")');
+  await page.waitForFunction(
+    () => document.querySelector(".project-tree__topic--active .project-tree__topic-label")?.textContent?.includes("bench:small-6t"),
+    undefined,
+    { timeout: 30_000 },
+  );
+  await openGeometryContractFixture(page);
+  await runGeometryContractTraversal(page, "DPR 1 A→B→A revisit");
   await page.click('.project-tree__topic-main:has-text("bench:tools-38t")');
   await page.waitForFunction(() => document.querySelector(".project-tree__topic--active .project-tree__topic-label")?.textContent?.includes("bench:tools-38t"));
   await page.waitForFunction(() => document.querySelector(".transcript")?.textContent?.includes("pkg-41/mod.go"), undefined, { timeout: 30_000 });
@@ -282,16 +523,52 @@ try {
   });
   assert(questionJumpWrites.length === 1, `question navigation clears stale selection and emits one indexed jump (${questionJumpWrites.length})`);
   await page.locator(".transcript__jump-bottom").waitFor({ state: "visible" });
-  // The question jump itself is smooth, so Playwright's actionability check
-  // can see the bottom button moving while the viewport settles. A DOM click
-  // still exercises the same React handler without waiting on button geometry.
-  await page.locator(".transcript__jump-bottom").evaluate((button) => button.click());
-  await page.waitForFunction(() => {
-    const element = document.querySelector(".transcript");
-    return element instanceof HTMLElement
-      && element.dataset.scrollMode === "tail-follow"
-      && element.scrollHeight - element.scrollTop - element.clientHeight <= 1;
+  // The question jump itself is smooth. Wait for its geometry to settle before
+  // clicking the current button: resolving a locator while React remounts the
+  // moving control can otherwise call click() on a detached node, which never
+  // reaches React's delegated handler.
+  await waitForStableTranscriptGeometry(page, { timeout: 5_000, frames: 3 });
+  await page.evaluate(() => {
+    window.__reasonixJumpBottomWrites = [];
+    window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = (write) => window.__reasonixJumpBottomWrites.push(write);
   });
+  const jumpBottomClicked = await page.evaluate(() => {
+    const button = document.querySelector(".transcript__jump-bottom");
+    if (!(button instanceof HTMLButtonElement) || !button.isConnected) return false;
+    button.click();
+    return true;
+  });
+  assert(jumpBottomClicked, "question jump exposes a connected jump-bottom control");
+  // The arbiter's rest threshold is 4px: a late sub-threshold remeasure can
+  // legally rest at 2-4px from the extent without earning another write.
+  try {
+    await page.waitForFunction(() => {
+      const element = document.querySelector(".transcript");
+      return element instanceof HTMLElement
+        && element.dataset.scrollMode === "tail-follow"
+        && element.scrollHeight - element.scrollTop - element.clientHeight <= 4;
+    });
+  } catch (error) {
+    const state = await page.evaluate(() => {
+      const element = document.querySelector(".transcript");
+      return element instanceof HTMLElement ? {
+        mode: element.dataset.scrollMode,
+        distance: element.scrollHeight - element.scrollTop - element.clientHeight,
+        scrollTop: element.scrollTop,
+        scrollHeight: element.scrollHeight,
+        clientHeight: element.clientHeight,
+        jumpVisible: Boolean(document.querySelector(".transcript__jump-bottom")),
+        selectionCollapsed: document.getSelection()?.isCollapsed ?? null,
+        writes: window.__reasonixJumpBottomWrites ?? [],
+      } : null;
+    });
+    throw new Error(`question jump-bottom did not settle (${JSON.stringify(state)})`, { cause: error });
+  } finally {
+    await page.evaluate(() => {
+      window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = undefined;
+      window.__reasonixJumpBottomWrites = undefined;
+    });
+  }
 
   // Stay on the tail. Opening the workspace dock must not crop right-aligned
   // user bubbles — that is a width/padding bug, not the scroll-up overlap.
@@ -316,10 +593,17 @@ try {
       fromBottom: +(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight).toFixed(2),
     };
   });
+  // Late hydration can momentarily detach the tail between the previous wait
+  // and this sample; the crop contract only needs a converged viewport.
+  await page.waitForFunction(() => {
+    const element = document.querySelector(".transcript");
+    return element instanceof HTMLElement
+      && element.scrollHeight - element.scrollTop - element.clientHeight <= 4;
+  });
   const dockOpen = await measureDockCrop();
   assert(dockOpen.ok, "tail-follow dock check can see the chat and a user bubble");
   assert(dockOpen.workspaceOpen === true, "bench starts with the workspace dock open");
-  assert(dockOpen.fromBottom <= 1, `dock-open check stays on the tail without scrolling up (${dockOpen.fromBottom})`);
+  assert(dockOpen.fromBottom <= 4, `dock-open check stays on the tail without scrolling up (${dockOpen.fromBottom})`);
   assert(dockOpen.overflowChatRight <= 1, `user bubble stays inside the chat column with the dock open (${dockOpen.overflowChatRight})`);
   assert(
     dockOpen.overflowDock == null || dockOpen.overflowDock <= 1,
@@ -358,11 +642,30 @@ try {
     );
   }
 
-  // Start away from either edge and record a visible stable row. Growing an
-  // already-mounted row above it reproduces async Markdown/tool hydration.
+  // Start away from either edge via a real upward gesture: user intent claims
+  // manual mode, which forbids tail writes for the rest of the section. The
+  // previous teleport-based setup left tail-follow armed, so the arbiter's
+  // legitimate pull-back raced the trusted wheel's async landing and the
+  // settle probe could fire on the pull-back instead of the gesture.
+  await moveToOuterReaderGutter(page, transcript);
+  await page.mouse.wheel(0, -1600);
+  // Playwright resolves mouse.wheel before Chromium finishes the trusted
+  // event's native default scroll. Let it land before sampling anchors.
+  await page.waitForTimeout(120);
+  await page.waitForFunction(() => document.querySelector(".transcript")?.dataset.scrollMode === "manual", undefined, { timeout: 5_000 });
+  await transcript.evaluate((element) => new Promise((resolve) => {
+    let previousTop = element.scrollTop;
+    let stableFrames = 0;
+    const sample = () => {
+      const currentTop = element.scrollTop;
+      stableFrames = Math.abs(currentTop - previousTop) <= 0.5 ? stableFrames + 1 : 0;
+      previousTop = currentTop;
+      if (stableFrames >= 2) { resolve(); return; }
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  }));
   const beforeGrowth = await transcript.evaluate((element) => {
-    element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight * 2);
-    element.dispatchEvent(new Event("scroll"));
     const viewport = element.getBoundingClientRect();
     const rows = [...element.querySelectorAll(".transcript__row")];
     const visible = rows
@@ -381,38 +684,14 @@ try {
   });
   assert(beforeGrowth.anchorKey && beforeGrowth.grownKey, "bench exposes a visible anchor and mounted dynamic row above it");
 
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await transcript.evaluate((element) => {
-    const initialTop = element.scrollTop;
-    let previousTop = initialTop;
-    let stableFrames = 0;
-    element.dataset.benchWheelSettled = "false";
-    const sample = () => {
-      const currentTop = element.scrollTop;
-      const moved = Math.abs(currentTop - initialTop) > 1;
-      stableFrames = moved && Math.abs(currentTop - previousTop) <= 0.5 ? stableFrames + 1 : 0;
-      previousTop = currentTop;
-      if (stableFrames >= 2) {
-        element.dataset.benchWheelSettled = "true";
-        return;
-      }
-      requestAnimationFrame(sample);
-    };
-    requestAnimationFrame(sample);
-  });
-  await page.mouse.wheel(0, -360);
-  await page.waitForFunction(() => document.querySelector(".transcript")?.dataset.benchWheelSettled === "true");
-  const gestureStart = await transcript.evaluate((element) => element.scrollTop);
-  await transcript.evaluate((element) => {
-    const viewport = element.getBoundingClientRect();
-    const rows = [...element.querySelectorAll(".transcript__row")];
-    const visible = rows
-      .filter((row) => row.getBoundingClientRect().bottom > viewport.top && row.getBoundingClientRect().top < viewport.bottom)
-      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top);
-    const above = rows
-      .filter((row) => row.getBoundingClientRect().bottom <= viewport.top)
-      .sort((left, right) => right.getBoundingClientRect().bottom - left.getBoundingClientRect().bottom)[0];
-    if (above instanceof HTMLElement) above.style.paddingBottom = `${Number.parseFloat(above.style.paddingBottom || "0") + 1200}px`;
+  const gestureStart = beforeGrowth.top;
+  await transcript.evaluate((element, grownKey) => {
+    const above = [...element.querySelectorAll(".transcript__row")]
+      .find((row) => row.dataset.rowKey === grownKey);
+    if (above instanceof HTMLElement) {
+      above.dataset.growthReplayBasePadding = above.style.paddingBottom;
+      above.style.paddingBottom = `${Number.parseFloat(above.style.paddingBottom || "0") + 1200}px`;
+    }
     window.__reasonixScrollSamples = [];
     const sample = () => {
       const currentRows = [...element.querySelectorAll(".transcript__row")];
@@ -425,7 +704,7 @@ try {
     };
     element.addEventListener("scroll", sample, { passive: true });
     sample();
-  });
+  }, beforeGrowth.grownKey);
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   const afterGrowth = await transcript.evaluate((element) => ({
     top: element.scrollTop,
@@ -433,6 +712,120 @@ try {
   }));
   assert(afterGrowth.top >= gestureStart - 2, `dynamic measurement never reverses an upward gesture into a multi-screen jump (${gestureStart} → ${afterGrowth.top})`);
   assert(afterGrowth.samples.every((sample) => sample.occupied), "dynamic measurement never exposes a blank transcript viewport");
+  await transcript.evaluate((element, grownKey) => {
+    const grown = [...element.querySelectorAll(".transcript__row")]
+      .find((row) => row.dataset.rowKey === grownKey);
+    if (!(grown instanceof HTMLElement)) return;
+    grown.style.paddingBottom = grown.dataset.growthReplayBasePadding || "";
+    delete grown.dataset.growthReplayBasePadding;
+  }, beforeGrowth.grownKey);
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+  // Replay the returned 146-row Windows failure with real DOM geometry. A
+  // downward wheel lands while the tail extent briefly loses 2,500px and regains
+  // it 50ms later. Native clamping may move for the collapsed frame, but the
+  // rebound must restore the user's logical direction without blank recovery.
+  await transcript.evaluate((element) => {
+    element.dataset.extentReplayOverflowAnchor = element.style.overflowAnchor;
+    element.style.overflowAnchor = "none";
+    element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight - 500);
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await page.waitForTimeout(100);
+  await transcript.evaluate((element) => new Promise((resolve) => {
+    const style = document.createElement("style");
+    style.id = "reader-extent-replay-style";
+    style.textContent = '.transcript[data-extent-replay-expanded="true"] > [data-viewport-type="element"]::after { content: ""; display: block; height: 2500px; }';
+    document.head.append(style);
+    element.dataset.extentReplayExpanded = "true";
+    let stableFrames = 0;
+    let previousHeight = element.scrollHeight;
+    const settle = () => {
+      const currentHeight = element.scrollHeight;
+      stableFrames = Math.abs(currentHeight - previousHeight) <= 0.5 ? stableFrames + 1 : 0;
+      previousHeight = currentHeight;
+      if (stableFrames >= 4) {
+        resolve();
+        return;
+      }
+      requestAnimationFrame(settle);
+    };
+    requestAnimationFrame(settle);
+  }));
+  await page.waitForTimeout(100);
+  await moveToOuterReaderGutter(page, transcript);
+  const beforeExtentReplay = await transcript.evaluate((element) => {
+    const viewport = element.getBoundingClientRect();
+    const rows = [...element.querySelectorAll(".transcript__row")];
+    const visible = rows
+      .filter((row) => row.getBoundingClientRect().bottom > viewport.top && row.getBoundingClientRect().top < viewport.bottom)
+      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top);
+    const anchor = visible.find((row) => row.getBoundingClientRect().top >= viewport.top) ?? visible[0];
+    window.__readerExtentProbe = { writes: [], samples: [], done: false };
+    window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = (write) => window.__readerExtentProbe.writes.push(write);
+    const sample = () => {
+      const current = document.querySelector(".transcript");
+      if (!(current instanceof HTMLElement)) return;
+      const rect = current.getBoundingClientRect();
+      const occupied = [...current.querySelectorAll(".transcript__row")].some((row) => {
+        const rowRect = row.getBoundingClientRect();
+        return rowRect.bottom > rect.top && rowRect.top < rect.bottom;
+      });
+      window.__readerExtentProbe.samples.push({ top: current.scrollTop, height: current.scrollHeight, occupied });
+      if (!window.__readerExtentProbe.done) requestAnimationFrame(sample);
+    };
+    element.addEventListener("wheel", () => requestAnimationFrame(() => {
+      delete element.dataset.extentReplayExpanded;
+      const collapsedTop = Math.max(0, element.scrollTop - 2_000);
+      element.scrollTop = collapsedTop;
+      setTimeout(() => {
+        element.dataset.extentReplayExpanded = "true";
+        // Chromium restores its own scroll anchor on macOS. Keep the returned
+        // WebView2 trace's clamped landing so this replay exercises our guard.
+        element.scrollTop = collapsedTop;
+      }, 50);
+    }), { capture: true, once: true });
+    requestAnimationFrame(sample);
+    return {
+      top: element.scrollTop,
+      anchorKey: anchor?.dataset.rowKey ?? null,
+      anchorOffset: anchor ? anchor.getBoundingClientRect().top - viewport.top : null,
+    };
+  });
+  assert(beforeExtentReplay.anchorKey, "extent replay starts from a visible logical anchor");
+  await page.mouse.wheel(0, 133);
+  await page.waitForTimeout(260);
+  const afterExtentReplay = await transcript.evaluate((element, before) => {
+    window.__readerExtentProbe.done = true;
+    window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = undefined;
+    element.style.overflowAnchor = element.dataset.extentReplayOverflowAnchor || "";
+    delete element.dataset.extentReplayOverflowAnchor;
+    const anchor = [...element.querySelectorAll(".transcript__row")]
+      .find((row) => row.dataset.rowKey === before.anchorKey);
+    return {
+      top: element.scrollTop,
+      anchorOffset: anchor ? anchor.getBoundingClientRect().top - element.getBoundingClientRect().top : null,
+      writes: window.__readerExtentProbe.writes,
+      samples: window.__readerExtentProbe.samples,
+      mode: element.dataset.scrollMode,
+    };
+  }, beforeExtentReplay);
+  const readerStabilityWrites = afterExtentReplay.writes.filter((write) => write.owner === "reader-stability");
+  const preservedDirection = afterExtentReplay.top >= beforeExtentReplay.top - 2;
+  assert(preservedDirection, preservedDirection
+    ? `transient extent rebound cannot reverse a downward wheel (${beforeExtentReplay.top} → ${afterExtentReplay.top})`
+    : `transient extent rebound cannot reverse a downward wheel (${beforeExtentReplay.top} → ${afterExtentReplay.top}; anchor=${beforeExtentReplay.anchorOffset}→${afterExtentReplay.anchorOffset}; mode=${afterExtentReplay.mode}; writes=${JSON.stringify(afterExtentReplay.writes)}; samples=${JSON.stringify(afterExtentReplay.samples)})`);
+  assert(readerStabilityWrites.length === 1, readerStabilityWrites.length === 1
+    ? "transient extent rebound uses one bounded reader-stability write"
+    : `transient extent rebound uses one bounded reader-stability write (${readerStabilityWrites.length}; ${JSON.stringify(afterExtentReplay.samples)})`);
+  assert(afterExtentReplay.writes.every((write) => write.owner !== "recovery"),
+    "nonblank extent rebound never enters blank recovery");
+  assert(afterExtentReplay.samples.every((sample) => sample.occupied),
+    "transient extent rebound keeps mounted coverage in every sampled frame");
+  await transcript.evaluate((element) => {
+    delete element.dataset.extentReplayExpanded;
+    document.getElementById("reader-extent-replay-style")?.remove();
+  });
 
   // Rapid direction changes are the exact user report. Sample every frame and
   // require that Virtuoso always maintains mounted coverage. Keep a real
@@ -502,8 +895,8 @@ try {
   // A native scrollbar thumb drag owns the browser's scroll range. Keep
   // Virtuoso's estimated size tree fixed until pointer release so newly
   // visited variable-height rows cannot resize the thumb under the pointer.
-  // This is deliberately pointer-gutter-specific; the wheel assertions above
-  // continue to exercise ordinary chat-content scrolling and live measuring.
+  // Browser themes clamp the held thumb only after the pointer crosses the
+  // track end, so the target below deliberately overshoots the visible gutter.
   await transcript.evaluate((element) => {
     element.scrollTop = 0;
     element.dispatchEvent(new Event("scroll"));
@@ -519,16 +912,27 @@ try {
     return {
       x: Math.min(rect.right - 1, contentRight + Math.max(1, (rect.right - contentRight) / 2)),
       y: rect.top + 5,
-      bottomY: rect.bottom - 5,
+      // Browser themes clamp the held thumb only after the pointer crosses
+      // the track end, so the target deliberately overshoots the visible
+      // gutter where a native thumb is available.
+      bottomY: Math.min(window.innerHeight - 1, rect.bottom + Math.max(24, rect.height * 0.1)),
       knownSize: Number.parseFloat(row.dataset.knownSize || "0"),
       gutter: rect.right - contentRight,
       scrollHeight: element.scrollHeight,
     };
   });
-  if (process.platform === "darwin" && (!nativeThumbProbe || nativeThumbProbe.gutter <= 1)) {
+  const nativeThumbDragSupported = process.platform !== "win32" || process.env.REASONIX_TRANSCRIPT_NATIVE_THUMB === "1";
+  if (!nativeThumbDragSupported) {
+    // Playwright's headless Chromium on Windows exposes the reserved gutter
+    // width but does not expose a pointer-draggable native thumb. The actual
+    // WebView2 path is covered by the Windows native smoke job; the geometry
+    // lock itself is covered by transcript-native-scrollbar.test.ts.
+    process.stdout.write("  SKIP  native thumb drag (headless Windows Chromium has no draggable native track)\n");
+  } else if (process.platform === "darwin" && (!nativeThumbProbe || nativeThumbProbe.gutter <= 1)) {
     // macOS Chromium inherits system overlay scrollbars, so there is no
-    // pointer-addressable native gutter. Linux/Windows CI still exercises the
-    // complete thumb ownership and measurement-freeze path below.
+    // pointer-addressable native gutter. Linux CI exercises the complete
+    // thumb ownership and measurement-freeze path below; Windows WebView2
+    // coverage is provided by the native smoke job.
     process.stdout.write("  SKIP  native thumb drag (host uses overlay scrollbars)\n");
   } else {
     assert(nativeThumbProbe && nativeThumbProbe.gutter > 1, `workbench exposes a native scrollbar gutter (${nativeThumbProbe?.gutter ?? 0}px)`);
@@ -734,7 +1138,15 @@ try {
       element.dataset.scrollMode === "tail-follow"
       && element.scrollHeight - element.scrollTop - element.clientHeight <= 1);
   }
-  assert(reachedBottom, "repeated downward wheels reach the physical bottom through measurement churn (#8657)");
+  const reachState = reachedBottom ? null : await transcript.evaluate((element) => ({
+    mode: element.dataset.scrollMode,
+    distance: element.scrollHeight - element.scrollTop - element.clientHeight,
+    top: element.scrollTop,
+    height: element.scrollHeight,
+    clientHeight: element.clientHeight,
+    writes: window.__reachBottomProbe.writes.slice(-8),
+  }));
+  assert(reachedBottom, `repeated downward wheels reach the physical bottom through measurement churn (#8657)${reachState ? `: ${JSON.stringify(reachState)}` : ""}`);
   await page.waitForFunction(() => document.querySelector(".transcript")?.dataset.scrollMode === "tail-follow", undefined, { timeout: 5_000 });
   const reachProbe = await transcript.evaluate(() => {
     window.__reachBottomProbe.done = true;
@@ -858,6 +1270,146 @@ try {
     stormProbe.writes.every((write) => write.owner !== "recovery"),
     `zero recovery-owned scroll writes through the storm (${stormProbe.writes.length} writes)`,
   );
+
+  // ── Reduced-motion tail stability (#9028/#9089). Windows reports
+  // prefers-reduced-motion: reduce whenever "Animate controls and elements
+  // inside windows" is off — the default on many machines. The global CSS
+  // reset then collapses every transition to ~0ms, layout churn lands one
+  // whole step per frame, and 1.28.0's tail writer chased each step through
+  // scrollToIndex against a stale size tree: a sustained per-frame flicker
+  // loop with the view never reaching the bottom (#9028 captured 340 no-op
+  // tail writes in 11s). The tail writer must stay calm through churn and
+  // still land on the physical bottom, with no OS setting involved.
+  const reducedPage = await browser.newPage({ viewport: { width: 1280, height: 800 }, reducedMotion: "reduce" });
+  await reducedPage.addInitScript(() => localStorage.setItem("reasonix-process-fold", "expanded"));
+  await reducedPage.goto(url, { waitUntil: "domcontentloaded" });
+  await reducedPage.waitForFunction(() => !document.querySelector(".startup-splash"), undefined, { timeout: 30_000 });
+  assert(
+    await reducedPage.evaluate(() => matchMedia("(prefers-reduced-motion: reduce)").matches),
+    "reduced-motion emulation is active",
+  );
+  await reducedPage.click('.project-tree__topic-main:has-text("bench:reported-long-turn")');
+  await reducedPage.waitForFunction(
+    () => document.querySelector(".transcript")?.textContent?.includes("Reported long turn complete."),
+    undefined,
+    { timeout: 30_000 },
+  );
+  // Let the open-time hydration burst converge, then require several stable
+  // frames before watching the idle tail. A single bottom sample can race a
+  // late markdown/row remeasurement on loaded CI runners and contaminate the
+  // idle probe with legitimate convergence motion.
+  await waitForStableTranscriptGeometry(reducedPage, { timeout: 30_000, requireTail: true });
+  const reducedIdle = await reducedPage.evaluate(() => new Promise((resolve) => {
+    const element = document.querySelector(".transcript");
+    const writes = [];
+    window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = (write) => writes.push(write);
+    const tops = [];
+    let frames = 0;
+    const sample = () => {
+      if (element instanceof HTMLElement) tops.push(element.scrollTop);
+      frames += 1;
+      if (frames < 180) { requestAnimationFrame(sample); return; }
+      window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = undefined;
+      let reversals = 0;
+      let lastDirection = 0;
+      for (let i = 1; i < tops.length; i += 1) {
+        const delta = tops[i] - tops[i - 1];
+        if (Math.abs(delta) <= 2) continue;
+        const direction = Math.sign(delta);
+        if (lastDirection !== 0 && direction !== lastDirection) reversals += 1;
+        lastDirection = direction;
+      }
+      const live = document.querySelector(".transcript");
+      resolve({
+        reversals,
+        tailWrites: writes.filter((write) => write.owner === "tail-follow").length,
+        finalDistance: live instanceof HTMLElement
+          ? live.scrollHeight - live.scrollTop - live.clientHeight
+          : Number.NaN,
+      });
+    };
+    requestAnimationFrame(sample);
+  }));
+  assert(
+    reducedIdle.reversals <= 2,
+    `reduced-motion idle tail does not ping-pong (${reducedIdle.reversals} direction reversals in 180 frames; ${reducedIdle.tailWrites} writes; ${reducedIdle.finalDistance}px from bottom)`,
+  );
+  // The #9028 pathology was a sustained loop: ~340 tail writes in 11s (about
+  // 2 writes every 3 frames, forever). Late fixture hydration can still land
+  // a legitimate convergence burst inside the window, so gate on an order of
+  // magnitude below the pathology instead of near-zero.
+  assert(
+    reducedIdle.tailWrites < 30,
+    `reduced-motion idle tail never enters a sustained write loop (${reducedIdle.tailWrites} tail writes in 180 frames)`,
+  );
+  assert(
+    reducedIdle.finalDistance <= 4,
+    `reduced-motion tail rests on the physical bottom (${reducedIdle.finalDistance}px)`,
+  );
+  // The #9089 gesture: wheel up, wheel back to the bottom, release, idle.
+  const reducedTranscript = reducedPage.locator(".transcript");
+  const reducedBottomTop = await reducedTranscript.evaluate((element) => element.scrollTop);
+  await moveToOuterReaderGutter(reducedPage, reducedTranscript);
+  await reducedPage.mouse.wheel(0, -900);
+  await reducedPage.waitForFunction((bottomTop) => {
+    const element = document.querySelector(".transcript");
+    return element instanceof HTMLElement
+      && element.dataset.scrollMode === "manual"
+      && element.scrollTop < bottomTop - 1
+      && element.scrollHeight - element.scrollTop - element.clientHeight > 4;
+  }, reducedBottomTop, { timeout: 5_000 });
+  let reducedReachedBottom = false;
+  for (let attempt = 0; attempt < 20 && !reducedReachedBottom; attempt += 1) {
+    await reducedPage.mouse.wheel(0, 640);
+    await reducedPage.waitForTimeout(50);
+    reducedReachedBottom = await reducedTranscript.evaluate((element) =>
+      element.dataset.scrollMode === "tail-follow"
+      && element.scrollHeight - element.scrollTop - element.clientHeight <= 4);
+  }
+  assert(reducedReachedBottom, "reduced-motion repeated downward wheels return to the physical bottom (#9089)");
+  const reducedReturn = await reducedPage.evaluate(() => new Promise((resolve) => {
+    const element = document.querySelector(".transcript");
+    const tops = [];
+    let frames = 0;
+    const sample = () => {
+      if (element instanceof HTMLElement) tops.push(element.scrollTop);
+      frames += 1;
+      if (frames < 120) { requestAnimationFrame(sample); return; }
+      let movingFrames = 0;
+      let reversals = 0;
+      let lastDirection = 0;
+      for (let i = 1; i < tops.length; i += 1) {
+        const delta = tops[i] - tops[i - 1];
+        if (Math.abs(delta) <= 2) continue;
+        movingFrames += 1;
+        const direction = Math.sign(delta);
+        if (lastDirection !== 0 && direction !== lastDirection) reversals += 1;
+        lastDirection = direction;
+      }
+      const live = document.querySelector(".transcript");
+      resolve({
+        movingFrames,
+        reversals,
+        finalDistance: live instanceof HTMLElement
+          ? live.scrollHeight - live.scrollTop - live.clientHeight
+          : Number.NaN,
+      });
+    };
+    requestAnimationFrame(sample);
+  }));
+  assert(
+    reducedReturn.reversals <= 2,
+    `reduced-motion return-to-bottom does not ping-pong (${reducedReturn.reversals} reversals in 120 frames)`,
+  );
+  assert(
+    reducedReturn.movingFrames < 12,
+    `reduced-motion return-to-bottom idles without sustained self-scrolling (${reducedReturn.movingFrames} moving frames in 120)`,
+  );
+  assert(
+    reducedReturn.finalDistance <= 4,
+    `reduced-motion return-to-bottom rests on the physical bottom (${reducedReturn.finalDistance}px)`,
+  );
+  await reducedPage.close();
 
   process.stdout.write("\ntranscript scroll stability browser gate passed\n");
 } finally {

@@ -722,10 +722,13 @@ func (a *App) restoreOrBuildTabs() {
 			}
 			tab.model = entry.Model
 			tab.effort = cloneStringPtr(entry.Effort)
-			// Execution modes are gone: old agentPreset/tokenMode entries are
-			// parsed for compatibility but never applied. The tab keeps the
-			// pinned dual-write compat value.
-			tab.tokenMode = boot.TokenModeFull
+			// The role entry seeds the quality floor: delivery (and legacy
+			// delivery labels) raise it; light folds to standard.
+			if entry.QualityFloor == control.QualityFloorDelivery {
+				tab.qualityFloor = control.QualityFloorDelivery
+			} else {
+				tab.qualityFloor = ""
+			}
 			tab.mode = persistedTabMode(entry.Mode)
 			// Validate the persisted goal against the session's goal-state
 			// sidecar: a typed /new or /clear rotates the session through the
@@ -827,7 +830,7 @@ func (a *App) createTabEntryWithID(scope, workspaceRoot, topicID, id string) *Wo
 		TopicTitle:       topicTitleForTab(scope, workspaceRoot, topicID),
 		topicTitleSource: loadTopicTitleSource(topicTitleRoot(scope, workspaceRoot), topicID),
 		model:            model,
-		tokenMode:        boot.TokenModeFull,
+		qualityFloor:     "",
 		mode:             tabModeFromAxes(false, toolApprovalMode == control.ToolApprovalYolo),
 		toolApprovalMode: toolApprovalMode,
 		disabledMCP:      map[string]ServerView{},
@@ -1966,10 +1969,12 @@ func (a *App) NewSessionForTab(tabID string) error {
 	if ctrl == nil {
 		return a.workspaceNotReadyErr(tab)
 	}
-	// Tab is already blank — just persist and skip the new-session dance.
+	// Tab is already blank — skip rotation, but still apply the configured
+	// default. A reused empty tab otherwise keeps the previous session's
+	// provider after a default-model change (#9080).
 	if !controllerHasActiveRuntimeWork(ctrl) && !messagesHaveConversationContent(ctrl.History()) {
 		a.persistTabSessionPath(tab, ctrl.SessionPath())
-		return nil
+		return a.applyNewSessionDefaultModel(tab)
 	}
 
 	if err := ctrl.NewSession(); err != nil {
@@ -1987,7 +1992,26 @@ func (a *App) NewSessionForTab(tabID string) error {
 	a.persistTabSessionPath(tab, ctrl.SessionPath())
 	a.invalidatePromptHistoryCache()
 	a.emitProjectTreeChangedForSessionDirs(ctrl.SessionDir())
-	return nil
+	return a.applyNewSessionDefaultModel(tab)
+}
+
+// applyNewSessionDefaultModel makes a freshly rotated or reused blank session
+// obey the same default as EnsureBlankTab. Existing conversations keep their
+// saved model until the user starts a new one.
+func (a *App) applyNewSessionDefaultModel(tab *WorkspaceTab) error {
+	if tab == nil {
+		return nil
+	}
+	a.mu.RLock()
+	scope := tab.Scope
+	root := tab.WorkspaceRoot
+	a.mu.RUnlock()
+	if strings.TrimSpace(scope) != "project" {
+		scope = "global"
+		root = ""
+	}
+	defaultModel, _ := desktopNewSessionDefaults(scope, root)
+	return a.alignReusableBlankTabModel(tab, defaultModel)
 }
 
 func (a *App) assignFreshSessionTopic(tab *WorkspaceTab) {
@@ -2958,6 +2982,8 @@ func channelDisplayName(provider, domain string) string {
 		return "WeChat"
 	case "qq":
 		return "QQ"
+	case "dingtalk":
+		return "DingTalk"
 	default:
 		return provider
 	}
@@ -3342,7 +3368,7 @@ func (a *App) openTransientBlankRuntime(scope, workspaceRoot string) error {
 		topicTitleSource: topicTitleSourceAuto,
 		SessionPath:      sessionPath,
 		model:            model,
-		tokenMode:        boot.TokenModeFull,
+		qualityFloor:     "",
 		mode:             tabModeFromAxes(false, toolApprovalMode == control.ToolApprovalYolo),
 		toolApprovalMode: toolApprovalMode,
 		disabledMCP:      map[string]ServerView{},
@@ -3616,12 +3642,27 @@ func (a *App) ResumeSessionForTab(tabID, path string) ([]HistoryMessage, error) 
 	return a.HistoryForTab(tab.ID), nil
 }
 
+// validateChannelSessionPath 校验 bot/channel 会话路径：channel 会话可能位于
+// 当前 controller 的 session dir（project scope）或全局 session dir
+// （global scope），单 tab 无法同时覆盖两者，因此都放行。
+func validateChannelSessionPath(ctrlDir, path string) (string, string, error) {
+	if p, b, err := validateSessionPath(ctrlDir, path); err == nil {
+		return p, b, nil
+	}
+	if globalDir := config.SessionDir(); globalDir != "" && globalDir != ctrlDir {
+		if p, b, err := validateSessionPath(globalDir, path); err == nil {
+			return p, b, nil
+		}
+	}
+	return validateSessionPath(ctrlDir, path)
+}
+
 func (a *App) OpenChannelSessionForTab(tabID, path string) ([]HistoryMessage, error) {
 	tab, ctrl := a.tabAndCtrlByID(tabID)
 	if tab == nil || ctrl == nil {
 		return []HistoryMessage{}, fmt.Errorf("tab is not ready")
 	}
-	sessionPath, _, err := validateSessionPath(controllerSessionDir(ctrl), path)
+	sessionPath, _, err := validateChannelSessionPath(controllerSessionDir(ctrl), path)
 	if err != nil {
 		return nil, err
 	}
@@ -3643,7 +3684,7 @@ func (a *App) OpenChannelSessionPageForTab(tabID, path string, limit int) (Histo
 	if tab == nil || ctrl == nil {
 		return HistoryPage{}, fmt.Errorf("tab is not ready")
 	}
-	sessionPath, _, err := validateSessionPath(controllerSessionDir(ctrl), path)
+	sessionPath, _, err := validateChannelSessionPath(controllerSessionDir(ctrl), path)
 	if err != nil {
 		return HistoryPage{}, err
 	}
@@ -6497,24 +6538,25 @@ func (a *App) jobsForCtrl(ctrl control.SessionAPI, out []JobView) []JobView {
 
 // Meta describes the session for the frontend's header and status line.
 type Meta struct {
-	Label             string             `json:"label"`
-	Ready             bool               `json:"ready"`
-	Runtime           SessionRuntimeView `json:"runtime"`
-	StartupErr        string             `json:"startupErr,omitempty"`
-	EventChannel      string             `json:"eventChannel"`
-	SessionPath       string             `json:"sessionPath,omitempty"`
-	SessionRevision   int64              `json:"sessionRevision,omitempty"`
-	SessionDigest     string             `json:"sessionDigest,omitempty"`
-	Cwd               string             `json:"cwd"`
-	WorkspaceRoot     string             `json:"workspaceRoot,omitempty"`
-	WorkspaceName     string             `json:"workspaceName,omitempty"`
-	WorkspacePath     string             `json:"workspacePath,omitempty"`
-	GitBranch         string             `json:"gitBranch,omitempty"`
-	ImageInputEnabled bool               `json:"imageInputEnabled"`
-	AutoApproveTools  bool               `json:"autoApproveTools"`
-	Bypass            bool               `json:"bypass"` // legacy JSON key for YOLO/full-access tool auto-approval
-	CollaborationMode string             `json:"collaborationMode"`
-	ToolApprovalMode  string             `json:"toolApprovalMode"`
+	Label                 string             `json:"label"`
+	Ready                 bool               `json:"ready"`
+	Runtime               SessionRuntimeView `json:"runtime"`
+	StartupErr            string             `json:"startupErr,omitempty"`
+	EventChannel          string             `json:"eventChannel"`
+	SessionPath           string             `json:"sessionPath,omitempty"`
+	SessionRevision       int64              `json:"sessionRevision,omitempty"`
+	SessionDigest         string             `json:"sessionDigest,omitempty"`
+	Cwd                   string             `json:"cwd"`
+	WorkspaceRoot         string             `json:"workspaceRoot,omitempty"`
+	WorkspaceName         string             `json:"workspaceName,omitempty"`
+	WorkspacePath         string             `json:"workspacePath,omitempty"`
+	GitBranch             string             `json:"gitBranch,omitempty"`
+	ImageInputEnabled     bool               `json:"imageInputEnabled"`
+	VisionFallbackEnabled bool               `json:"visionFallbackEnabled,omitempty"`
+	AutoApproveTools      bool               `json:"autoApproveTools"`
+	Bypass                bool               `json:"bypass"` // legacy JSON key for YOLO/full-access tool auto-approval
+	CollaborationMode     string             `json:"collaborationMode"`
+	ToolApprovalMode      string             `json:"toolApprovalMode"`
 	// TokenMode and AgentPreset are deprecated dual-write wire values pinned to
 	// their safe defaults; one-version-old frontends still parse them.
 	TokenMode   string           `json:"tokenMode"`
@@ -6569,24 +6611,11 @@ func (a *App) Meta() Meta {
 	return a.MetaForTab("")
 }
 
-// imageInputEnabledForRootModel reports whether the resolved model supports
-// image input. EXPENSIVE: it loads the workspace config and resolves the model
-// catalog. Never call it on a bound-method request path — MetaForTab serves
-// the cached tabMetaExtras instead, and only refreshTabMetaExtras (background)
-// calls this.
-func (a *App) imageInputEnabledForRootModel(root, ref string) bool {
+func (a *App) loadConfigForVision(root string) (*config.Config, error) {
 	if hook := a.configLoadForRootHook; hook != nil {
 		hook(root)
 	}
-	cfg, err := config.LoadForRoot(root)
-	if err == nil && ref == "" {
-		ref = cfg.DefaultModel
-	}
-	if err != nil || ref == "" {
-		return false
-	}
-	entry, ok := cfg.ResolveModel(ref)
-	return ok && config.EffectiveVision(entry)
+	return config.LoadForRoot(root)
 }
 
 func (a *App) MetaForTab(tabID string) Meta {
@@ -6628,31 +6657,32 @@ func (a *App) MetaForTab(tabID string) Meta {
 		sessionDigest = branchMeta.ContentDigest
 	}
 	return Meta{
-		Label:                snap.label,
-		Ready:                runtimeView.Phase == sessionRuntimeReady && snap.ctrl != nil,
-		Runtime:              runtimeView,
-		StartupErr:           snap.startupErr,
-		EventChannel:         eventChannel,
-		SessionPath:          sessionPath,
-		SessionRevision:      sessionRevision,
-		SessionDigest:        sessionDigest,
-		Cwd:                  cwd,
-		WorkspaceRoot:        cwd,
-		WorkspaceName:        tabWorkspaceNameForScope(snap.scope, cwd),
-		WorkspacePath:        cwd,
-		GitBranch:            extras.gitBranch,
-		ImageInputEnabled:    extras.imageInputEnabled,
-		AutoApproveTools:     autoApproveTools,
-		Bypass:               autoApproveTools,
-		CollaborationMode:    collaborationMode,
-		TokenMode:            tokenMode,
-		AgentPreset:          agentPreset,
-		ToolApprovalMode:     toolApprovalMode,
-		Goal:                 goal,
-		GoalStatus:           goalStatus,
-		GoalRuntime:          goalRuntimeViewFromController(snap.ctrl),
-		CanonicalTodos:       ctrlTodos(snap.ctrl),
-		DismissedTodoBatches: a.dismissedTodoBatchesForSession(sessionPath),
+		Label:                 snap.label,
+		Ready:                 runtimeView.Phase == sessionRuntimeReady && snap.ctrl != nil,
+		Runtime:               runtimeView,
+		StartupErr:            snap.startupErr,
+		EventChannel:          eventChannel,
+		SessionPath:           sessionPath,
+		SessionRevision:       sessionRevision,
+		SessionDigest:         sessionDigest,
+		Cwd:                   cwd,
+		WorkspaceRoot:         cwd,
+		WorkspaceName:         tabWorkspaceNameForScope(snap.scope, cwd),
+		WorkspacePath:         cwd,
+		GitBranch:             extras.gitBranch,
+		ImageInputEnabled:     extras.imageInputEnabled,
+		VisionFallbackEnabled: extras.visionFallbackEnabled,
+		AutoApproveTools:      autoApproveTools,
+		Bypass:                autoApproveTools,
+		CollaborationMode:     collaborationMode,
+		TokenMode:             tokenMode,
+		AgentPreset:           agentPreset,
+		ToolApprovalMode:      toolApprovalMode,
+		Goal:                  goal,
+		GoalStatus:            goalStatus,
+		GoalRuntime:           goalRuntimeViewFromController(snap.ctrl),
+		CanonicalTodos:        ctrlTodos(snap.ctrl),
+		DismissedTodoBatches:  a.dismissedTodoBatchesForSession(sessionPath),
 	}
 }
 
@@ -10047,12 +10077,14 @@ func (a *App) SetAgentPreset(preset string) error {
 // the legacy argument, does not require an idle tab, saves no mode, rebuilds
 // no agent, and always succeeds with the deprecation notice.
 func (a *App) SetAgentPresetForTab(tabID, preset string) error {
-	_ = boot.NormalizeAgentPreset(preset)
+	normalized, err := boot.NormalizeAgentPresetErr(preset)
+	if err != nil {
+		return err
+	}
 	if tab := a.tabByID(tabID); tab == nil && strings.TrimSpace(tabID) != "" {
 		return fmt.Errorf("tab %q not found", tabID)
 	}
-	a.noticeForTab(strings.TrimSpace(tabID), SetAgentPresetDeprecatedNotice)
-	return nil
+	return a.SetQualityFloorForTab(tabID, normalized)
 }
 
 // persistTabTokenMode persists the deprecated dual-write compatibility values
@@ -10064,7 +10096,6 @@ func (a *App) persistTabTokenMode(tab *WorkspaceTab) {
 		return
 	}
 	a.mu.Lock()
-	tab.tokenMode = boot.TokenModeFull
 	a.saveTabsLocked()
 	a.mu.Unlock()
 	_ = a.saveTabSessionMetaForCurrentSession(tab)
